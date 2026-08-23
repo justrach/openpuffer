@@ -6,6 +6,7 @@ Protocol: see `program.md`. Append-only EXCEPT completing the current experiment
 Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on this Linux Xeon AVX-512 host after E004: p50 = 0.927 ms (lower of two unmodified runs). Subsequent deltas on this agent are vs that host number, not the M1 0.981.
 Best-so-far after E005: p50 = 0.834 ms (AVX-512-width i8 dots).
+Best-so-far after E007: p50 = 0.616 ms (neighbor qvec prefetch).
 
 | id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | notes |
 |----|------|------------|----------------|---------------|------|----------|-----------|-------------------|---------|-------|
@@ -16,4 +17,5 @@ Best-so-far after E005: p50 = 0.834 ms (AVX-512-width i8 dots).
 | E004 | 2026-08-23 | rebaseline unmodified tree on Linux Xeon AVX-512 (this agent host); M1 numbers are not comparable | none — no source edit | — | pass | 1.031 / 0.927 | 0.3130 | — | keep | 4-core Intel Xeon (KVM), avx512f/vnni/amx; first-run p99=5.08ms (cold); host variance > M1 ±3%; synthetic loop needs no API keys. Best for this host = 0.927 |
 | E005 | 2026-08-23 | widen dotI8 16→64 so the i8 inner loop fills a 512-bit AVX-512 register (E002 was neutral on M1 NEON) | lane=16→64 in dotI8; integer math unchanged (bit-exact) | src/vector.zig | pass | 0.875 / 0.834 | 0.3130 | -5.6% / -10.0% | keep | both runs ≥4% vs host 0.927; recall bit-stable; new host best 0.834 |
 | E006 | 2026-08-23 | stack-allocate 1536-dim query/quantize scratch (norm_buf/qbuf are 512, so every metric query heap-allocs) | grow searchAdvanced scratch from 512 to 2048 | src/hnsw.zig | pass | 0.774 / 0.845 | 0.3130 | -7.2% / +1.3% | discard | run1 looked like a keep but exact-scan also dropped 5.32→4.79 (ambient); run2 0.845 = neutral vs 0.834. Reverted |
-| E007 | 2026-08-23 | prefetch next neighbor's int8 vector during layer traversal to hide random qvec load latency | @prefetch next qvec in searchLayer neighbor loop | src/hnsw.zig | pending | — | — | — | running | vs host best 0.834ms |
+| E007 | 2026-08-23 | prefetch next neighbor's int8 vector during layer traversal to hide random qvec load latency | @prefetch next qvec in searchLayer neighbor loop | src/hnsw.zig | pass | 0.616 / 0.678 | 0.3130 | -26.1% / -18.7% | keep | both runs clear 4%; ANN/exact ratio 0.128 and 0.123 vs ~0.157 baseline — not ambient. New host best 0.616 |
+| E008 | 2026-08-23 | reuse candidate/result heaps across searchLayer calls instead of allocating two PriorityQueues per layer | scratch heaps owned by searchAdvanced, reset per layer | src/hnsw.zig | pending | — | — | — | running | vs host best 0.616ms |

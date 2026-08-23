@@ -149,7 +149,15 @@ pub fn Hnsw(comptime D: type) type {
                     @panic("hnsw invariant broken");
                 }
                 const neighbors = self.node_links.items[c.id][layer].items;
-                for (neighbors) |nid| {
+                for (neighbors, 0..) |nid, ni| {
+                    if (ni + 1 < neighbors.len) {
+                        const nxt = neighbors[ni + 1];
+                        @prefetch(self.qvecs.items[nxt].ptr, .{
+                            .rw = .read,
+                            .locality = 3,
+                            .cache = .data,
+                        });
+                    }
                     if (visited.isSet(nid)) continue;
                     visited.set(nid);
                     const d = dist_ctx.dist(nid);
