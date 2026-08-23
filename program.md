@@ -34,9 +34,9 @@ grep -E "p50|recall" /tmp/zvec-bench.log
 Output lines look like (parse these mechanically):
 
 ```
-zvec (ANN)     p50   1.029ms  p95   1.200ms  p99   1.275ms  mean   1.042ms  191979.1 qps
+zvec (ANN)     p50   0.981ms  p95   1.138ms  p99   1.333ms  mean   0.995ms  200915.2 qps
 zvec recall@10 vs exact: 0.3130
-exact scan     p50   3.402ms  ...
+exact scan     p50   3.355ms  p95   3.498ms  p99   3.590ms  mean   3.345ms   59790.3 qps
 ```
 
 Score rules:
@@ -45,27 +45,44 @@ Score rules:
   (measured baseline is 0.3130; uniformly random high-dim vectors are ANN worst
   case per README). A faster result below the floor is a discard.
 - Ignore the `exact scan` line except as context.
-- **Noise floor: measured run-to-run p50 variance is ±3% on this machine.** A
-  single-run delta under 4% is NOT an improvement — re-run once; only keep if
-  the improvement reproduces across both runs. Recall@10 is bit-stable, so any
-  recall change is real (and any drop below the floor is a discard).
+- **Noise floor: measured run-to-run p50 variance is ±3% on this machine, so
+  the decision procedure per hypothesis is exactly:**
+  1. Run 1 measures. Delta ≥ 4% faster than best AND recall floor met → keep,
+     no further runs needed.
+  2. Otherwise Run 2 decides: ≥ 4% faster than best → keep, else discard.
+  3. A trivial-fix rebuild between runs is allowed but consumes the budget —
+     there is no third run. If the fix isn't obviously mechanical, discard.
+
+  Recall@10 is bit-stable, so ANY recall change is real (and a drop below the
+  floor is an instant discard regardless of speed).
 - Compare on the same machine state as the previous best; note anomalies
   (thermal load, background builds) in the ledger notes column.
 
-Reference baseline (M1 Mac): p50 ≈ 1.03–1.08 ms, recall@10 = 0.3130.
+Reference baseline (M1 Mac, 2026-08-23): p50 0.981–1.013 ms across runs,
+recall@10 = 0.3130. Best-so-far entering E001 is **0.981 ms** (the lower of
+E000's two runs — see experiments/log.md).
 
 ## VERSION CONTROL (step 0 — do this before your first cycle)
 
-This directory may or may not be a git repository. Check for `.git`:
+Check for `.git` in the repo root:
 
-- **If git exists**: use it. Commit a baseline (`git add -A && git commit -m
-  "baseline"`) if the tree is dirty, then follow the git flow in step 7.
-- **If not** (current state as of seeding): initialize it — `git init && git
-  add -A && git commit -m "baseline"`. This is safe and non-destructive; the
-  keep/revert discipline below depends on it existing.
-- If you cannot create a repo at all, fall back to snapshots: before each
-  edit, `cp src/hnsw.zig src/vector.zig /tmp/zvec-snap/` and revert by copying
-  back. Say which mode you're in in each ledger row's notes.
+- **This repo HAS `.git`** with a baseline commit — verify with `git log
+  --oneline | head -1`. If the tree is dirty from someone else's work-in-
+  progress, leave their files alone; just note it in your first row's notes.
+- **If `.git` is missing**, create it:
+
+  ```
+  git init && git add -A && git -c user.name=zvec-agent -c user.email=agent@local commit -m "baseline"
+  ```
+
+  The inline `-c` flags set an identity for this one command WITHOUT touching
+  global config — required because fresh machines often have none and `git
+  commit` would otherwise fail. This is safe and non-destructive.
+- **Snapshot fallback** (only if you cannot create a repo at all): before each
+  edit run `mkdir -p /tmp/zvec-snap/ && cp src/hnsw.zig /tmp/zvec-snap/<ID>-hnsw.zig`
+  (same for vector.zig), using the experiment's id so each experiment has its
+  own restore point; revert by copying back. Say which mode you're in in each
+  ledger row's notes.
 
 ## THE GATE
 
@@ -79,27 +96,32 @@ Loop forever until interrupted. Each cycle:
 
 1. **Hypothesis**: pick ONE code-change hypothesis (e.g. "reserve neighbor
    buffer capacity to skip allocator churn", "widen SIMD in vector.zig").
-2. **Log first** (see Budget rule below): write the row skeleton into
-   `experiments/log.md` before editing.
+2. **Log first** (see Budget rule below): append a PENDING row skeleton to
+    `experiments/log.md` BEFORE editing — e.g.
+    `| E002 | <date> | <hypothesis> | <change summary> | <files> | pending | — | — | — | running | |`
+    — then fill the cells in as results arrive. Only the CURRENT experiment's
+    row may be rewritten; once its verdict is final, the row is immutable.
 3. **Edit** `src/hnsw.zig` and/or `src/vector.zig` only.
 4. **Gate**: `zig build test`. Fail → fix or revert, log verdict.
 5. **Bench**: build ReleaseFast, run the metric command, parse p50 + recall@10.
 6. **Compare vs best-so-far**: keep only if recall@10 ≥ 0.30 AND p50 < best p50.
-7. **Keep or revert**: if improved (recall floor met AND p50 win reproduced
-   past the noise floor), `git add src/hnsw.zig src/vector.zig
-   experiments/log.md && git commit` — this advances the lineage. If equal or
-   worse, revert the edit (`git checkout -- src/hnsw.zig src/vector.zig`, or
-   restore from `/tmp/zvec-snap/` in snapshot mode), update the log row with
-   verdict `discard` and why, and do NOT commit the change (commit only the
-   log row).
+7. **Keep or revert**: if improved (recall floor met AND a ≥4% p50 win per the
+   decision procedure above), `git add src/hnsw.zig src/vector.zig
+   experiments/log.md && git -c user.name=zvec-agent -c user.email=agent@local commit -m "E00N: <one-line result>"`
+   — this advances the lineage. If equal or worse, FIRST revert the source
+   edit (`git checkout -- src/hnsw.zig src/vector.zig`, or restore from your
+   `/tmp/zvec-snap/<ID>-*` copies in snapshot mode), THEN update the log row
+   with verdict `discard` and why, and commit ONLY the ledger file — the
+   discard commit must never contain reverted source changes.
 8. Go to 1. Never stop to ask whether to continue — you are autonomous.
 
 ## Budget rule
 
 Each bench run is seconds, not minutes, so the autoresearch 5-minute budget
 maps to: **ONE hypothesis per experiment cycle, and at most N=2 bench runs per
-hypothesis** (one measurement + one retry after a trivial fix). If two runs
-don't produce a clean number, log `discard`/`crash` with notes and move on.
+hypothesis** (Run 1 + Run 2 of the noise-floor decision procedure; a trivial
+fix may land between them). If both runs fail to produce a clean number, log
+`discard`/`crash` with notes and move on.
 A new idea requires the previous idea's ledger entry to be complete first.
 
 ## Ledger format (`experiments/log.md`)
@@ -111,7 +133,8 @@ One markdown table row per experiment:
 - `id`: zero-padded sequence `E001`, `E002`, …
 - `gate`: `pass` / `fail`.
 - `delta p50 vs best`: signed % vs best-so-far entering the experiment.
-- `verdict`: `keep` (new best, committed) / `discard` (reverted) / `crash`.
+- `verdict`: `running` (row opened, no result yet) / `keep` (new best,
+  committed) / `discard` (reverted) / `crash`.
 - Baseline row `E000` is seeded by the human; never edit it.
 
 ## Guardrails (adapted from autoresearch)
@@ -123,9 +146,9 @@ One markdown table row per experiment:
   clears the 0.30 floor.
 - **Don't touch peer-owned files**: anything outside `src/hnsw.zig`,
   `src/vector.zig`, `experiments/log.md` is off-limits.
-- **Commit discipline**: commit source changes only after ≥1 kept improvement
-  establishes a lineage point; discards are reverted, not committed (except the
-  ledger row itself).
+- **Commit discipline**: EVERY kept improvement is committed, including the
+  very first one — the first keep IS the lineage point. Discards are reverted,
+  not committed (except the ledger row itself).
 - **Simplicity criterion**: all else equal, simpler is better. A 5% p50 win via
   30 lines of hacky special-casing? Probably not worth it. Equal performance
   with less code? Keep.

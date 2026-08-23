@@ -2,7 +2,8 @@
 
 Metric: `zig build -Doptimize=ReleaseFast && ./zig-out/bin/zvec bench-synthetic --n 20000 --queries 200 --dim 1536 --k 10 --ef 128`
 Score: lowest `zvec (ANN) p50 (ms)` subject to `zvec recall@10 >= 0.30`. Gate: `zig build test` must pass.
-Protocol: see `program.md`. Append-only; one row per experiment; E000 baseline seeded by human, never edited.
+Protocol: see `program.md`. Append-only EXCEPT completing the current experiment's row; one row per experiment; E000 baseline seeded by human, never edited.
+Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 
 | id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | notes |
 |----|------|------------|----------------|---------------|------|----------|-----------|-------------------|---------|-------|
