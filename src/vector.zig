@@ -32,8 +32,10 @@ pub fn normalize(v: []f32) void {
 }
 
 /// Vectorized int8 dot product for quantized distance evaluation.
+/// 64 i8 lanes = 512 bits, matching AVX-512 register width. Integer
+/// products are still widened to i32 (max |product| = 16129).
 pub fn dotI8(a: []const i8, b: []const i8) i32 {
-    const lane = 16;
+    const lane = 64;
     var acc: @Vector(lane, i32) = @splat(0);
     var i: usize = 0;
     while (i + lane <= a.len) : (i += lane) {
