@@ -1,7 +1,7 @@
-# experiments/log.md — zvec optimization ledger
+# experiments/log.md — openpuffer optimization ledger
 
-Metric: `zig build -Doptimize=ReleaseFast && ./zig-out/bin/zvec bench-synthetic --n 20000 --queries 200 --dim 1536 --k 10 --ef 128`
-Score: lowest `zvec (ANN) p50 (ms)` subject to `zvec recall@10 >= 0.30`. Gate: `zig build test` must pass.
+Metric: `zig build -Doptimize=ReleaseFast && ./zig-out/bin/openpuffer bench-synthetic --n 20000 --queries 200 --dim 1536 --k 10 --ef 128`
+Score: lowest `openpuffer (ANN) p50 (ms)` subject to `openpuffer recall@10 >= 0.30`. Gate: `zig build test` must pass.
 Protocol: see `program.md`. Append-only EXCEPT completing the current experiment's row; one row per experiment; E000 baseline seeded by human, never edited.
 Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 

@@ -11,14 +11,14 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "zvec",
+        .name = "openpuffer",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    const run_step = b.step("run", "Run zvec");
+    const run_step = b.step("run", "Run openpuffer");
     run_step.dependOn(&run_cmd.step);
 
     const test_mod = b.createModule(.{

@@ -106,7 +106,9 @@ fn handleRequest(
     registry: *Registry,
     o: Options,
 ) !void {
-    const path = req.head.target;
+    // head.target points into the connection's read buffer; the body read
+    // below overwrites it, so copy it out first.
+    const path = try alloc.dupe(u8, req.head.target);
     const method = req.head.method;
 
     // read full body
@@ -269,6 +271,11 @@ fn handleQuery(
     }
 
     if (ns.index.entry_point == null) return respondJson(req, .ok, "{\"rows\":[]}");
+    if (query_vec.len != ns.dim) {
+        var dbuf: [128]u8 = undefined;
+        const dmsg = try std.fmt.bufPrint(&dbuf, "{{\"error\":\"dimension mismatch\",\"expected\":{d},\"got\":{d}}}", .{ ns.dim, query_vec.len });
+        return respondJson(req, .bad_request, dmsg);
+    }
 
     const results = try ns.index.search(query_vec, top_k, o.ef, alloc);
 

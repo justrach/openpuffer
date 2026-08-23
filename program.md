@@ -1,4 +1,4 @@
-# zvec autonomous optimization loop
+# openpuffer autonomous optimization loop
 
 This repo runs an autonomous research loop in the style of
 [karpathy/autoresearch](https://github.com/karpathy/autoresearch): an agent
@@ -27,21 +27,21 @@ Build and run exactly this, no parameter changes:
 
 ```
 zig build -Doptimize=ReleaseFast
-./zig-out/bin/zvec bench-synthetic --n 20000 --queries 200 --dim 1536 --k 10 --ef 128 > /tmp/zvec-bench.log 2>&1
-grep -E "p50|recall" /tmp/zvec-bench.log
+./zig-out/bin/openpuffer bench-synthetic --n 20000 --queries 200 --dim 1536 --k 10 --ef 128 > /tmp/openpuffer-bench.log 2>&1
+grep -E "p50|recall" /tmp/openpuffer-bench.log
 ```
 
 Output lines look like (parse these mechanically):
 
 ```
-zvec (ANN)     p50   0.981ms  p95   1.138ms  p99   1.333ms  mean   0.995ms  200915.2 qps
-zvec recall@10 vs exact: 0.3130
+openpuffer (ANN)     p50   0.981ms  p95   1.138ms  p99   1.333ms  mean   0.995ms  200915.2 qps
+openpuffer recall@10 vs exact: 0.3130
 exact scan     p50   3.355ms  p95   3.498ms  p99   3.590ms  mean   3.345ms   59790.3 qps
 ```
 
 Score rules:
-- **Primary score: the `zvec (ANN) p50` value in ms. Lower is better.**
-- **Hard floor: `zvec recall@10` must be ≥ 0.30** on this random dataset
+- **Primary score: the `openpuffer (ANN) p50` value in ms. Lower is better.**
+- **Hard floor: `openpuffer recall@10` must be ≥ 0.30** on this random dataset
   (measured baseline is 0.3130; uniformly random high-dim vectors are ANN worst
   case per README). A faster result below the floor is a discard.
 - Ignore the `exact scan` line except as context.
@@ -72,14 +72,14 @@ Check for `.git` in the repo root:
 - **If `.git` is missing**, create it:
 
   ```
-  git init && git add -A && git -c user.name=zvec-agent -c user.email=agent@local commit -m "baseline"
+  git init && git add -A && git -c user.name=openpuffer-agent -c user.email=agent@local commit -m "baseline"
   ```
 
   The inline `-c` flags set an identity for this one command WITHOUT touching
   global config — required because fresh machines often have none and `git
   commit` would otherwise fail. This is safe and non-destructive.
 - **Snapshot fallback** (only if you cannot create a repo at all): before each
-  edit run `mkdir -p /tmp/zvec-snap/ && cp src/hnsw.zig /tmp/zvec-snap/<ID>-hnsw.zig`
+  edit run `mkdir -p /tmp/openpuffer-snap/ && cp src/hnsw.zig /tmp/openpuffer-snap/<ID>-hnsw.zig`
   (same for vector.zig), using the experiment's id so each experiment has its
   own restore point; revert by copying back. Say which mode you're in in each
   ledger row's notes.
@@ -107,10 +107,10 @@ Loop forever until interrupted. Each cycle:
 6. **Compare vs best-so-far**: keep only if recall@10 ≥ 0.30 AND p50 < best p50.
 7. **Keep or revert**: if improved (recall floor met AND a ≥4% p50 win per the
    decision procedure above), `git add src/hnsw.zig src/vector.zig
-   experiments/log.md && git -c user.name=zvec-agent -c user.email=agent@local commit -m "E00N: <one-line result>"`
+   experiments/log.md && git -c user.name=openpuffer-agent -c user.email=agent@local commit -m "E00N: <one-line result>"`
    — this advances the lineage. If equal or worse, FIRST revert the source
    edit (`git checkout -- src/hnsw.zig src/vector.zig`, or restore from your
-   `/tmp/zvec-snap/<ID>-*` copies in snapshot mode), THEN update the log row
+   `/tmp/openpuffer-snap/<ID>-*` copies in snapshot mode), THEN update the log row
    with verdict `discard` and why, and commit ONLY the ledger file — the
    discard commit must never contain reverted source changes.
 8. Go to 1. Never stop to ask whether to continue — you are autonomous.

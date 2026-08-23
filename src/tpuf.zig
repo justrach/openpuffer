@@ -6,7 +6,7 @@ pub const Config = struct {
     api_key: []const u8,
     region: []const u8 = "gcp-us-central1",
     /// when set, requests go to this base URL instead of turbopuffer cloud
-    /// (drop-in mode against a local `zvec serve` instance).
+    /// (drop-in mode against a local `openpuffer serve` instance).
     endpoint: ?[]const u8 = null,
 };
 

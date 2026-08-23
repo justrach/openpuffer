@@ -207,7 +207,7 @@ pub fn Hnsw(comptime D: type) type {
 
         /// Insert a vector (copies it). Returns its id.
         pub fn insert(self: *Self, vector: []const f32) !u32 {
-            assertDim(vector.len == self.dim);
+            if (vector.len != self.dim) return error.DimensionMismatch;
             const alloc = self.allocator;
             const id: u32 = @intCast(self.vectors.items.len);
 
@@ -328,7 +328,7 @@ pub fn Hnsw(comptime D: type) type {
             rerank_mult: usize,
             alloc: std.mem.Allocator,
         ) ![]SearchResult {
-            assertDim(query.len == self.dim);
+            if (query.len != self.dim) return error.DimensionMismatch;
             const ep_id = self.entry_point orelse return alloc.alloc(SearchResult, 0);
             var norm_buf: [512]f32 = undefined;
             const nq: []const f32 = if (query.len <= norm_buf.len) blk: {
@@ -397,9 +397,6 @@ pub fn Hnsw(comptime D: type) type {
             return out;
         }
 
-        inline fn assertDim(ok: bool) void {
-            if (!ok) @panic("dimension mismatch");
-        }
     };
 }
 

@@ -1,11 +1,11 @@
-//! zvec — in-memory vector search engine + dual benchmark against turbopuffer.
+//! openpuffer — in-memory vector search engine + dual benchmark against turbopuffer.
 //!
 //! Commands:
 //!   selftest            run the built-in correctness tests
 //!   bench-synthetic     local HNSW vs brute-force on synthetic vectors
-//!   bench-live          Gemini embeddings -> load BOTH zvec and turbopuffer,
+//!   bench-live          Gemini embeddings -> load BOTH openpuffer and turbopuffer,
 //!                       then time queries against both and score recall
-//!                       (zvec ANN vs exact ground truth, tpuf vs same GT)
+//!                       (openpuffer ANN vs exact ground truth, tpuf vs same GT)
 
 const std = @import("std");
 const vecmath = @import("vector.zig");
@@ -35,7 +35,7 @@ const BenchOpts = struct {
     dim: usize = 768,
     k: usize = 10,
     ef: usize = 200,
-    namespace: []const u8 = "zvec-bench-1",
+    namespace: []const u8 = "openpuffer-bench-1",
     model: []const u8 = "gemini-embedding-2",
     tpuf_key: []const u8 = "",
     google_key: []const u8 = "",
@@ -88,12 +88,12 @@ pub fn main(init: std.process.Init) !void {
         try server_mod.serve(gpa, io, .{ .port = port }, &w.interface);
     } else {
         try w.interface.writeAll(
-            \\zvec — fast vector search engine + turbopuffer benchmark
+            \\openpuffer — fast vector search engine + turbopuffer benchmark
             \\
             \\usage:
-            \\  zvec selftest
-            \\  zvec bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
-            \\  zvec bench-live [--namespace zvec-bench-1] [--n 512] [--queries 30] [--dim 768]
+            \\  openpuffer selftest
+            \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
+            \\  openpuffer bench-live [--namespace openpuffer-bench-1] [--n 512] [--queries 30] [--dim 768]
             \\                  [--model gemini-embedding-2] [--k 10] [--ef 200]
             \\                  (env: TURBOPUFFER_API_KEY, GEMINI_API_KEY)
             \\
@@ -242,8 +242,8 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
         recall_sum += recallAtK(gt, got[0..res.len]);
     }
     const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
-    try report(out, "zvec (ANN)", &lat_local, qps_local);
-    try out.print("zvec recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
+    try report(out, "openpuffer (ANN)", &lat_local, qps_local);
+    try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
 
     // brute force baseline
     var lat_bf = try Lat.init(alloc, o.q);
@@ -334,13 +334,13 @@ fn benchLive(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOp
     const n = doc_vecs.items.len;
     const dim = o.dim;
 
-    // 2) load into zvec (local HNSW)
-    try out.print("building zvec index ({d} x {d})...\n", .{ n, dim });
+    // 2) load into openpuffer (local HNSW)
+    try out.print("building openpuffer index ({d} x {d})...\n", .{ n, dim });
     var index = Hnsw.init(gpa, dim, .{});
     defer index.deinit();
     var t0 = Sw.start(io);
     for (doc_vecs.items) |v| _ = try index.insert(v);
-    try out.print("zvec build: {d:.1}ms\n", .{@as(f64, @floatFromInt(t0.readNs())) / 1e6});
+    try out.print("openpuffer build: {d:.1}ms\n", .{@as(f64, @floatFromInt(t0.readNs())) / 1e6});
 
     // 3) load into turbopuffer
     var tp = tpuf_mod.Client.init(gpa, io, .{ .api_key = o.tpuf_key });
@@ -363,20 +363,20 @@ fn benchLive(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOp
     // 4) benchmark both
     var lat_local = try Lat.init(alloc, o.q);
     var lat_tpuf = try Lat.init(alloc, o.q);
-    var recall_zvec: f64 = 0;
+    var recall_openpuffer: f64 = 0;
     var recall_tpuf: f64 = 0;
     var hits_buf: [64]tpuf_mod.QueryHit = undefined;
     var got_buf: [64]u32 = undefined;
 
     for (q_vecs.items) |qv| {
-        // zvec
+        // openpuffer
         {
             var t = Sw.start(io);
             const res = try index.search(qv, o.k, @intCast(o.ef), alloc);
             lat_local.push(t.readNs());
             for (res, 0..) |r, j| got_buf[j] = r.id;
             const gt = try bruteForce(alloc, doc_vecs.items, qv, o.k);
-            recall_zvec += recallAtK(gt, got_buf[0..res.len]);
+            recall_openpuffer += recallAtK(gt, got_buf[0..res.len]);
         }
         // turbopuffer
         {
@@ -394,9 +394,9 @@ fn benchLive(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOp
 
     const qps_tpuf = @as(f64, @floatFromInt(o.q)) / (lat_tpuf.mean() / 1000.0);
     const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
-    try report(out, "zvec (local)", &lat_local, qps_local);
+    try report(out, "openpuffer (local)", &lat_local, qps_local);
     try report(out, "turbopuffer", &lat_tpuf, qps_tpuf);
-    try out.print("zvec recall@{d}:   {d:.4}\n", .{ o.k, recall_zvec / @as(f64, @floatFromInt(o.q)) });
+    try out.print("openpuffer recall@{d}:   {d:.4}\n", .{ o.k, recall_openpuffer / @as(f64, @floatFromInt(o.q)) });
     try out.print("tpuf recall@{d}:   {d:.4}  (vs local exact GT)\n", .{ o.k, recall_tpuf / @as(f64, @floatFromInt(o.q)) });
 
     if (o.local_endpoint) |ep| {
@@ -426,7 +426,7 @@ fn benchLive(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOp
             recall_http += recallAtK(gt, got_buf[0..got]);
         }
         const qps_http = @as(f64, @floatFromInt(o.q)) / (lat_http.mean() / 1000.0);
-        try report(out, "zvec (HTTP API)", &lat_http, qps_http);
-        try out.print("zvec HTTP recall@{d}: {d:.4}\n", .{ o.k, recall_http / @as(f64, @floatFromInt(o.q)) });
+        try report(out, "openpuffer (HTTP API)", &lat_http, qps_http);
+        try out.print("openpuffer HTTP recall@{d}: {d:.4}\n", .{ o.k, recall_http / @as(f64, @floatFromInt(o.q)) });
     }
 }
