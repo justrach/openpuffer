@@ -60,6 +60,19 @@ engine. The apples-to-apples local comparison:
 embedding space clusters and lands at 0.95+.
 \† extrapolated from scan throughput at that scale.
 
+## Autonomous optimization loop
+
+This repo runs an [autoresearch](https://github.com/karpathy/autoresearch)-style
+experiment loop (`program.md`): an agent proposes one change at a time to
+`src/hnsw.zig` / `src/vector.zig`, gates it on `zig build test`, measures it
+with the fixed `bench-synthetic` command, and keeps or reverts based on a
+≥4% reproduced p50 win (run-to-run noise here is ±3%). Every outcome lands in
+the ledger at [`experiments/log.md`](experiments/log.md):
+
+![p50 per experiment](experiments/results.svg)
+
+Regenerate after each experiment with `python3 tools/plot_results.py`.
+
 ## Layout
 
 - `src/vector.zig` — SIMD dot product / cosine distance / normalization
