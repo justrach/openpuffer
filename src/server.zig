@@ -51,7 +51,7 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", o.port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    try out.print("zvec serving turbopuffer-compatible API on http://127.0.0.1:{d}\n", .{o.port});
+    try out.print("openpuffer serving turbopuffer-compatible API on http://127.0.0.1:{d}\n", .{o.port});
     try out.flush();
 
     while (true) {
