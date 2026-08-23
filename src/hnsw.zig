@@ -152,11 +152,13 @@ pub fn Hnsw(comptime D: type) type {
                 for (neighbors, 0..) |nid, ni| {
                     if (ni + 1 < neighbors.len) {
                         const nxt = neighbors[ni + 1];
-                        @prefetch(self.qvecs.items[nxt].ptr, .{
-                            .rw = .read,
-                            .locality = 3,
-                            .cache = .data,
-                        });
+                        if (!visited.isSet(nxt)) {
+                            @prefetch(self.qvecs.items[nxt].ptr, .{
+                                .rw = .read,
+                                .locality = 3,
+                                .cache = .data,
+                            });
+                        }
                     }
                     if (visited.isSet(nid)) continue;
                     visited.set(nid);

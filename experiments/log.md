@@ -7,6 +7,7 @@ Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on this Linux Xeon AVX-512 host after E004: p50 = 0.927 ms (lower of two unmodified runs). Subsequent deltas on this agent are vs that host number, not the M1 0.981.
 Best-so-far after E005: p50 = 0.834 ms (AVX-512-width i8 dots).
 Best-so-far after E007: p50 = 0.616 ms (neighbor qvec prefetch).
+Best-so-far after E014: p50 = 0.575 ms (prefetch only unvisited neighbors).
 
 | id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | notes |
 |----|------|------------|----------------|---------------|------|----------|-----------|-------------------|---------|-------|
@@ -24,4 +25,4 @@ Best-so-far after E007: p50 = 0.616 ms (neighbor qvec prefetch).
 | E011 | 2026-08-23 | two independent 64-lane i8 accumulators to hide i32 add latency (bit-exact) | dotI8 dual-acc, 128 i8s per iteration | src/vector.zig | pass | 0.740 / 0.699 | 0.3130 | +20.1% / +13.5% | discard | dual 64-wide i32 accs slower (register pressure). Reverted |
 | E012 | 2026-08-23 | prefetch next f32 vector during exact rerank (40 random 6 KiB loads) | @prefetch next stored vector in rerank loop | src/hnsw.zig | pass | 0.678 / 0.630 | 0.3130 | +10.1% / +2.3% | discard | rerank is a small slice of p50; prefetch did not clear 4%. Reverted |
 | E013 | 2026-08-23 | two independent 16-wide f32 accumulators in dot() to hide FMA latency on rerank | dual-acc f32 dot, bit-exact enough for ranking | src/vector.zig | pass | 0.674 / 0.610 | 0.3130 | +9.4% / -1.0% | discard | query p50 not a 4% win (build *was* faster, ~38.7s vs ~46s, but metric is query). Reverted |
-| E014 | 2026-08-23 | only prefetch the next neighbor qvec when it is not already visited (skip wasted prefetches) | guard E007 prefetch with !visited.isSet | src/hnsw.zig | pending | — | — | — | running | vs host best 0.616ms |
+| E014 | 2026-08-23 | only prefetch the next neighbor qvec when it is not already visited (skip wasted prefetches) | guard E007 prefetch with !visited.isSet | src/hnsw.zig | pass | 0.710 / 0.575 | 0.3130 | +15.3% / -6.7% | keep | run1 miss, run2 decides (-6.7%); recall 0.3130. exact-scan also dipped on run2 (5.55→4.85) so treat 0.575 as noisy; still a protocol keep. New host best 0.575 |
