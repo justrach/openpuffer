@@ -114,6 +114,9 @@ Loop forever until interrupted. Each cycle:
    with verdict `discard` and why, and commit ONLY the ledger file — the
    discard commit must never contain reverted source changes.
 8. Go to 1. Never stop to ask whether to continue — you are autonomous.
+9. **Regenerate the chart** after closing a row: `python3 tools/plot_results.py`
+   rewrites `experiments/results.svg` from the ledger; include it in the same
+   commit as the ledger row.
 
 ## Budget rule
 
