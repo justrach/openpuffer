@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+.graff/
+engram/
+.DS_Store
