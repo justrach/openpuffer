@@ -53,8 +53,9 @@ def main():
         sys.exit("no numeric p50 rows found in " + str(LOG))
 
     best_id, best = min(
-        ((r["id"], min(r["runs"])) for r in plotted), key=lambda t: t[1]
-    )
+        ((r["id"], min(r["runs"])) for r in plotted if r["verdict"] == "keep"),
+        key=lambda t: t[1],
+    )  # lineage best: KEPT rows only — discards don't advance the best line
     floor = best * 0.96  # noise-floor rule: >=4% faster than best to keep
 
     W, H = 960, 420
