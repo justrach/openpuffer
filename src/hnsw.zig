@@ -331,35 +331,38 @@ pub fn Hnsw(comptime D: type) type {
             if (query.len != self.dim) return error.DimensionMismatch;
             const ep_id = self.entry_point orelse return alloc.alloc(SearchResult, 0);
             var norm_buf: [512]f32 = undefined;
+            var heap_nq: ?[]f32 = null;
+            defer if (heap_nq) |h| alloc.free(h);
             const nq: []const f32 = if (query.len <= norm_buf.len) blk: {
                 @memcpy(norm_buf[0..query.len], query);
                 vecmath.normalize(norm_buf[0..query.len]);
                 break :blk norm_buf[0..query.len];
             } else blk: {
-                const c = try alloc.alloc(f32, query.len);
-                @memcpy(c, query);
-                vecmath.normalize(c);
-                break :blk c;
+                heap_nq = try alloc.alloc(f32, query.len);
+                @memcpy(heap_nq.?, query);
+                vecmath.normalize(heap_nq.?);
+                break :blk heap_nq.?;
             };
 
-            // quantize the normalized query once
+            // quantize the normalized query once; reuse the amax scan for qs
             var qbuf: [512]i8 = undefined;
+            var amax: f32 = 0;
+            for (nq) |x| amax = @max(amax, @abs(x));
+            const scale = amax / 127.0;
+            const qs: f32 = scale;
+            var heap_qq: ?[]i8 = null;
+            defer if (heap_qq) |h| alloc.free(h);
             const qq: []const i8 = blk: {
-                var amax: f32 = 0;
-                for (nq) |x| amax = @max(amax, @abs(x));
-                const scale = amax / 127.0;
-                const buf = if (nq.len <= qbuf.len) qbuf[0..nq.len] else try alloc.alloc(i8, nq.len);
+                const buf = if (nq.len <= qbuf.len) qbuf[0..nq.len] else blk2: {
+                    heap_qq = try alloc.alloc(i8, nq.len);
+                    break :blk2 heap_qq.?;
+                };
                 if (scale == 0) {
                     @memset(buf, 0);
                 } else {
                     for (nq, 0..) |x, i| buf[i] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
                 }
                 break :blk buf;
-            };
-            const qs: f32 = blk: {
-                var amax: f32 = 0;
-                for (nq) |x| amax = @max(amax, @abs(x));
-                break :blk amax / 127.0;
             };
             const ctx = QDist{ .s = self, .qq = qq, .qs = qs };
 
