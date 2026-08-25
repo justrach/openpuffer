@@ -3,6 +3,9 @@
 //! The in-memory HNSW loop does no I/O — io_uring cannot make dots faster.
 //! It *can* cut the per-query HTTP cost (accept + recv + send + Nagle) that
 //! qa_bench / urllib pay by opening a new TCP connection every time.
+//! Concurrent queries are handled by a fixed OS-thread worker pool; each
+//! worker uses blocking posix read/write so keep-alive and parallel ANN
+//! searches do not serialize on the accept ring.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -71,6 +74,26 @@ const RingLinux = struct {
     }
 };
 
+/// Blocking read/write for worker threads when a second io_uring cannot be created.
+pub fn posixRecv(fd: std.posix.fd_t, buf: []u8) !usize {
+    if (!is_linux) return error.RecvFailed;
+    const res = std.os.linux.read(fd, buf.ptr, buf.len);
+    const e = std.os.linux.errno(res);
+    if (e != .SUCCESS) return error.RecvFailed;
+    return res;
+}
+
+pub fn posixSendAll(fd: std.posix.fd_t, data: []const u8) !void {
+    if (!is_linux) return error.SendFailed;
+    var off: usize = 0;
+    while (off < data.len) {
+        const res = std.os.linux.write(fd, data[off..].ptr, data.len - off);
+        const e = std.os.linux.errno(res);
+        if (e != .SUCCESS or res == 0) return error.SendFailed;
+        off += res;
+    }
+}
+
 /// How many bytes of `buf` form a complete HTTP/1.1 request, or 0 if more data needed.
 pub fn completeHttpRequest(buf: []const u8) usize {
     const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return 0;
@@ -111,9 +134,27 @@ pub fn parseHttpRequest(buf: []const u8) !HttpReq {
     };
 }
 
-pub fn formatResponse(alloc: std.mem.Allocator, status: u16, reason: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
-        status, reason, body.len, body,
+pub fn wantsClose(buf: []const u8) bool {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return true;
+    const head = buf[0..sep];
+    const nl = std.mem.indexOf(u8, head, "\r\n") orelse return true;
+    const line = head[0..nl];
+    if (std.mem.endsWith(u8, line, "HTTP/1.0")) return true;
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    _ = it.next();
+    while (it.next()) |hdr| {
+        if (hdr.len >= 11 and std.ascii.eqlIgnoreCase(hdr[0..11], "connection:")) {
+            const v = std.mem.trim(u8, hdr[11..], " \t");
+            if (std.ascii.eqlIgnoreCase(v, "close")) return true;
+        }
+    }
+    return false;
+}
+
+pub fn formatResponse(alloc: std.mem.Allocator, status: u16, reason: []const u8, body: []const u8, keepalive: bool) ![]u8 {
+    const conn = if (keepalive) "keep-alive" else "close";
+    return std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n{s}", .{
+        status, reason, body.len, conn, body,
     });
 }
 
@@ -122,6 +163,15 @@ test "completeHttpRequest waits for body" {
     try std.testing.expectEqual(@as(usize, 0), completeHttpRequest(partial));
     const full = "POST /v2/namespaces/x/query HTTP/1.1\r\nContent-Length: 5\r\n\r\nabcde";
     try std.testing.expectEqual(full.len, completeHttpRequest(full));
+}
+
+test "wantsClose honors Connection and HTTP/1.0" {
+    const c = "POST /q HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(wantsClose(c));
+    const k = "POST /q HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(!wantsClose(k));
+    const old = "POST /q HTTP/1.0\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(wantsClose(old));
 }
 
 test "parseHttpRequest extracts method path body" {

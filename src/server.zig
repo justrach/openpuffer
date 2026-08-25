@@ -263,8 +263,6 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     try out.flush();
 
     if (builtin.os.tag == .linux) {
-        try out.print("linux serve: io_uring accept/recv/send + TCP_NODELAY\n", .{});
-        try out.flush();
         serveIoUring(alloc, io, listener.socket.handle, &registry, o, out) catch |e| {
             try out.print("io_uring serve failed ({any}); falling back to thread-per-conn\n", .{e});
             try out.flush();
@@ -272,6 +270,79 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
         };
     } else {
         try serveThreaded(alloc, io, &listener, &registry, o, out);
+    }
+}
+
+fn workerCount() usize {
+    const n = std.Thread.getCpuCount() catch 4;
+    return @min(32, @max(4, n * 2));
+}
+
+const FdQueue = struct {
+    io: std.Io,
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    slots: [256]std.posix.fd_t = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+
+    fn push(self: *FdQueue, fd: std.posix.fd_t) void {
+        self.mu.lockUncancelable(self.io);
+        while (self.count == self.slots.len) {
+            self.cv.waitUncancelable(self.io, &self.mu);
+        }
+        self.slots[self.tail] = fd;
+        self.tail = (self.tail + 1) % self.slots.len;
+        self.count += 1;
+        self.cv.signal(self.io);
+        self.mu.unlock(self.io);
+    }
+
+    fn pop(self: *FdQueue) std.posix.fd_t {
+        self.mu.lockUncancelable(self.io);
+        while (self.count == 0) {
+            self.cv.waitUncancelable(self.io, &self.mu);
+        }
+        const fd = self.slots[self.head];
+        self.head = (self.head + 1) % self.slots.len;
+        self.count -= 1;
+        self.cv.signal(self.io);
+        self.mu.unlock(self.io);
+        return fd;
+    }
+};
+
+const PoolCtx = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    registry: *Registry,
+    o: Options,
+    queue: *FdQueue,
+};
+
+fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options) !*FdQueue {
+    const queue = try alloc.create(FdQueue);
+    queue.* = .{ .io = io };
+    const ctx = try alloc.create(PoolCtx);
+    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue };
+    const n = workerCount();
+    for (0..n) |_| {
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, poolWorker, .{ctx});
+        t.detach();
+    }
+    return queue;
+}
+
+fn poolWorker(ctx: *PoolCtx) void {
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(ctx.alloc);
+    store.resize(ctx.alloc, 1 << 16) catch return;
+    var xfer = ConnXfer{};
+    while (true) {
+        const fd = ctx.queue.pop();
+        handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store) catch {};
+        _ = std.os.linux.close(fd);
     }
 }
 
@@ -291,7 +362,7 @@ fn serveThreaded(
         };
         iouring.enableTcpNoDelay(stream.socket.handle);
         conn_sem.waitUncancelable(io);
-        const t = std.Thread.spawn(.{}, handleConnectionThread, .{ alloc, io, stream, registry, o, &conn_sem }) catch {
+        const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handleConnectionThread, .{ alloc, io, stream, registry, o, &conn_sem }) catch {
             conn_sem.post(io);
             handleConnection(alloc, io, stream, registry, o) catch {};
             continue;
@@ -308,6 +379,10 @@ fn serveIoUring(
     o: Options,
     out: *std.Io.Writer,
 ) !void {
+    _ = std.os.linux.listen(listen_fd, 1024);
+    const queue = try startWorkerPool(alloc, io, registry, o);
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers, TCP_NODELAY\n", .{workerCount()});
+    try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
     while (true) {
@@ -317,49 +392,71 @@ fn serveIoUring(
             continue;
         };
         iouring.enableTcpNoDelay(fd);
-        handleIoUringConn(&ring, fd, alloc, io, registry, o) catch {};
-        _ = std.os.linux.close(fd);
+        queue.push(fd);
     }
 }
 
+const ConnXfer = struct {
+    ring: ?*iouring.Ring = null,
+
+    fn recv(self: *ConnXfer, fd: std.posix.fd_t, buf: []u8) !usize {
+        if (self.ring) |r| return r.recv(fd, buf);
+        return iouring.posixRecv(fd, buf);
+    }
+
+    fn sendAll(self: *ConnXfer, fd: std.posix.fd_t, data: []const u8) !void {
+        if (self.ring) |r| return r.sendAll(fd, data);
+        return iouring.posixSendAll(fd, data);
+    }
+};
+
 fn handleIoUringConn(
-    ring: *iouring.Ring,
+    xfer: *ConnXfer,
     fd: std.posix.fd_t,
     alloc: std.mem.Allocator,
     io: std.Io,
     registry: *Registry,
     o: Options,
+    store: *std.ArrayList(u8),
 ) !void {
-    var store: std.ArrayList(u8) = .empty;
-    defer store.deinit(alloc);
-    try store.resize(alloc, 1 << 16);
     var n: usize = 0;
     while (true) {
-        if (n == store.items.len) {
-            const cap = store.items.len;
-            if (cap >= 8 << 20) return error.RequestTooLarge;
-            try store.resize(alloc, cap * 2);
+        while (iouring.completeHttpRequest(store.items[0..n]) == 0) {
+            if (n == store.items.len) {
+                const cap = store.items.len;
+                if (cap >= 8 << 20) return error.RequestTooLarge;
+                try store.resize(alloc, cap * 2);
+            }
+            const got = try xfer.recv(fd, store.items[n..]);
+            if (got == 0) return;
+            n += got;
         }
-        const got = try ring.recv(fd, store.items[n..]);
-        if (got == 0) break;
-        n += got;
-        if (iouring.completeHttpRequest(store.items[0..n]) != 0) break;
-    }
-    if (n == 0) return;
-    const raw = try iouring.parseHttpRequest(store.items[0..n]);
+        const used = iouring.completeHttpRequest(store.items[0..n]);
+        const raw = try iouring.parseHttpRequest(store.items[0..used]);
+        const keepalive = !iouring.wantsClose(store.items[0..used]);
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var res = Responder{ .raw_alloc = arena };
-    dispatch(arena, io, raw.method, raw.path, raw.body, registry, o, &res) catch {
-        res.raw_status = .internal_server_error;
-        res.raw_body = "{\"error\":\"internal\"}";
-    };
-    const status_n: u16 = @intFromEnum(res.raw_status);
-    const phrase = res.raw_status.phrase() orelse "OK";
-    const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body);
-    try ring.sendAll(fd, wire);
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var res = Responder{ .raw_alloc = arena };
+        dispatch(arena, io, raw.method, raw.path, raw.body, registry, o, &res) catch {
+            res.raw_status = .internal_server_error;
+            res.raw_body = "{\"error\":\"internal\"}";
+        };
+        const status_n: u16 = @intFromEnum(res.raw_status);
+        const phrase = res.raw_status.phrase() orelse "OK";
+        const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
+        try xfer.sendAll(fd, wire);
+
+        if (!keepalive) return;
+        if (used < n) {
+            const rest = n - used;
+            std.mem.copyForwards(u8, store.items[0..rest], store.items[used..n]);
+            n = rest;
+        } else {
+            n = 0;
+        }
+    }
 }
 
 fn handleConnectionThread(
