@@ -1,6 +1,11 @@
 //! HNSW (Hierarchical Navigable Small World) ANN index, in-memory.
 //! Cosine distance; vectors are L2-normalized on insert so
 //! cosine distance == 1 - dot, which keeps the inner loop tight.
+//!
+//! Memory layout is flat / mmap-shaped (one slab per array, not one malloc
+//! per vector or per neighbor list). On-disk next step is append-only
+//! segments: RecordID → {segment, offset, generation}. This file does not
+//! implement NVMe/SPDK/ZNS; see experiments/log.md.
 
 const std = @import("std");
 const vecmath = @import("vector.zig");
@@ -26,14 +31,24 @@ pub fn Hnsw(comptime D: type) type {
         opts: Options,
         rng: std.Random.DefaultPrng,
 
-        vectors: std.ArrayList([]f32) = .empty,
-        /// int8-quantized copies (symmetric per-vector scale) used to cut
-        /// memory traffic during graph traversal at high dimensionality.
-        qvecs: std.ArrayList([]i8) = .empty,
+        /// Packed f32 payload, stride `dim`. Replaces ArrayList([]f32).
+        vectors_flat: std.ArrayList(f32) = .empty,
+        /// Packed int8 payload, stride `dim`. Replaces ArrayList([]i8).
+        qvecs_flat: std.ArrayList(i8) = .empty,
         qscales: std.ArrayList(f32) = .empty,
         levels: std.ArrayList(u32) = .empty,
-        /// node_links[id] is a per-node list of per-layer neighbor lists.
-        node_links: std.ArrayList([]std.ArrayList(u32)) = .empty,
+
+        /// Layer-0 packed adjacency (CSR with fixed slack).
+        /// l0_nbrs stride = m0()+1 so a splice can temporarily exceed M.
+        l0_deg: std.ArrayList(u16) = .empty,
+        l0_nbrs: std.ArrayList(u32) = .empty,
+
+        /// Higher layers (1..level) packed the same way.
+        /// hi_start[id] indexes the first higher-layer slot in hi_deg / hi_nbrs.
+        hi_start: std.ArrayList(u32) = .empty,
+        hi_deg: std.ArrayList(u16) = .empty,
+        hi_nbrs: std.ArrayList(u32) = .empty,
+
         entry_point: ?u32 = null,
         max_level: u32 = 0,
 
@@ -47,22 +62,114 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.vectors.items) |v| self.allocator.free(v);
-            self.vectors.deinit(self.allocator);
-            for (self.qvecs.items) |v| self.allocator.free(v);
-            self.qvecs.deinit(self.allocator);
+            self.vectors_flat.deinit(self.allocator);
+            self.qvecs_flat.deinit(self.allocator);
             self.qscales.deinit(self.allocator);
             self.levels.deinit(self.allocator);
-            for (self.node_links.items) |layers| {
-                for (layers) |*l| l.deinit(self.allocator);
-                self.allocator.free(layers);
-            }
-            self.node_links.deinit(self.allocator);
+            self.l0_deg.deinit(self.allocator);
+            self.l0_nbrs.deinit(self.allocator);
+            self.hi_start.deinit(self.allocator);
+            self.hi_deg.deinit(self.allocator);
+            self.hi_nbrs.deinit(self.allocator);
             self.* = undefined;
         }
 
         pub fn len(self: *const Self) usize {
-            return self.vectors.items.len;
+            if (self.dim == 0) return 0;
+            return self.vectors_flat.items.len / self.dim;
+        }
+
+        inline fn m0(self: *const Self) usize {
+            return @as(usize, self.opts.m) * @as(usize, self.opts.m0_factor);
+        }
+
+        inline fn l0Stride(self: *const Self) usize {
+            return self.m0() + 1;
+        }
+
+        inline fn hiStride(self: *const Self) usize {
+            return @as(usize, self.opts.m) + 1;
+        }
+
+        /// Mutable f32 row. Server snapshot/WAL and `update` use this.
+        pub fn vector(self: *Self, id: u32) []f32 {
+            const off = @as(usize, id) * self.dim;
+            return self.vectors_flat.items[off..][0..self.dim];
+        }
+
+        pub fn vectorConst(self: *const Self, id: u32) []const f32 {
+            const off = @as(usize, id) * self.dim;
+            return self.vectors_flat.items[off..][0..self.dim];
+        }
+
+        pub fn qvec(self: *Self, id: u32) []i8 {
+            const off = @as(usize, id) * self.dim;
+            return self.qvecs_flat.items[off..][0..self.dim];
+        }
+
+        pub fn qvecConst(self: *const Self, id: u32) []const i8 {
+            const off = @as(usize, id) * self.dim;
+            return self.qvecs_flat.items[off..][0..self.dim];
+        }
+
+        pub fn layerCount(self: *const Self, id: u32) u32 {
+            return self.levels.items[id] + 1;
+        }
+
+        pub fn neighbors(self: *const Self, id: u32, layer: u32) []const u32 {
+            const deg = self.degree(id, layer);
+            return self.neighborSlotsConst(id, layer)[0..deg];
+        }
+
+        fn degree(self: *const Self, id: u32, layer: u32) usize {
+            if (layer == 0) return self.l0_deg.items[id];
+            const slot = self.hi_start.items[id] + (layer - 1);
+            return self.hi_deg.items[slot];
+        }
+
+        fn neighborSlotsConst(self: *const Self, id: u32, layer: u32) []const u32 {
+            if (layer == 0) {
+                const stride = self.l0Stride();
+                const off = @as(usize, id) * stride;
+                return self.l0_nbrs.items[off..][0..stride];
+            }
+            const slot = self.hi_start.items[id] + (layer - 1);
+            const stride = self.hiStride();
+            const off = slot * stride;
+            return self.hi_nbrs.items[off..][0..stride];
+        }
+
+        fn neighborSlots(self: *Self, id: u32, layer: u32) []u32 {
+            if (layer == 0) {
+                const stride = self.l0Stride();
+                const off = @as(usize, id) * stride;
+                return self.l0_nbrs.items[off..][0..stride];
+            }
+            const slot = self.hi_start.items[id] + (layer - 1);
+            const stride = self.hiStride();
+            const off = slot * stride;
+            return self.hi_nbrs.items[off..][0..stride];
+        }
+
+        fn setDegree(self: *Self, id: u32, layer: u32, deg: u16) void {
+            if (layer == 0) {
+                self.l0_deg.items[id] = deg;
+            } else {
+                const slot = self.hi_start.items[id] + (layer - 1);
+                self.hi_deg.items[slot] = deg;
+            }
+        }
+
+        fn pushNeighbor(self: *Self, id: u32, layer: u32, nid: u32) void {
+            const deg = self.degree(id, layer);
+            self.neighborSlots(id, layer)[deg] = nid;
+            self.setDegree(id, layer, @intCast(deg + 1));
+        }
+
+        fn replaceNeighbors(self: *Self, id: u32, layer: u32, ids: []const u32) void {
+            const slots = self.neighborSlots(id, layer);
+            @memcpy(slots[0..ids.len], ids);
+            self.setDegree(id, layer, @intCast(ids.len));
         }
 
         fn randomLevel(self: *Self) u32 {
@@ -72,28 +179,32 @@ pub fn Hnsw(comptime D: type) type {
             return @intFromFloat(std.math.floor(-std.math.log(f64, std.math.e, r) * self.opts.ml));
         }
 
+        pub fn nextLevel(self: *Self) u32 {
+            return self.randomLevel();
+        }
+
         inline fn distTo(self: *const Self, q: []const f32, id: u32) f32 {
-            return vecmath.cosineDistance(q, self.vectors.items[id]);
+            return vecmath.cosineDistance(q, self.vectorConst(id));
         }
 
         inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
             // stored vectors are unit-norm; a ~= aq * scale, so
             // cos(a,b) ~= dot(aq,bq) * qs * scale_b
-            const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecs.items[id]))) *
+            const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
                 qs * self.qscales.items[id];
             return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
         }
 
         /// Distance contexts let searchLayer run on either exact or quantized math.
         pub const F32Dist = struct {
-            s: *Self,
+            s: *const Self,
             q: []const f32,
             pub inline fn dist(d: @This(), id: u32) f32 {
                 return d.s.distTo(d.q, id);
             }
         };
         pub const QDist = struct {
-            s: *Self,
+            s: *const Self,
             qq: []const i8,
             qs: f32,
             pub inline fn dist(d: @This(), id: u32) f32 {
@@ -103,7 +214,7 @@ pub fn Hnsw(comptime D: type) type {
 
         /// greedy search on a single layer; `ef` bounds result set size.
         fn searchLayer(
-            self: *Self,
+            self: *const Self,
             dist_ctx: anytype,
             entry_points: []const Candidate,
             ef: usize,
@@ -144,19 +255,19 @@ pub fn Hnsw(comptime D: type) type {
                 const worst = if (results.count() > 0) results.peek().?.d else c.d;
                 if (c.d > worst and results.count() >= ef) break;
 
-                if (layer >= self.node_links.items[c.id].len) {
-                    std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.node_links.items[c.id].len, layer, self.max_level, self.entry_point, if (self.entry_point) |e| self.node_links.items[e].len else 0 });
+                if (layer >= self.layerCount(c.id)) {
+                    std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.layerCount(c.id), layer, self.max_level, self.entry_point, if (self.entry_point) |e| self.layerCount(e) else 0 });
                     @panic("hnsw invariant broken");
                 }
-                const neighbors = self.node_links.items[c.id][layer].items;
-                for (neighbors, 0..) |nid, ni| {
+                const nbrs = self.neighbors(c.id, layer);
+                for (nbrs, 0..) |nid, ni| {
                     // one-ahead software prefetch: the next neighbor's int8
                     // vector starts its memory fetch while we dot this one.
                     // Skip already-visited neighbors (wasted prefetches).
-                    if (ni + 1 < neighbors.len) {
-                        const nxt = neighbors[ni + 1];
+                    if (ni + 1 < nbrs.len) {
+                        const nxt = nbrs[ni + 1];
                         if (!visited.isSet(nxt)) {
-                            @prefetch(self.qvecs.items[nxt].ptr, .{
+                            @prefetch(self.qvecConst(nxt).ptr, .{
                                 .rw = .read,
                                 .locality = 3,
                                 .cache = .data,
@@ -187,7 +298,7 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn selectNeighborsHeuristic(
-            self: *Self,
+            self: *const Self,
             base: []const Candidate,
             max_m: u32,
             alloc: std.mem.Allocator,
@@ -204,7 +315,7 @@ pub fn Hnsw(comptime D: type) type {
                     continue;
                 }
                 for (selected.items) |s| {
-                    if (self.distTo(self.vectors.items[c.id], s.id) < c.d) {
+                    if (self.distTo(self.vectorConst(c.id), s.id) < c.d) {
                         try pruned.append(alloc, c);
                         continue :outer;
                     }
@@ -219,16 +330,16 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         /// Replace the vector at `id` in place (requantize; graph links stay).
-        pub fn update(self: *Self, id: u32, vector: []const f32) !void {
-            if (id >= self.vectors.items.len) return error.NotFound;
-            if (vector.len != self.dim) return error.DimensionMismatch;
-            const copy = self.vectors.items[id];
-            @memcpy(copy, vector);
+        pub fn update(self: *Self, id: u32, vector_in: []const f32) !void {
+            if (id >= self.len()) return error.NotFound;
+            if (vector_in.len != self.dim) return error.DimensionMismatch;
+            const copy = self.vector(id);
+            @memcpy(copy, vector_in);
             vecmath.normalize(copy);
             var amax: f32 = 0;
             for (copy) |x| amax = @max(amax, @abs(x));
             const scale = amax / 127.0;
-            const q8 = self.qvecs.items[id];
+            const q8 = self.qvec(id);
             if (scale == 0) {
                 @memset(q8, 0);
             } else {
@@ -237,84 +348,138 @@ pub fn Hnsw(comptime D: type) type {
             self.qscales.items[id] = scale;
         }
 
-        /// Insert a vector (copies it). Returns its id.
-        pub fn insert(self: *Self, vector: []const f32) !u32 {
-            if (vector.len != self.dim) return error.DimensionMismatch;
+        /// Neighbor picks for one insert. `copy`/`q8` are owned by the index
+        /// allocator; `layers` slices are owned by `scratch`.
+        pub const InsertPlan = struct {
+            copy: []f32,
+            q8: []i8,
+            scale: f32,
+            level: u32,
+            /// layers[i] = selected neighbor ids at graph layer i
+            layers: [][]u32,
+            scratch: std.mem.Allocator,
+
+            pub fn discard(self: InsertPlan, index_alloc: std.mem.Allocator) void {
+                index_alloc.free(self.copy);
+                index_alloc.free(self.q8);
+                for (self.layers) |ids| self.scratch.free(ids);
+                self.scratch.free(self.layers);
+            }
+        };
+
+        fn quantizeOwned(self: *const Self, vector_in: []const f32) !struct { copy: []f32, q8: []i8, scale: f32 } {
             const alloc = self.allocator;
-            const id: u32 = @intCast(self.vectors.items.len);
-
             const copy = try alloc.alloc(f32, self.dim);
-            @memcpy(copy, vector);
+            errdefer alloc.free(copy);
+            @memcpy(copy, vector_in);
             vecmath.normalize(copy);
-            try self.vectors.append(alloc, copy);
-
-            // int8-quantized copy for fast traversal
             var amax: f32 = 0;
             for (copy) |x| amax = @max(amax, @abs(x));
             const scale = amax / 127.0;
             const q8 = try alloc.alloc(i8, self.dim);
+            errdefer alloc.free(q8);
             if (scale == 0) {
                 @memset(q8, 0);
             } else {
                 for (copy, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
             }
-            try self.qvecs.append(alloc, q8);
+            return .{ .copy = copy, .q8 = q8, .scale = scale };
+        }
+
+        fn appendRecord(self: *Self, copy: []const f32, q8: []const i8, scale: f32, level: u32) !u32 {
+            const alloc = self.allocator;
+            const id: u32 = @intCast(self.len());
+            try self.vectors_flat.appendSlice(alloc, copy);
+            try self.qvecs_flat.appendSlice(alloc, q8);
             try self.qscales.append(alloc, scale);
-
-            const level = self.randomLevel();
             try self.levels.append(alloc, level);
+            try self.l0_deg.append(alloc, 0);
+            const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
+            @memset(l0_pad, 0);
+            try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
+            if (level > 0) {
+                const slots: usize = level;
+                const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
+                @memset(degs, 0);
+                const nbrs = try self.hi_nbrs.addManyAsSlice(alloc, slots * self.hiStride());
+                @memset(nbrs, 0);
+            }
+            return id;
+        }
 
-            const layers = try alloc.alloc(std.ArrayList(u32), level + 1);
-            for (layers) |*l| l.* = .empty;
-            try self.node_links.append(alloc, layers);
-
-            const max_m0 = self.opts.m * self.opts.m0_factor;
+        /// Read-only neighbor search for a new node. Caller must hold a shared
+        /// (or exclusive) lock so the graph arrays are stable.
+        pub fn planInsert(self: *const Self, vector_in: []const f32, level: u32, scratch: std.mem.Allocator) !InsertPlan {
+            if (vector_in.len != self.dim) return error.DimensionMismatch;
+            const q = try self.quantizeOwned(vector_in);
+            errdefer {
+                self.allocator.free(q.copy);
+                self.allocator.free(q.q8);
+            }
+            const n_layers: usize = @as(usize, @min(level, self.max_level)) + 1;
+            const layers = try scratch.alloc([]u32, n_layers);
+            errdefer scratch.free(layers);
+            for (layers) |*slot| slot.* = &.{};
 
             if (self.entry_point == null) {
-                self.entry_point = id;
-                self.max_level = level;
-                return id;
+                return .{ .copy = q.copy, .q8 = q.q8, .scale = q.scale, .level = level, .layers = layers, .scratch = scratch };
             }
 
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.vectors.items.len);
-            defer visited.deinit(alloc);
-
-            var ep: [1]Candidate = .{.{ .id = self.entry_point.?, .d = self.distTo(copy, self.entry_point.?) }};
+            var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len());
+            defer visited.deinit(scratch);
+            const fctx = F32Dist{ .s = self, .q = q.copy };
+            var ep: [1]Candidate = .{.{ .id = self.entry_point.?, .d = fctx.dist(self.entry_point.?) }};
             var cur = self.max_level;
             while (cur > level) : (cur -= 1) {
-                const res = try self.searchLayer(F32Dist{ .s = self, .q = copy }, &ep, 1, cur, &visited, alloc);
-                var res_mut = res;
-                defer res_mut.deinit(alloc);
-                ep[0] = res_mut.items[0];
+                var res = try self.searchLayer(fctx, &ep, 1, cur, &visited, scratch);
+                defer res.deinit(scratch);
+                ep[0] = res.items[0];
             }
-
             var eps: std.ArrayList(Candidate) = .empty;
-            defer eps.deinit(alloc);
-            try eps.append(alloc, ep[0]);
-
-            const top_connect = @min(level, self.max_level);
-
-            var l: i64 = @intCast(top_connect);
-            while (l >= 0) : (l -= 1) {
-                const layer: u32 = @intCast(l);
+            defer eps.deinit(scratch);
+            try eps.append(scratch, ep[0]);
+            const max_m0: u32 = @intCast(self.m0());
+            var li: i64 = @intCast(n_layers - 1);
+            while (li >= 0) : (li -= 1) {
+                const layer: u32 = @intCast(li);
                 const max_m: u32 = if (layer == 0) max_m0 else self.opts.m;
-                var found = try self.searchLayer(F32Dist{ .s = self, .q = copy }, eps.items, self.opts.ef_construction, layer, &visited, alloc);
-                defer found.deinit(alloc);
+                var found = try self.searchLayer(fctx, eps.items, self.opts.ef_construction, layer, &visited, scratch);
+                defer found.deinit(scratch);
+                const selected = try self.selectNeighborsHeuristic(found.items, max_m, scratch);
+                defer scratch.free(selected);
+                const ids = try scratch.alloc(u32, selected.len);
+                for (selected, ids) |s, *out| out.* = s.id;
+                layers[layer] = ids;
+                eps.clearRetainingCapacity();
+                for (found.items) |f| try eps.append(scratch, f);
+            }
+            return .{ .copy = q.copy, .q8 = q.q8, .scale = q.scale, .level = level, .layers = layers, .scratch = scratch };
+        }
 
-                const selected = try self.selectNeighborsHeuristic(found.items, max_m, alloc);
-                defer alloc.free(selected);
+        /// Splice a planned node into the graph. Caller must hold exclusive lock.
+        /// Copies `plan.copy` / `plan.q8` into the flat pools and frees them.
+        pub fn commitInsert(self: *Self, plan: InsertPlan) !u32 {
+            const alloc = self.allocator;
+            const id = try self.appendRecord(plan.copy, plan.q8, plan.scale, plan.level);
+            alloc.free(plan.copy);
+            alloc.free(plan.q8);
 
-                for (selected) |s| {
-                    try self.node_links.items[id][layer].append(alloc, s.id);
-                    const back = &self.node_links.items[s.id][layer];
-                    try back.append(alloc, id);
-                    if (back.items.len > max_m) {
-                        // shrink: keep closest to s.id
+            const max_m0: u32 = @intCast(self.m0());
+            const connect_n = @min(plan.layers.len, self.layerCount(id));
+            var layer: u32 = 0;
+            while (layer < connect_n) : (layer += 1) {
+                const max_m: u32 = if (layer == 0) max_m0 else self.opts.m;
+                for (plan.layers[layer]) |nid| {
+                    if (nid >= self.len() or layer >= self.layerCount(nid)) continue;
+                    self.pushNeighbor(id, layer, nid);
+                    self.pushNeighbor(nid, layer, id);
+                    if (self.degree(nid, layer) > max_m) {
                         var cands: std.ArrayList(Candidate) = .empty;
                         defer cands.deinit(alloc);
-                        try cands.ensureTotalCapacity(alloc, back.items.len);
-                        for (back.items) |n| {
-                            cands.appendAssumeCapacity(.{ .id = n, .d = self.distTo(self.vectors.items[s.id], n) });
+                        const back = self.neighbors(nid, layer);
+                        try cands.ensureTotalCapacity(alloc, back.len);
+                        for (back) |n| {
+                            cands.appendAssumeCapacity(.{ .id = n, .d = self.distTo(self.vectorConst(nid), n) });
                         }
                         std.mem.sort(Candidate, cands.items, {}, struct {
                             fn cmp(_: void, a: Candidate, b: Candidate) bool {
@@ -323,19 +488,30 @@ pub fn Hnsw(comptime D: type) type {
                         }.cmp);
                         const pruned = try self.selectNeighborsHeuristic(cands.items, max_m, alloc);
                         defer alloc.free(pruned);
-                        back.clearRetainingCapacity();
-                        for (pruned) |p| try back.append(alloc, p.id);
+                        var ids: std.ArrayList(u32) = .empty;
+                        defer ids.deinit(alloc);
+                        try ids.ensureTotalCapacity(alloc, pruned.len);
+                        for (pruned) |p| ids.appendAssumeCapacity(p.id);
+                        self.replaceNeighbors(nid, layer, ids.items);
                     }
                 }
-                eps.clearRetainingCapacity();
-                for (found.items) |f| try eps.append(alloc, f);
             }
+            for (plan.layers) |ids| plan.scratch.free(ids);
+            plan.scratch.free(plan.layers);
 
-            if (level > self.max_level) {
-                self.max_level = level;
+            if (self.entry_point == null or plan.level > self.max_level) {
+                self.max_level = plan.level;
                 self.entry_point = id;
             }
             return id;
+        }
+
+        /// Insert a vector (copies it). Returns its id.
+        pub fn insert(self: *Self, vector_in: []const f32) !u32 {
+            if (vector_in.len != self.dim) return error.DimensionMismatch;
+            const level = self.randomLevel();
+            const plan = try self.planInsert(vector_in, level, self.allocator);
+            return self.commitInsert(plan);
         }
 
         /// k-ANN search: graph traversal runs on int8 distances (4x less memory
@@ -398,7 +574,7 @@ pub fn Hnsw(comptime D: type) type {
             };
             const ctx = QDist{ .s = self, .qq = qq, .qs = qs };
 
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.vectors.items.len);
+            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len());
             defer visited.deinit(alloc);
 
             var ep: [1]Candidate = .{.{ .id = ep_id, .d = ctx.dist(ep_id) }};
@@ -437,20 +613,25 @@ pub fn Hnsw(comptime D: type) type {
 
         pub fn serializedSize(self: *const Self) usize {
             var n: usize = 48; // header
-            const count = self.vectors.items.len;
+            const count = self.len();
             n += count * 4; // levels
             n += count * 4; // qscales
             n += count * self.dim * 4; // f32
             n += count * self.dim; // i8
-            for (self.node_links.items) |layers| {
+            var id: u32 = 0;
+            while (id < count) : (id += 1) {
+                const n_layers = self.layerCount(id);
                 n += 4; // n_layers
-                for (layers) |l| n += 4 + l.items.len * 4;
+                var layer: u32 = 0;
+                while (layer < n_layers) : (layer += 1) {
+                    n += 4 + self.degree(id, layer) * 4;
+                }
             }
             return n;
         }
 
         /// Little-endian graph blob: header + levels + qscales + f32 + i8 + links.
-        /// Does not include external document ids.
+        /// Does not include external document ids. On-disk format is unchanged.
         pub fn serialize(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
             const buf = try alloc.alloc(u8, self.serializedSize());
             errdefer alloc.free(buf);
@@ -468,7 +649,7 @@ pub fn Hnsw(comptime D: type) type {
             wr.u32le(buf, &i, GRAPH_MAGIC);
             wr.u32le(buf, &i, GRAPH_VERSION);
             wr.u64le(buf, &i, self.dim);
-            wr.u64le(buf, &i, self.vectors.items.len);
+            wr.u64le(buf, &i, self.len());
             wr.u32le(buf, &i, self.entry_point orelse std.math.maxInt(u32));
             wr.u32le(buf, &i, self.max_level);
             wr.u32le(buf, &i, self.opts.m);
@@ -481,20 +662,21 @@ pub fn Hnsw(comptime D: type) type {
                 const bits: u32 = @bitCast(s);
                 wr.u32le(buf, &i, bits);
             }
-            for (self.vectors.items) |v| {
-                const bytes = std.mem.sliceAsBytes(v);
-                @memcpy(buf[i..][0..bytes.len], bytes);
-                i += bytes.len;
-            }
-            for (self.qvecs.items) |v| {
-                @memcpy(buf[i..][0..v.len], std.mem.sliceAsBytes(v));
-                i += v.len;
-            }
-            for (self.node_links.items) |layers| {
-                wr.u32le(buf, &i, @intCast(layers.len));
-                for (layers) |l| {
-                    wr.u32le(buf, &i, @intCast(l.items.len));
-                    for (l.items) |nid| wr.u32le(buf, &i, nid);
+            const fbytes = std.mem.sliceAsBytes(self.vectors_flat.items);
+            @memcpy(buf[i..][0..fbytes.len], fbytes);
+            i += fbytes.len;
+            const qbytes = std.mem.sliceAsBytes(self.qvecs_flat.items);
+            @memcpy(buf[i..][0..qbytes.len], qbytes);
+            i += qbytes.len;
+            var id: u32 = 0;
+            while (id < self.len()) : (id += 1) {
+                const n_layers = self.layerCount(id);
+                wr.u32le(buf, &i, n_layers);
+                var layer: u32 = 0;
+                while (layer < n_layers) : (layer += 1) {
+                    const nbrs = self.neighbors(id, layer);
+                    wr.u32le(buf, &i, @intCast(nbrs.len));
+                    for (nbrs) |nid| wr.u32le(buf, &i, nid);
                 }
             }
             if (i != buf.len) return error.SerializeSizeMismatch;
@@ -503,7 +685,7 @@ pub fn Hnsw(comptime D: type) type {
 
         /// Populate an empty index from `serialize` output. No HNSW rebuild.
         pub fn load(self: *Self, bytes: []const u8) !void {
-            if (self.vectors.items.len != 0) return error.NotEmpty;
+            if (self.len() != 0) return error.NotEmpty;
             if (bytes.len < 48) return error.Truncated;
             var i: usize = 0;
             const rd = struct {
@@ -527,14 +709,14 @@ pub fn Hnsw(comptime D: type) type {
             const ep_raw = try rd.u32le(bytes, &i);
             const max_level = try rd.u32le(bytes, &i);
             const m = try rd.u32le(bytes, &i);
-            const m0 = try rd.u32le(bytes, &i);
+            const m0_factor = try rd.u32le(bytes, &i);
             const efc = try rd.u32le(bytes, &i);
             const flags = try rd.u32le(bytes, &i);
             _ = flags;
             if (self.dim == 0) self.dim = dim;
             if (self.dim != dim) return error.DimensionMismatch;
             self.opts.m = m;
-            self.opts.m0_factor = m0;
+            self.opts.m0_factor = m0_factor;
             self.opts.ef_construction = efc;
             self.max_level = max_level;
             self.entry_point = if (ep_raw == std.math.maxInt(u32)) null else ep_raw;
@@ -542,51 +724,58 @@ pub fn Hnsw(comptime D: type) type {
             const alloc = self.allocator;
             try self.levels.ensureTotalCapacity(alloc, n);
             try self.qscales.ensureTotalCapacity(alloc, n);
-            try self.vectors.ensureTotalCapacity(alloc, n);
-            try self.qvecs.ensureTotalCapacity(alloc, n);
-            try self.node_links.ensureTotalCapacity(alloc, n);
+            try self.vectors_flat.ensureTotalCapacity(alloc, n * dim);
+            try self.qvecs_flat.ensureTotalCapacity(alloc, n * dim);
+            try self.l0_deg.ensureTotalCapacity(alloc, n);
+            try self.l0_nbrs.ensureTotalCapacity(alloc, n * self.l0Stride());
+            try self.hi_start.ensureTotalCapacity(alloc, n);
 
             for (0..n) |_| self.levels.appendAssumeCapacity(try rd.u32le(bytes, &i));
             for (0..n) |_| {
                 const bits = try rd.u32le(bytes, &i);
                 self.qscales.appendAssumeCapacity(@bitCast(bits));
             }
-            for (0..n) |_| {
-                const nbytes = dim * @sizeOf(f32);
-                if (i + nbytes > bytes.len) return error.Truncated;
-                const copy = try alloc.alloc(f32, dim);
-                @memcpy(std.mem.sliceAsBytes(copy), bytes[i..][0..nbytes]);
-                i += nbytes;
-                self.vectors.appendAssumeCapacity(copy);
-            }
-            for (0..n) |_| {
-                if (i + dim > bytes.len) return error.Truncated;
-                const copy = try alloc.alloc(i8, dim);
-                @memcpy(std.mem.sliceAsBytes(copy), bytes[i..][0..dim]);
-                i += dim;
-                self.qvecs.appendAssumeCapacity(copy);
-            }
-            for (0..n) |_| {
+            const fnbytes = n * dim * @sizeOf(f32);
+            if (i + fnbytes > bytes.len) return error.Truncated;
+            const fdest = try self.vectors_flat.addManyAsSlice(alloc, n * dim);
+            @memcpy(std.mem.sliceAsBytes(fdest), bytes[i..][0..fnbytes]);
+            i += fnbytes;
+            const qnbytes = n * dim;
+            if (i + qnbytes > bytes.len) return error.Truncated;
+            const qdest = try self.qvecs_flat.addManyAsSlice(alloc, n * dim);
+            @memcpy(std.mem.sliceAsBytes(qdest), bytes[i..][0..qnbytes]);
+            i += qnbytes;
+
+            var id: u32 = 0;
+            while (id < n) : (id += 1) {
                 const n_layers: usize = @intCast(try rd.u32le(bytes, &i));
-                const layers = try alloc.alloc(std.ArrayList(u32), n_layers);
-                for (layers) |*l| l.* = .empty;
-                errdefer {
-                    for (layers) |*l| l.deinit(alloc);
-                    alloc.free(layers);
+                const level: u32 = if (n_layers == 0) 0 else @intCast(n_layers - 1);
+                if (id >= self.levels.items.len) return error.Truncated;
+                self.levels.items[id] = level;
+                self.l0_deg.appendAssumeCapacity(0);
+                const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
+                @memset(l0_pad, 0);
+                try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
+                if (level > 0) {
+                    const slots: usize = level;
+                    const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
+                    @memset(degs, 0);
+                    const nbrs = try self.hi_nbrs.addManyAsSlice(alloc, slots * self.hiStride());
+                    @memset(nbrs, 0);
                 }
-                for (layers) |*l| {
+                var layer: u32 = 0;
+                while (layer < n_layers) : (layer += 1) {
                     const deg: usize = @intCast(try rd.u32le(bytes, &i));
-                    try l.ensureTotalCapacity(alloc, deg);
+                    if (deg > self.neighborSlots(id, layer).len) return error.DegreeOverflow;
                     var k: usize = 0;
                     while (k < deg) : (k += 1) {
-                        l.appendAssumeCapacity(try rd.u32le(bytes, &i));
+                        self.neighborSlots(id, layer)[k] = try rd.u32le(bytes, &i);
                     }
+                    self.setDegree(id, layer, @intCast(deg));
                 }
-                self.node_links.appendAssumeCapacity(layers);
             }
             if (i != bytes.len) return error.TrailingBytes;
         }
-
     };
 }
 
@@ -648,7 +837,7 @@ test "layer-0 connectivity and recall on clustered data" {
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const id = queue.items[head];
-        for (index.node_links.items[id][0].items) |nb| {
+        for (index.neighbors(id, 0)) |nb| {
             if (!visited.isSet(nb)) {
                 visited.set(nb);
                 try queue.append(alloc, nb);
@@ -670,8 +859,9 @@ test "layer-0 connectivity and recall on clustered data" {
     var all: std.ArrayList(GT) = .empty;
     const nq = try alloc.dupe(f32, &q);
     vecmath.normalize(nq);
-    for (index.vectors.items, 0..) |row, idx| {
-        try all.append(alloc, .{ .id = @intCast(idx), .d = vecmath.cosineDistance(nq, row) });
+    var idx: u32 = 0;
+    while (idx < index.len()) : (idx += 1) {
+        try all.append(alloc, .{ .id = idx, .d = vecmath.cosineDistance(nq, index.vectorConst(idx)) });
     }
     std.mem.sort(GT, all.items, {}, struct {
         fn lt(_: void, a: GT, b: GT) bool {
@@ -687,9 +877,11 @@ test "layer-0 connectivity and recall on clustered data" {
             }
         }
     }
+    const recall = @as(f64, @floatFromInt(hits)) / 10.0;
     std.debug.print("recall@10 vs brute force: {d:.3} (ann best {d:.4} vs gt best {d:.4} id {d})\n", .{
-        @as(f64, @floatFromInt(hits)) / 10.0, res[0].distance, all.items[0].d, all.items[0].id,
+        recall, res[0].distance, all.items[0].d, all.items[0].id,
     });
+    try std.testing.expectEqual(@as(usize, 10), hits);
 }
 
 test "hnsw update replaces vector without growing the index" {
@@ -740,10 +932,12 @@ test "hnsw serialize/load preserves neighbors and search" {
     try std.testing.expectEqual(index.len(), loaded.len());
     try std.testing.expectEqual(index.entry_point, loaded.entry_point);
     try std.testing.expectEqual(index.max_level, loaded.max_level);
-    for (index.node_links.items, loaded.node_links.items) |a, b| {
-        try std.testing.expectEqual(a.len, b.len);
-        for (a, b) |al, bl| {
-            try std.testing.expectEqualSlices(u32, al.items, bl.items);
+    var id: u32 = 0;
+    while (id < index.len()) : (id += 1) {
+        try std.testing.expectEqual(index.layerCount(id), loaded.layerCount(id));
+        var layer: u32 = 0;
+        while (layer < index.layerCount(id)) : (layer += 1) {
+            try std.testing.expectEqualSlices(u32, index.neighbors(id, layer), loaded.neighbors(id, layer));
         }
     }
     const after = try loaded.search(&v, 5, 64, alloc);
