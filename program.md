@@ -57,6 +57,11 @@ Score rules:
   floor is an instant discard regardless of speed).
 - Compare on the same machine state as the previous best; note anomalies
   (thermal load, background builds) in the ledger notes column.
+- **Re-baseline rule (added after E007)**: run-to-run ambient drift on this
+  machine can reach ±5%, larger than most candidate effects. Before trusting
+  any sub-8% comparison, re-measure the CURRENT BEST tree (revert your edit,
+  bench twice) and compare against THAT number, not the historical best. Log
+  both control values in the row's notes. Historical bests go stale.
 
 Reference baseline (M1 Mac, 2026-08-23): p50 0.981–1.013 ms across runs,
 recall@10 = 0.3130. Best-so-far entering E001 is **0.981 ms** (the lower of
