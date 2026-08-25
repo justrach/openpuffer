@@ -527,14 +527,22 @@ def main():
             f"write {cmp['write_error_rate_mixed']*100:.2f}%"
         )
         if cmp["writers_stall_readers"]:
-            print(
-                "writers stall readers: YES — mixed query p50 still tracks writes "
-                "(exclusive section or DRAM contention)."
-            )
+            wp = cmp["write_p50_ms"]
+            mq = cmp["query_p50_mixed_ms"]
+            if wp and mq and mq < 0.85 * wp:
+                print(
+                    "writers stall readers: mixed query p50 is above idle but does "
+                    "not track write p50 (DRAM/CPU share; exclusive is grow-only)."
+                )
+            else:
+                print(
+                    "writers stall readers: YES — mixed query p50 still tracks writes "
+                    "(exclusive section or DRAM contention)."
+                )
         else:
             print(
                 "writers stall readers: not obvious at p50/p95 — query p50 does "
-                "not track write p50 (publish is exclusive; splice is shared)."
+                "not track write p50 (publish is reserved-slab; splice is shared)."
             )
 
         out = {
