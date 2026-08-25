@@ -9,6 +9,7 @@ Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022
 Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
 Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB (no recall; `--no-exact`). 2M does not fit. Numbers live in the Scale section below — do not put them in the E-table p50 cell or results.svg.
 Multi-instance sharding (N serve processes + Python router) is a **separate** design note below the Scale section — not an E-row.
+mmap slabs (E028, memory track): load-via-mmap RSS Δ**0.0 MiB** vs load-via-alloc **373.2 MiB** at n=50k / **1492.7 MiB** at n=200k (dim=1536, blank-slab reopen). Not an E-table p50. See Memory/mmap below.
 
 ![p50 per experiment](results.svg)
 
@@ -23,6 +24,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 - **RecordID → {segment, offset, generation}** on large append-only segments.
 - Updates append a new record and bump generation; readers ignore stale gen.
 - Segments are mmap/O_DIRECT-friendly; compaction rewrites live records.
+- Flat-slab mmap reopen is implemented (E028): HMLS file, MAP_PRIVATE, heap append buffer.
 - Do **not** plumb raw NVMe/SPDK/ZNS until the address map and flatten prove out.
 
 | id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | track | notes |
@@ -55,6 +57,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 | E025 | 2026-08-25 | 1M-scale RSS (~9 GB at 800k, 11.2 GB at 1M) is mostly GPA headers + size-class waste on ~4M live allocs, not payload; flatten f32/i8 pools and pack the graph as fixed-slack CSR so the layout is mmap/SSD-shaped | vectors_flat + qvecs_flat stride dim; layer-0/higher-layer packed neighbors (stride m0+1 / m+1); accessors for distTo/distQ/prefetch/update/planInsert/commitInsert/serialize/load | src/hnsw.zig | pass | 0.744 / 0.581 | 0.3130 | +29% / +1.0% vs host best 0.575 (run2 within noise) | keep | memory | MEMORY keep (not a p50 keep — E004's ~3% was below the 4% bar; re-landed because 1M RSS is the score). Clustered recall@10 = 1.0; serialize/load test pass. RSS no-corpus GPA: n=20k 221.1→150.2 MiB (−32%); n=50k 527.0→374.3 MiB (−29%). Old 1M bench (left running, finished on its own) post-build 11153 MiB / p50 12.7ms. Linear 1M estimate for flatten ≈ 7.5 GiB. Chart not regenerated (E023/E024 serving cells stay HTTP-tagged; do not mix into results.svg). No NVMe/SPDK/ZNS. |
 | E026 | 2026-08-25 | Pareto surface at scale is an (n, ef, distribution) problem, not a 20k p50 micro-opt; expose the existing rerank_mult knob and one-build ef/clustered sweeps so we can find the smallest ef that holds recall@10 ≥ 0.30 | CLI `--rerank-mult` / `--ef-sweep` / `--clustered` (mixture-of-Gaussians); serve + per-query `rerank_mult`; search() default still 4 | src/hnsw.zig src/main.zig src/server.zig tools/qa_bench.py | pass | 0.639 | 0.3130 | +11% vs E025 run2 0.575 (within flatten-host noise; not a p50 claim) | keep | knobs | KNOB/DOCS keep. Scored metric unchanged (searchAdvanced(..., 4) ≡ search()). Scale n×ef lives in the Pareto section below — do not read 1M/200k p50s from this cell. Random cannot hold 0.30 at 200k even at ef=1024; clustered holds 0.98–1.00 from ef=64 through 200k. Flatten 1M `--no-exact`: RSS **7481 MiB** / ef=128 p50 **1.410 ms** (old layout 11153 MiB / 12.7 ms). |
 | E027 | 2026-08-25 | drop the hot-path f32 copy (optional store_f32 / `--no-f32`) so 2M×1536 can fit on 16 GiB after E025 flatten | Options.store_f32 default true; `--no-f32` skips f32 slab; int8 traversal; rerank only if f32 present; serialize v2 omits f32, load still accepts v1 | src/hnsw.zig src/main.zig | pass | 0.679 | 0.3105 | +18% vs E022 0.575 (not a p50 claim) | keep | memory | MEMORY keep. Scored command unchanged (default still stores f32). `--no-f32` 20k recall **0.3100** (−0.0005). RSS `--no-exact`: 50k 375→**82** MiB; 200k 1689→**323** MiB. 2M `--no-exact --no-f32 --ef 128` **fits**: post-build **3222 MiB** (p50 1.760 ms — Scale section only, not this cell / not results.svg). Flatten 1M f32+i8 was 7481 MiB; dropping f32 is the ~5.7 GiB save. |
+| E028 | 2026-08-26 | mmap the flat HNSW slabs so a snapshot reopen is demand-paged (no copy-in of vectors_flat / qvecs_flat / packed CSR) | HMLS slab file; POSIX mmap MAP_PRIVATE; heap ArrayLists are the post-mmap append buffer; persist SNAP v2 envelope + page-aligned HMLS; atomic tmp+fsync+rename | src/hnsw.zig src/persist.zig | pass | — | — | — | keep | memory | MEMORY keep: MAP_PRIVATE + heap append. Reopen RSS ~0.8 MiB vs ~1.5 GiB alloc. load-via-mmap vs load-via-alloc (blank slabs, dim=1536): n=50k **Δ0.0 vs Δ373.2 MiB**; n=200k **Δ0.0 vs Δ1492.7 MiB**. Touching one mapped row stays Δ0.0. Snapshot file is never written by load/insert. Combined with E027 drop-f32 on GRAPH serialize. No NVMe/SPDK/ZNS. |
 
 ## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
 
@@ -91,7 +94,7 @@ What is left at 1–2M:
 - **Recall at scale**: raise ef (or M / ef_construction) once n is large; measure on clustered embeddings, not only random.
 - **Memory layout**: E025 flatten **measured** at 1M `--no-exact`: RSS **7481 MiB** (old layout 11153 MiB, −33%). Payload was the estimate; GPA waste is gone.
 - **Drop the f32 copy** (E027, done): `--no-f32` / `store_f32=false`. 50k 375→82 MiB; 200k 1689→323 MiB; **2M fits at 3222 MiB**. Default still stores f32 so the 20k scored bench is unchanged.
-- **mmap** the flat pools so RSS is demand-paged.
+- **mmap** the flat pools so RSS is demand-paged — **done in E028** (see Memory/mmap below).
 - `rerank_mult` is now `--rerank-mult` (default still 4). At 20k/ef=128, mult=1 and mult=8 both recall **0.3280** — rerank cannot recover neighbors that ef never found.
 - Do not HTTP-upsert 1–2M; in-process insert is the only sane load path.
 
@@ -113,6 +116,37 @@ Default `store_f32=true`. `--no-f32` skips the packed f32 slab; search is int8-o
 | 2M | on | ~17 GiB (200k×10) | | skipped; over 14 GiB bar |
 
 20k `--no-f32` recall stays above the 0.30 floor. On this random 1536-d set rerank was not finding extra neighbors (E026 `rerank_mult` same lesson).
+
+## Memory / mmap (not an E-row p50) — 2026-08-25
+
+HMLS slab file + POSIX `mmap(..., PROT_READ|PROT_WRITE, MAP_PRIVATE)`.
+`loadMmap` does not copy `vectors_flat` / `qvecs_flat` / packed CSR; RSS is
+demand-paged. `loadSlabsFile` / `loadSlabsCopy` is the old copy-in path.
+
+**Growth.** Mapped nodes stay in the MAP_PRIVATE view. Neighbor splices and
+`update` on those ids write COW pages (never dirty the file). New inserts go
+to the existing heap ArrayLists (append buffer). `len()` = mapped_n + heap_n.
+A later `writeSlabs` / `writeSlabSnapshotFile` rewrites a new snapshot
+atomically (`path.tmp` → fdatasync → rename).
+
+**Crash / safety.** The snapshot fd is opened read-only. MAP_PRIVATE writes
+are process-private. A crash mid-insert or mid-rewrite leaves the previous
+`path` intact (a leftover `path.tmp` is ignored). Same durability as “WAL
+then compact”: uncommitted inserts are lost; the last successful snapshot
+is not corrupted. Do not use MAP_SHARED for live mutation.
+
+Blank-slab reopen (dim=1536, no HNSW build — payload bytes only):
+
+| n | load | RSS after open | Δ vs baseline | notes |
+|---|------|----------------|---------------|-------|
+| 50k | mmap | 0.8 MiB | **0.0** | one-row touch still 0.8 |
+| 50k | alloc | 374.0 MiB | **373.2** | matches E025 flatten ~374 MiB |
+| 200k | mmap | 0.8 MiB | **0.0** | |
+| 200k | alloc | 1493.5 MiB | **1492.7** | ≈ 4× the 50k copy-in |
+
+A live query walk will fault in touched pages (payload + CSR rows), so
+serve RSS after traffic is “working set”, not “full index”. Full-index RSS
+is still the alloc number unless `--no-f32` (E027) is also used. No 200k engine p50 in the E-table.
 
 ## Pareto (n × ef, dim=1536) — 2026-08-25, flatten tree, 50 queries
 

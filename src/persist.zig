@@ -15,6 +15,8 @@ const Hnsw = hnsw_mod.Hnsw(void);
 
 pub const SNAP_MAGIC: u32 = 0x4E53504F; // 'OPSN' le
 pub const SNAP_VERSION: u32 = 1;
+/// Envelope + page-aligned HMLS slab image (mmap reopen, no copy-in).
+pub const SNAP_VERSION_SLAB: u32 = 2;
 
 /// Parse a WAL object filename (prefix already stripped) into a seq number.
 /// Accepts `00000000000000000001.json` and bare integers.
@@ -257,6 +259,66 @@ pub const Store = struct {
         @memcpy(buf[i..], graph);
         return buf;
     }
+
+    /// Local mmap-shaped snapshot: OPSN v2 envelope + page-aligned HMLS.
+    /// Written atomically (`path.tmp` → fsync → rename). Reopen with
+    /// `Hnsw.loadMmap(path)` — the file is never opened writeable by load.
+    pub fn writeSlabSnapshotFile(
+        path: []const u8,
+        seq: u64,
+        dim: usize,
+        doc_ids: []const u64,
+        index: *const Hnsw,
+    ) !void {
+        const linux = std.os.linux;
+        const posix = std.posix;
+        var tmp_buf: [posix.PATH_MAX]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+        const fd = try posix.openat(posix.AT.FDCWD, tmp, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644);
+        var closed = false;
+        defer {
+            if (!closed) _ = linux.close(fd);
+        }
+        errdefer {
+            if (posix.toPosixPath(tmp)) |z| {
+                _ = linux.unlink(&z);
+            } else |_| {}
+        }
+
+        const n = doc_ids.len;
+        var hdr: [32]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], SNAP_MAGIC, .little);
+        std.mem.writeInt(u32, hdr[4..8], SNAP_VERSION_SLAB, .little);
+        std.mem.writeInt(u64, hdr[8..16], seq, .little);
+        std.mem.writeInt(u64, hdr[16..24], dim, .little);
+        std.mem.writeInt(u64, hdr[24..32], n, .little);
+
+        var wrote = linux.pwrite(fd, &hdr, hdr.len, 0);
+        if (posix.errno(wrote) != .SUCCESS or wrote != hdr.len) return error.WriteFailed;
+        if (n > 0) {
+            const id_bytes = std.mem.sliceAsBytes(doc_ids);
+            var done: usize = 0;
+            while (done < id_bytes.len) {
+                wrote = linux.pwrite(fd, id_bytes[done..].ptr, id_bytes.len - done, @intCast(32 + done));
+                if (posix.errno(wrote) != .SUCCESS) return error.WriteFailed;
+                done += wrote;
+            }
+        }
+        const hmls_off: u64 = Hnsw.pageAlign(32 + n * 8);
+        _ = try index.writeSlabsAt(fd, hmls_off);
+        if (posix.errno(linux.fdatasync(fd)) != .SUCCESS) return error.SyncFailed;
+        _ = linux.close(fd);
+        closed = true;
+        const z_tmp = try posix.toPosixPath(tmp);
+        const z_dst = try posix.toPosixPath(path);
+        if (posix.errno(linux.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst)) != .SUCCESS)
+            return error.RenameFailed;
+    }
 };
 
 pub const BinaryHeader = struct {
@@ -265,6 +327,7 @@ pub const BinaryHeader = struct {
     n: usize,
     doc_ids_off: usize,
     graph_off: usize,
+    version: u32 = SNAP_VERSION,
 };
 
 pub fn parseBinaryHeader(body: []const u8) !BinaryHeader {
@@ -272,14 +335,14 @@ pub fn parseBinaryHeader(body: []const u8) !BinaryHeader {
     const magic = std.mem.readInt(u32, body[0..4], .little);
     if (magic != SNAP_MAGIC) return error.BadMagic;
     const version = std.mem.readInt(u32, body[4..8], .little);
-    if (version != SNAP_VERSION) return error.UnsupportedVersion;
+    if (version != SNAP_VERSION and version != SNAP_VERSION_SLAB) return error.UnsupportedVersion;
     const seq = std.mem.readInt(u64, body[8..16], .little);
     const dim: usize = @intCast(std.mem.readInt(u64, body[16..24], .little));
     const n: usize = @intCast(std.mem.readInt(u64, body[24..32], .little));
     const doc_off: usize = 32;
-    const graph_off = 32 + n * 8;
-    if (body.len < graph_off) return error.Truncated;
-    return .{ .seq = seq, .dim = dim, .n = n, .doc_ids_off = doc_off, .graph_off = graph_off };
+    const raw_graph = 32 + n * 8;
+    const graph_off = if (version == SNAP_VERSION_SLAB) Hnsw.pageAlign(raw_graph) else raw_graph;
+    return .{ .seq = seq, .dim = dim, .n = n, .doc_ids_off = doc_off, .graph_off = graph_off, .version = version };
 }
 
 pub fn docIdsFromBinary(body: []const u8, hdr: BinaryHeader, out: []u64) void {
@@ -333,6 +396,38 @@ test "binary snapshot header roundtrip" {
     var loaded = Hnsw.init(alloc, 4, .{});
     defer loaded.deinit();
     try loaded.load(body[hdr.graph_off..]);
+    try std.testing.expectEqual(index.len(), loaded.len());
+    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+}
+
+test "slab snapshot file mmap reopen" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var index = Hnsw.init(alloc, 4, .{});
+    defer index.deinit();
+    const a = [_]f32{ 1, 0, 0, 0 };
+    const b = [_]f32{ 0, 1, 0, 0 };
+    _ = try index.insert(&a);
+    _ = try index.insert(&b);
+    const ids = [_]u64{ 10, 20 };
+    const path = "/tmp/openpuffer-persist-mmap.snap";
+    try Store.writeSlabSnapshotFile(path, 9, 4, &ids, &index);
+
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    var peek: [32]u8 = undefined;
+    const nread = std.os.linux.pread(fd, &peek, peek.len, 0);
+    _ = std.os.linux.close(fd);
+    try std.testing.expectEqual(std.posix.errno(nread), .SUCCESS);
+    const hdr = try parseBinaryHeader(&peek);
+    try std.testing.expectEqual(@as(u32, SNAP_VERSION_SLAB), hdr.version);
+    try std.testing.expectEqual(@as(u64, 9), hdr.seq);
+    try std.testing.expectEqual(@as(usize, 2), hdr.n);
+    try std.testing.expectEqual(Hnsw.pageAlign(32 + 16), hdr.graph_off);
+
+    var loaded = Hnsw.init(alloc, 4, .{});
+    defer loaded.deinit();
+    try loaded.loadMmap(path);
+    try std.testing.expect(loaded.isMmapBacked());
     try std.testing.expectEqual(index.len(), loaded.len());
     try std.testing.expectEqual(index.entry_point, loaded.entry_point);
 }

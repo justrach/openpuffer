@@ -3,12 +3,28 @@
 //! cosine distance == 1 - dot, which keeps the inner loop tight.
 //!
 //! Memory layout is flat / mmap-shaped (one slab per array, not one malloc
-//! per vector or per neighbor list). On-disk next step is append-only
-//! segments: RecordID → {segment, offset, generation}. This file does not
-//! implement NVMe/SPDK/ZNS; see experiments/log.md.
+//! per vector or per neighbor list). Snapshots persist those slabs as one
+//! HMLS file and can be reopened with POSIX mmap (MAP_PRIVATE) so RSS is
+//! demand-paged — no copy-in of vectors_flat / qvecs_flat / packed CSR.
+//!
+//! Growth after mmap: in-memory append buffer (the existing ArrayLists).
+//! Splices/updates on mapped nodes write MAP_PRIVATE COW pages; the snapshot
+//! file is never mutated. Crash mid-insert leaves the file intact. Durable
+//! persist is an atomic rewrite (tmp + fsync + rename).
+//!
+//! On-disk next step is append-only segments: RecordID → {segment, offset,
+//! generation}. This file does not implement NVMe/SPDK/ZNS; see
+//! experiments/log.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vecmath = @import("vector.zig");
+const posix = std.posix;
+const linux = std.os.linux;
+
+/// Persist envelope magic ('OPSN' le). Duplicated so this file does not
+/// import persist.zig (persist already imports hnsw).
+const SNAP_MAGIC_DUP: u32 = 0x4E53504F;
 
 pub const Options = struct {
     m: u32 = 16,
@@ -53,8 +69,32 @@ pub fn Hnsw(comptime D: type) type {
         hi_deg: std.ArrayList(u16) = .empty,
         hi_nbrs: std.ArrayList(u32) = .empty,
 
+        /// MAP_PRIVATE view of a slab snapshot. ArrayLists above are the
+        /// post-mmap append buffer (empty until the first insert after load).
+        slab_map: ?SlabMap = null,
+
         entry_point: ?u32 = null,
         max_level: u32 = 0,
+
+        pub const SLAB_MAGIC: u32 = 0x534C4D48; // 'HMLS' le
+        pub const SLAB_VERSION: u32 = 1;
+        pub const SLAB_HEADER_SIZE: usize = 256;
+
+        /// Live mmap of one HMLS (or persist-envelope + HMLS) file.
+        pub const SlabMap = struct {
+            bytes: []align(std.heap.page_size_min) u8,
+            n: usize,
+            hi_slots: usize,
+            levels: []u32,
+            qscales: []f32,
+            vectors: []f32,
+            qvecs: []i8,
+            l0_deg: []u16,
+            l0_nbrs: []u32,
+            hi_start: []u32,
+            hi_deg: []u16,
+            hi_nbrs: []u32,
+        };
 
         pub fn init(allocator: std.mem.Allocator, dim: usize, opts: Options) Self {
             return .{
@@ -66,6 +106,8 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.slab_map) |m| posix.munmap(m.bytes);
+            self.slab_map = null;
             self.vectors_flat.deinit(self.allocator);
             self.qvecs_flat.deinit(self.allocator);
             self.qscales.deinit(self.allocator);
@@ -78,13 +120,21 @@ pub fn Hnsw(comptime D: type) type {
             self.* = undefined;
         }
 
+        inline fn mappedCount(self: *const Self) usize {
+            return if (self.slab_map) |m| m.n else 0;
+        }
+
         pub fn len(self: *const Self) usize {
-            return self.qscales.items.len;
+            return self.mappedCount() + self.qscales.items.len;
         }
 
         /// True when this index retains the f32 slab (exact rerank / snapshot f32).
         pub fn hasStoredF32(self: *const Self) bool {
             return self.opts.store_f32;
+        }
+
+        pub fn isMmapBacked(self: *const Self) bool {
+            return self.slab_map != null;
         }
 
         inline fn m0(self: *const Self) usize {
@@ -99,32 +149,102 @@ pub fn Hnsw(comptime D: type) type {
             return @as(usize, self.opts.m) + 1;
         }
 
+        fn heapId(self: *const Self, id: u32) u32 {
+            return id - @as(u32, @intCast(self.mappedCount()));
+        }
+
         /// Mutable f32 row. Server snapshot/WAL and `update` use this.
         /// Empty when `store_f32=false` (callers must check `hasStoredF32`).
         pub fn vector(self: *Self, id: u32) []f32 {
-            if (!self.opts.store_f32 or self.vectors_flat.items.len == 0) return &.{};
+            if (!self.opts.store_f32) return &.{};
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    if (m.vectors.len == 0) return &.{};
+                    const off = @as(usize, id) * self.dim;
+                    return m.vectors[off..][0..self.dim];
+                }
+                if (self.vectors_flat.items.len == 0) return &.{};
+                const off = @as(usize, self.heapId(id)) * self.dim;
+                return self.vectors_flat.items[off..][0..self.dim];
+            }
+            if (self.vectors_flat.items.len == 0) return &.{};
             const off = @as(usize, id) * self.dim;
             return self.vectors_flat.items[off..][0..self.dim];
         }
 
         pub fn vectorConst(self: *const Self, id: u32) []const f32 {
-            if (!self.opts.store_f32 or self.vectors_flat.items.len == 0) return &.{};
+            if (!self.opts.store_f32) return &.{};
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    if (m.vectors.len == 0) return &.{};
+                    const off = @as(usize, id) * self.dim;
+                    return m.vectors[off..][0..self.dim];
+                }
+                if (self.vectors_flat.items.len == 0) return &.{};
+                const off = @as(usize, self.heapId(id)) * self.dim;
+                return self.vectors_flat.items[off..][0..self.dim];
+            }
+            if (self.vectors_flat.items.len == 0) return &.{};
             const off = @as(usize, id) * self.dim;
             return self.vectors_flat.items[off..][0..self.dim];
         }
 
         pub fn qvec(self: *Self, id: u32) []i8 {
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const off = @as(usize, id) * self.dim;
+                    return m.qvecs[off..][0..self.dim];
+                }
+                const off = @as(usize, self.heapId(id)) * self.dim;
+                return self.qvecs_flat.items[off..][0..self.dim];
+            }
             const off = @as(usize, id) * self.dim;
             return self.qvecs_flat.items[off..][0..self.dim];
         }
 
         pub fn qvecConst(self: *const Self, id: u32) []const i8 {
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const off = @as(usize, id) * self.dim;
+                    return m.qvecs[off..][0..self.dim];
+                }
+                const off = @as(usize, self.heapId(id)) * self.dim;
+                return self.qvecs_flat.items[off..][0..self.dim];
+            }
             const off = @as(usize, id) * self.dim;
             return self.qvecs_flat.items[off..][0..self.dim];
         }
 
+        fn levelOf(self: *const Self, id: u32) u32 {
+            if (self.slab_map) |m| {
+                if (id < m.n) return m.levels[id];
+                return self.levels.items[self.heapId(id)];
+            }
+            return self.levels.items[id];
+        }
+
+        fn qscaleOf(self: *const Self, id: u32) f32 {
+            if (self.slab_map) |m| {
+                if (id < m.n) return m.qscales[id];
+                return self.qscales.items[self.heapId(id)];
+            }
+            return self.qscales.items[id];
+        }
+
+        fn setQscaleOf(self: *Self, id: u32, scale: f32) void {
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    m.qscales[id] = scale;
+                    return;
+                }
+                self.qscales.items[self.heapId(id)] = scale;
+                return;
+            }
+            self.qscales.items[id] = scale;
+        }
+
         pub fn layerCount(self: *const Self, id: u32) u32 {
-            return self.levels.items[id] + 1;
+            return self.levelOf(id) + 1;
         }
 
         pub fn neighbors(self: *const Self, id: u32, layer: u32) []const u32 {
@@ -133,7 +253,21 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn degree(self: *const Self, id: u32, layer: u32) usize {
-            if (layer == 0) return self.l0_deg.items[id];
+            if (layer == 0) {
+                if (self.slab_map) |m| {
+                    if (id < m.n) return m.l0_deg[id];
+                    return self.l0_deg.items[self.heapId(id)];
+                }
+                return self.l0_deg.items[id];
+            }
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const slot = m.hi_start[id] + (layer - 1);
+                    return m.hi_deg[slot];
+                }
+                const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
+                return self.hi_deg.items[slot];
+            }
             const slot = self.hi_start.items[id] + (layer - 1);
             return self.hi_deg.items[slot];
         }
@@ -141,11 +275,29 @@ pub fn Hnsw(comptime D: type) type {
         fn neighborSlotsConst(self: *const Self, id: u32, layer: u32) []const u32 {
             if (layer == 0) {
                 const stride = self.l0Stride();
+                if (self.slab_map) |m| {
+                    if (id < m.n) {
+                        const off = @as(usize, id) * stride;
+                        return m.l0_nbrs[off..][0..stride];
+                    }
+                    const off = @as(usize, self.heapId(id)) * stride;
+                    return self.l0_nbrs.items[off..][0..stride];
+                }
                 const off = @as(usize, id) * stride;
                 return self.l0_nbrs.items[off..][0..stride];
             }
-            const slot = self.hi_start.items[id] + (layer - 1);
             const stride = self.hiStride();
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const slot = m.hi_start[id] + (layer - 1);
+                    const off = slot * stride;
+                    return m.hi_nbrs[off..][0..stride];
+                }
+                const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
+                const off = slot * stride;
+                return self.hi_nbrs.items[off..][0..stride];
+            }
+            const slot = self.hi_start.items[id] + (layer - 1);
             const off = slot * stride;
             return self.hi_nbrs.items[off..][0..stride];
         }
@@ -153,18 +305,52 @@ pub fn Hnsw(comptime D: type) type {
         fn neighborSlots(self: *Self, id: u32, layer: u32) []u32 {
             if (layer == 0) {
                 const stride = self.l0Stride();
+                if (self.slab_map) |m| {
+                    if (id < m.n) {
+                        const off = @as(usize, id) * stride;
+                        return m.l0_nbrs[off..][0..stride];
+                    }
+                    const off = @as(usize, self.heapId(id)) * stride;
+                    return self.l0_nbrs.items[off..][0..stride];
+                }
                 const off = @as(usize, id) * stride;
                 return self.l0_nbrs.items[off..][0..stride];
             }
-            const slot = self.hi_start.items[id] + (layer - 1);
             const stride = self.hiStride();
+            if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const slot = m.hi_start[id] + (layer - 1);
+                    const off = slot * stride;
+                    return m.hi_nbrs[off..][0..stride];
+                }
+                const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
+                const off = slot * stride;
+                return self.hi_nbrs.items[off..][0..stride];
+            }
+            const slot = self.hi_start.items[id] + (layer - 1);
             const off = slot * stride;
             return self.hi_nbrs.items[off..][0..stride];
         }
 
         fn setDegree(self: *Self, id: u32, layer: u32, deg: u16) void {
             if (layer == 0) {
+                if (self.slab_map) |m| {
+                    if (id < m.n) {
+                        m.l0_deg[id] = deg;
+                        return;
+                    }
+                    self.l0_deg.items[self.heapId(id)] = deg;
+                    return;
+                }
                 self.l0_deg.items[id] = deg;
+            } else if (self.slab_map) |m| {
+                if (id < m.n) {
+                    const slot = m.hi_start[id] + (layer - 1);
+                    m.hi_deg[slot] = deg;
+                } else {
+                    const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
+                    self.hi_deg.items[slot] = deg;
+                }
             } else {
                 const slot = self.hi_start.items[id] + (layer - 1);
                 self.hi_deg.items[slot] = deg;
@@ -202,14 +388,14 @@ pub fn Hnsw(comptime D: type) type {
         /// is stored; otherwise the same int8 score search already uses.
         inline fn distPair(self: *const Self, src: u32, dst: u32) f32 {
             if (self.opts.store_f32) return self.distTo(self.vectorConst(src), dst);
-            return self.distQ(self.qvecConst(src), self.qscales.items[src], dst);
+            return self.distQ(self.qvecConst(src), self.qscaleOf(src), dst);
         }
 
         inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
             // stored vectors are unit-norm; a ~= aq * scale, so
             // cos(a,b) ~= dot(aq,bq) * qs * scale_b
             const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
-                qs * self.qscales.items[id];
+                qs * self.qscaleOf(id);
             return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
         }
 
@@ -371,7 +557,7 @@ pub fn Hnsw(comptime D: type) type {
             } else {
                 for (copy, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
             }
-            self.qscales.items[id] = scale;
+            self.setQscaleOf(id, scale);
         }
 
         /// Neighbor picks for one insert. `copy`/`q8` are owned by the index
@@ -702,19 +888,29 @@ pub fn Hnsw(comptime D: type) type {
             if (self.opts.store_f32) flags |= FLAG_HAS_F32;
             wr.u32le(buf, &i, flags);
 
-            for (self.levels.items) |lv| wr.u32le(buf, &i, lv);
-            for (self.qscales.items) |s| {
-                const bits: u32 = @bitCast(s);
+            var sid: u32 = 0;
+            while (sid < self.len()) : (sid += 1) wr.u32le(buf, &i, self.levelOf(sid));
+            sid = 0;
+            while (sid < self.len()) : (sid += 1) {
+                const bits: u32 = @bitCast(self.qscaleOf(sid));
                 wr.u32le(buf, &i, bits);
             }
             if (self.opts.store_f32) {
-                const fbytes = std.mem.sliceAsBytes(self.vectors_flat.items);
-                @memcpy(buf[i..][0..fbytes.len], fbytes);
-                i += fbytes.len;
+                sid = 0;
+                while (sid < self.len()) : (sid += 1) {
+                    const row = self.vectorConst(sid);
+                    const fbytes = std.mem.sliceAsBytes(row);
+                    @memcpy(buf[i..][0..fbytes.len], fbytes);
+                    i += fbytes.len;
+                }
             }
-            const qbytes = std.mem.sliceAsBytes(self.qvecs_flat.items);
-            @memcpy(buf[i..][0..qbytes.len], qbytes);
-            i += qbytes.len;
+            sid = 0;
+            while (sid < self.len()) : (sid += 1) {
+                const row = self.qvecConst(sid);
+                const qbytes = std.mem.sliceAsBytes(row);
+                @memcpy(buf[i..][0..qbytes.len], qbytes);
+                i += qbytes.len;
+            }
             var id: u32 = 0;
             while (id < self.len()) : (id += 1) {
                 const n_layers = self.layerCount(id);
@@ -731,8 +927,13 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         /// Populate an empty index from `serialize` output. No HNSW rebuild.
+        /// Accepts the legacy GRAPH blob or an HMLS slab image (copy-in).
         pub fn load(self: *Self, bytes: []const u8) !void {
             if (self.len() != 0) return error.NotEmpty;
+            if (bytes.len >= 4) {
+                const magic = std.mem.readInt(u32, bytes[0..4], .little);
+                if (magic == SLAB_MAGIC) return self.loadSlabsCopy(bytes);
+            }
             if (bytes.len < 48) return error.Truncated;
             var i: usize = 0;
             const rd = struct {
@@ -828,6 +1029,488 @@ pub fn Hnsw(comptime D: type) type {
                 }
             }
             if (i != bytes.len) return error.TrailingBytes;
+        }
+
+        pub fn pageAlign(n: usize) usize {
+            return std.mem.alignForward(usize, n, std.heap.page_size_min);
+        }
+
+        fn hiSlotCount(self: *const Self) usize {
+            const extra = self.hi_deg.items.len;
+            return if (self.slab_map) |m| m.hi_slots + extra else extra;
+        }
+
+        const SlabLayout = struct {
+            n: usize,
+            dim: usize,
+            hi_slots: usize,
+            levels_off: usize,
+            qscales_off: usize,
+            vectors_off: usize,
+            qvecs_off: usize,
+            l0_deg_off: usize,
+            l0_nbrs_off: usize,
+            hi_start_off: usize,
+            hi_deg_off: usize,
+            hi_nbrs_off: usize,
+            file_len: usize,
+
+            fn compute(n: usize, dim: usize, hi_slots: usize, l0_stride: usize, hi_stride: usize) SlabLayout {
+                var off: usize = pageAlign(SLAB_HEADER_SIZE);
+                const levels_off = off;
+                off = pageAlign(off + n * @sizeOf(u32));
+                const qscales_off = off;
+                off = pageAlign(off + n * @sizeOf(f32));
+                const vectors_off = off;
+                off = pageAlign(off + n * dim * @sizeOf(f32));
+                const qvecs_off = off;
+                off = pageAlign(off + n * dim * @sizeOf(i8));
+                const l0_deg_off = off;
+                off = pageAlign(off + n * @sizeOf(u16));
+                const l0_nbrs_off = off;
+                off = pageAlign(off + n * l0_stride * @sizeOf(u32));
+                const hi_start_off = off;
+                off = pageAlign(off + n * @sizeOf(u32));
+                const hi_deg_off = off;
+                off = pageAlign(off + hi_slots * @sizeOf(u16));
+                const hi_nbrs_off = off;
+                off = pageAlign(off + hi_slots * hi_stride * @sizeOf(u32));
+                return .{
+                    .n = n,
+                    .dim = dim,
+                    .hi_slots = hi_slots,
+                    .levels_off = levels_off,
+                    .qscales_off = qscales_off,
+                    .vectors_off = vectors_off,
+                    .qvecs_off = qvecs_off,
+                    .l0_deg_off = l0_deg_off,
+                    .l0_nbrs_off = l0_nbrs_off,
+                    .hi_start_off = hi_start_off,
+                    .hi_deg_off = hi_deg_off,
+                    .hi_nbrs_off = hi_nbrs_off,
+                    .file_len = off,
+                };
+            }
+        };
+
+        fn writeHeaderBytes(buf: []u8, layout: SlabLayout, self: *const Self) void {
+            @memset(buf[0..SLAB_HEADER_SIZE], 0);
+            std.mem.writeInt(u32, buf[0..4], SLAB_MAGIC, .little);
+            std.mem.writeInt(u32, buf[4..8], SLAB_VERSION, .little);
+            std.mem.writeInt(u64, buf[8..16], layout.dim, .little);
+            std.mem.writeInt(u64, buf[16..24], layout.n, .little);
+            std.mem.writeInt(u32, buf[24..28], self.entry_point orelse 0, .little);
+            std.mem.writeInt(u32, buf[28..32], self.max_level, .little);
+            std.mem.writeInt(u32, buf[32..36], self.opts.m, .little);
+            std.mem.writeInt(u32, buf[36..40], self.opts.m0_factor, .little);
+            std.mem.writeInt(u32, buf[40..44], self.opts.ef_construction, .little);
+            std.mem.writeInt(u32, buf[44..48], 1, .little);
+            std.mem.writeInt(u64, buf[48..56], layout.hi_slots, .little);
+            std.mem.writeInt(u64, buf[56..64], layout.levels_off, .little);
+            std.mem.writeInt(u64, buf[64..72], layout.qscales_off, .little);
+            std.mem.writeInt(u64, buf[72..80], layout.vectors_off, .little);
+            std.mem.writeInt(u64, buf[80..88], layout.qvecs_off, .little);
+            std.mem.writeInt(u64, buf[88..96], layout.l0_deg_off, .little);
+            std.mem.writeInt(u64, buf[96..104], layout.l0_nbrs_off, .little);
+            std.mem.writeInt(u64, buf[104..112], layout.hi_start_off, .little);
+            std.mem.writeInt(u64, buf[112..120], layout.hi_deg_off, .little);
+            std.mem.writeInt(u64, buf[120..128], layout.hi_nbrs_off, .little);
+            std.mem.writeInt(u64, buf[128..136], layout.file_len, .little);
+        }
+
+        fn parseLayout(bytes: []const u8) !struct { layout: SlabLayout, entry: u32, max_level: u32, m: u32, m0_factor: u32, efc: u32 } {
+            if (bytes.len < SLAB_HEADER_SIZE) return error.Truncated;
+            if (std.mem.readInt(u32, bytes[0..4], .little) != SLAB_MAGIC) return error.BadMagic;
+            if (std.mem.readInt(u32, bytes[4..8], .little) != SLAB_VERSION) return error.UnsupportedVersion;
+            const dim: usize = @intCast(std.mem.readInt(u64, bytes[8..16], .little));
+            const n: usize = @intCast(std.mem.readInt(u64, bytes[16..24], .little));
+            const entry = std.mem.readInt(u32, bytes[24..28], .little);
+            const max_level = std.mem.readInt(u32, bytes[28..32], .little);
+            const m = std.mem.readInt(u32, bytes[32..36], .little);
+            const m0_factor = std.mem.readInt(u32, bytes[36..40], .little);
+            const efc = std.mem.readInt(u32, bytes[40..44], .little);
+            const hi_slots: usize = @intCast(std.mem.readInt(u64, bytes[48..56], .little));
+            const layout = SlabLayout{
+                .n = n,
+                .dim = dim,
+                .hi_slots = hi_slots,
+                .levels_off = @intCast(std.mem.readInt(u64, bytes[56..64], .little)),
+                .qscales_off = @intCast(std.mem.readInt(u64, bytes[64..72], .little)),
+                .vectors_off = @intCast(std.mem.readInt(u64, bytes[72..80], .little)),
+                .qvecs_off = @intCast(std.mem.readInt(u64, bytes[80..88], .little)),
+                .l0_deg_off = @intCast(std.mem.readInt(u64, bytes[88..96], .little)),
+                .l0_nbrs_off = @intCast(std.mem.readInt(u64, bytes[96..104], .little)),
+                .hi_start_off = @intCast(std.mem.readInt(u64, bytes[104..112], .little)),
+                .hi_deg_off = @intCast(std.mem.readInt(u64, bytes[112..120], .little)),
+                .hi_nbrs_off = @intCast(std.mem.readInt(u64, bytes[120..128], .little)),
+                .file_len = @intCast(std.mem.readInt(u64, bytes[128..136], .little)),
+            };
+            return .{ .layout = layout, .entry = entry, .max_level = max_level, .m = m, .m0_factor = m0_factor, .efc = efc };
+        }
+
+        fn sysWriteAll(fd: linux.fd_t, bytes: []const u8) !void {
+            var off: usize = 0;
+            while (off < bytes.len) {
+                const n = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+                switch (posix.errno(n)) {
+                    .SUCCESS => off += n,
+                    .INTR => continue,
+                    else => return error.WriteFailed,
+                }
+            }
+        }
+
+        fn sysPwriteAll(fd: linux.fd_t, bytes: []const u8, offset: u64) !void {
+            var off: usize = 0;
+            while (off < bytes.len) {
+                const n = linux.pwrite(fd, bytes[off..].ptr, bytes.len - off, @intCast(offset + off));
+                switch (posix.errno(n)) {
+                    .SUCCESS => off += n,
+                    .INTR => continue,
+                    else => return error.WriteFailed,
+                }
+            }
+        }
+
+        fn sysPreadAll(fd: linux.fd_t, dest: []u8, offset: u64) !void {
+            var off: usize = 0;
+            while (off < dest.len) {
+                const n = linux.pread(fd, dest[off..].ptr, dest.len - off, @intCast(offset + off));
+                switch (posix.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.Truncated;
+                        off += n;
+                    },
+                    .INTR => continue,
+                    else => return error.ReadFailed,
+                }
+            }
+        }
+
+        fn writeConcat(fd: linux.fd_t, file_off: u64, a: []const u8, b: []const u8) !void {
+            if (a.len > 0) try sysPwriteAll(fd, a, file_off);
+            if (b.len > 0) try sysPwriteAll(fd, b, file_off + a.len);
+        }
+
+        fn mappedLevels(self: *const Self) []const u32 {
+            return if (self.slab_map) |m| m.levels else &.{};
+        }
+        fn mappedQscales(self: *const Self) []const f32 {
+            return if (self.slab_map) |m| m.qscales else &.{};
+        }
+        fn mappedVectors(self: *const Self) []const f32 {
+            return if (self.slab_map) |m| m.vectors else &.{};
+        }
+        fn mappedQvecs(self: *const Self) []const i8 {
+            return if (self.slab_map) |m| m.qvecs else &.{};
+        }
+        fn mappedL0Deg(self: *const Self) []const u16 {
+            return if (self.slab_map) |m| m.l0_deg else &.{};
+        }
+        fn mappedL0Nbrs(self: *const Self) []const u32 {
+            return if (self.slab_map) |m| m.l0_nbrs else &.{};
+        }
+        fn mappedHiStart(self: *const Self) []const u32 {
+            return if (self.slab_map) |m| m.hi_start else &.{};
+        }
+        fn mappedHiDeg(self: *const Self) []const u16 {
+            return if (self.slab_map) |m| m.hi_deg else &.{};
+        }
+        fn mappedHiNbrs(self: *const Self) []const u32 {
+            return if (self.slab_map) |m| m.hi_nbrs else &.{};
+        }
+
+        /// Byte size of a standalone HMLS image for this index.
+        pub fn slabImageSize(self: *const Self) usize {
+            const n = self.len();
+            return SlabLayout.compute(n, self.dim, self.hiSlotCount(), self.l0Stride(), self.hiStride()).file_len;
+        }
+
+        /// Atomically write an HMLS slab file (`path.tmp` → fsync → rename).
+        /// The live snapshot is never opened writeable; a crash leaves `path` intact.
+        pub fn writeSlabs(self: *const Self, path: []const u8) !void {
+            var tmp_buf: [posix.PATH_MAX]u8 = undefined;
+            const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+            const fd = try posix.openat(posix.AT.FDCWD, tmp, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .TRUNC = true,
+                .CLOEXEC = true,
+            }, 0o644);
+            var closed = false;
+            defer {
+                if (!closed) _ = linux.close(fd);
+            }
+            errdefer {
+                if (posix.toPosixPath(tmp)) |z| {
+                    _ = linux.unlink(&z);
+                } else |_| {}
+            }
+            _ = try self.writeSlabsAt(fd, 0);
+            switch (posix.errno(linux.fdatasync(fd))) {
+                .SUCCESS => {},
+                else => return error.SyncFailed,
+            }
+            _ = linux.close(fd);
+            closed = true;
+            const z_tmp = try posix.toPosixPath(tmp);
+            const z_dst = try posix.toPosixPath(path);
+            switch (posix.errno(linux.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
+                .SUCCESS => {},
+                else => return error.RenameFailed,
+            }
+        }
+
+        /// Write an HMLS image starting at `hmls_off` in an already-open file.
+        /// Used by persist to prefix a SNAP envelope. Returns image size.
+        pub fn writeSlabsAt(self: *const Self, fd: linux.fd_t, hmls_off: u64) !u64 {
+            const n = self.len();
+            const layout = SlabLayout.compute(n, self.dim, self.hiSlotCount(), self.l0Stride(), self.hiStride());
+            var hdr: [SLAB_HEADER_SIZE]u8 = undefined;
+            writeHeaderBytes(&hdr, layout, self);
+            try sysPwriteAll(fd, &hdr, hmls_off);
+
+            const base = hmls_off;
+            try writeConcat(fd, base + layout.levels_off, std.mem.sliceAsBytes(self.mappedLevels()), std.mem.sliceAsBytes(self.levels.items));
+            try writeConcat(fd, base + layout.qscales_off, std.mem.sliceAsBytes(self.mappedQscales()), std.mem.sliceAsBytes(self.qscales.items));
+            try writeConcat(fd, base + layout.vectors_off, std.mem.sliceAsBytes(self.mappedVectors()), std.mem.sliceAsBytes(self.vectors_flat.items));
+            try writeConcat(fd, base + layout.qvecs_off, std.mem.sliceAsBytes(self.mappedQvecs()), std.mem.sliceAsBytes(self.qvecs_flat.items));
+            try writeConcat(fd, base + layout.l0_deg_off, std.mem.sliceAsBytes(self.mappedL0Deg()), std.mem.sliceAsBytes(self.l0_deg.items));
+            try writeConcat(fd, base + layout.l0_nbrs_off, std.mem.sliceAsBytes(self.mappedL0Nbrs()), std.mem.sliceAsBytes(self.l0_nbrs.items));
+
+            const mapped_hi = if (self.slab_map) |m| m.hi_slots else 0;
+            try writeConcat(fd, base + layout.hi_start_off, std.mem.sliceAsBytes(self.mappedHiStart()), &.{});
+            if (self.hi_start.items.len > 0) {
+                var bias_buf: std.ArrayList(u32) = .empty;
+                defer bias_buf.deinit(self.allocator);
+                try bias_buf.ensureTotalCapacity(self.allocator, self.hi_start.items.len);
+                const bias: u32 = @intCast(mapped_hi);
+                for (self.hi_start.items) |v| bias_buf.appendAssumeCapacity(v + bias);
+                try sysPwriteAll(fd, std.mem.sliceAsBytes(bias_buf.items), base + layout.hi_start_off + self.mappedHiStart().len * 4);
+            }
+            try writeConcat(fd, base + layout.hi_deg_off, std.mem.sliceAsBytes(self.mappedHiDeg()), std.mem.sliceAsBytes(self.hi_deg.items));
+            try writeConcat(fd, base + layout.hi_nbrs_off, std.mem.sliceAsBytes(self.mappedHiNbrs()), std.mem.sliceAsBytes(self.hi_nbrs.items));
+
+            const end = hmls_off + layout.file_len;
+            switch (posix.errno(linux.ftruncate(fd, @intCast(end)))) {
+                .SUCCESS => {},
+                else => return error.TruncateFailed,
+            }
+            return layout.file_len;
+        }
+
+        /// Sparse HMLS of `n` zero vectors / empty graph. Cheap RSS fixture.
+        pub fn writeBlankSlabs(path: []const u8, n: usize, dim: usize, opts: Options) !void {
+            var index = Self.init(std.heap.page_allocator, dim, opts);
+            defer index.deinit();
+            index.entry_point = if (n == 0) null else 0;
+            const layout = SlabLayout.compute(n, dim, 0, index.l0Stride(), index.hiStride());
+            var tmp_buf: [posix.PATH_MAX]u8 = undefined;
+            const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+            const fd = try posix.openat(posix.AT.FDCWD, tmp, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .TRUNC = true,
+                .CLOEXEC = true,
+            }, 0o644);
+            var hdr: [SLAB_HEADER_SIZE]u8 = undefined;
+            writeHeaderBytes(&hdr, layout, &index);
+            const wr = sysPwriteAll(fd, &hdr, 0);
+            const tr = linux.ftruncate(fd, @intCast(layout.file_len));
+            const ds = linux.fdatasync(fd);
+            _ = linux.close(fd);
+            wr catch {
+                const z = posix.toPosixPath(tmp) catch return error.WriteFailed;
+                _ = linux.unlink(&z);
+                return error.WriteFailed;
+            };
+            if (posix.errno(tr) != .SUCCESS or posix.errno(ds) != .SUCCESS) {
+                const z = posix.toPosixPath(tmp) catch return error.WriteFailed;
+                _ = linux.unlink(&z);
+                return error.WriteFailed;
+            }
+            const z_tmp = try posix.toPosixPath(tmp);
+            const z_dst = try posix.toPosixPath(path);
+            switch (posix.errno(linux.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
+                .SUCCESS => {},
+                else => return error.RenameFailed,
+            }
+        }
+
+        fn sliceField(comptime T: type, bytes: []u8, off: usize, count: usize) ![]T {
+            const nbytes = count * @sizeOf(T);
+            if (off + nbytes > bytes.len) return error.Truncated;
+            if (count == 0) return @as([*]T, undefined)[0..0];
+            if (off % @alignOf(T) != 0) return error.Misaligned;
+            const raw = bytes[off..][0..nbytes];
+            return @as([*]T, @ptrCast(@alignCast(raw.ptr)))[0..count];
+        }
+
+        fn attachMapped(self: *Self, bytes: []align(std.heap.page_size_min) u8, hmls_off: usize) !void {
+            if (hmls_off + SLAB_HEADER_SIZE > bytes.len) return error.Truncated;
+            const parsed = try parseLayout(bytes[hmls_off..]);
+            const L = parsed.layout;
+            if (self.dim == 0) self.dim = L.dim;
+            if (self.dim != L.dim) return error.DimensionMismatch;
+            self.opts.m = parsed.m;
+            self.opts.m0_factor = parsed.m0_factor;
+            self.opts.ef_construction = parsed.efc;
+            self.max_level = parsed.max_level;
+            self.entry_point = if (L.n == 0) null else parsed.entry;
+
+            const base = hmls_off;
+            const l0_stride = self.l0Stride();
+            const hi_stride = self.hiStride();
+            const need = base + L.file_len;
+            if (bytes.len < need) return error.Truncated;
+
+            self.slab_map = .{
+                .bytes = bytes,
+                .n = L.n,
+                .hi_slots = L.hi_slots,
+                .levels = try sliceField(u32, bytes, base + L.levels_off, L.n),
+                .qscales = try sliceField(f32, bytes, base + L.qscales_off, L.n),
+                .vectors = try sliceField(f32, bytes, base + L.vectors_off, L.n * L.dim),
+                .qvecs = try sliceField(i8, bytes, base + L.qvecs_off, L.n * L.dim),
+                .l0_deg = try sliceField(u16, bytes, base + L.l0_deg_off, L.n),
+                .l0_nbrs = try sliceField(u32, bytes, base + L.l0_nbrs_off, L.n * l0_stride),
+                .hi_start = try sliceField(u32, bytes, base + L.hi_start_off, L.n),
+                .hi_deg = try sliceField(u16, bytes, base + L.hi_deg_off, L.hi_slots),
+                .hi_nbrs = try sliceField(u32, bytes, base + L.hi_nbrs_off, L.hi_slots * hi_stride),
+            };
+        }
+
+        fn hmlsOffsetIn(bytes: []const u8) !usize {
+            if (bytes.len < 4) return error.Truncated;
+            const magic = std.mem.readInt(u32, bytes[0..4], .little);
+            if (magic == SLAB_MAGIC) return 0;
+            if (magic != SNAP_MAGIC_DUP) return error.BadMagic;
+            if (bytes.len < 32) return error.Truncated;
+            const version = std.mem.readInt(u32, bytes[4..8], .little);
+            const n: usize = @intCast(std.mem.readInt(u64, bytes[24..32], .little));
+            const raw_off = 32 + n * 8;
+            // v2 persist slab snapshots page-align the HMLS image.
+            if (version == 2) return pageAlign(raw_off);
+            return raw_off;
+        }
+
+        /// mmap a raw HMLS file or a persist v2 envelope+HMLS file.
+        /// MAP_PRIVATE: reads demand-page; writes COW and never dirty the file.
+        pub fn loadMmap(self: *Self, path: []const u8) !void {
+            if (self.len() != 0) return error.NotEmpty;
+            const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            const size64 = linux.lseek(fd, 0, linux.SEEK.END);
+            if (posix.errno(size64) != .SUCCESS) {
+                _ = linux.close(fd);
+                return error.SeekFailed;
+            }
+            const size: usize = @intCast(size64);
+            if (size == 0) {
+                _ = linux.close(fd);
+                return error.Truncated;
+            }
+            const mapped = posix.mmap(
+                null,
+                size,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE },
+                fd,
+                0,
+            ) catch {
+                _ = linux.close(fd);
+                return error.MmapFailed;
+            };
+            _ = linux.close(fd);
+            errdefer posix.munmap(mapped);
+            const off = try hmlsOffsetIn(mapped);
+            try self.attachMapped(mapped, off);
+        }
+
+        fn copySlabInto(comptime T: type, list: *std.ArrayList(T), alloc: std.mem.Allocator, src: []const T) !void {
+            const dest = try list.addManyAsSlice(alloc, src.len);
+            if (src.len > 0) @memcpy(dest, src);
+        }
+
+        /// Copy-in HMLS image (load-via-alloc). Same bytes as `loadMmap`, full RSS.
+        pub fn loadSlabsCopy(self: *Self, bytes: []const u8) !void {
+            if (self.len() != 0) return error.NotEmpty;
+            const off = try hmlsOffsetIn(bytes);
+            if (off + SLAB_HEADER_SIZE > bytes.len) return error.Truncated;
+            const parsed = try parseLayout(bytes[off..]);
+            const L = parsed.layout;
+            if (self.dim == 0) self.dim = L.dim;
+            if (self.dim != L.dim) return error.DimensionMismatch;
+            self.opts.m = parsed.m;
+            self.opts.m0_factor = parsed.m0_factor;
+            self.opts.ef_construction = parsed.efc;
+            self.max_level = parsed.max_level;
+            self.entry_point = if (L.n == 0) null else parsed.entry;
+            if (off + L.file_len > bytes.len) return error.Truncated;
+
+            const alloc = self.allocator;
+            const l0_stride = self.l0Stride();
+            const hi_stride = self.hiStride();
+            const base = bytes[off..];
+
+            const take = struct {
+                fn sl(comptime T: type, b: []const u8, o: usize, c: usize) ![]const T {
+                    const nbytes = c * @sizeOf(T);
+                    if (o + nbytes > b.len) return error.Truncated;
+                    if (c == 0) return &[_]T{};
+                    return @as([*]const T, @ptrCast(@alignCast(b[o..].ptr)))[0..c];
+                }
+            };
+            try copySlabInto(u32, &self.levels, alloc, try take.sl(u32, base, L.levels_off, L.n));
+            try copySlabInto(f32, &self.qscales, alloc, try take.sl(f32, base, L.qscales_off, L.n));
+            try copySlabInto(f32, &self.vectors_flat, alloc, try take.sl(f32, base, L.vectors_off, L.n * L.dim));
+            try copySlabInto(i8, &self.qvecs_flat, alloc, try take.sl(i8, base, L.qvecs_off, L.n * L.dim));
+            try copySlabInto(u16, &self.l0_deg, alloc, try take.sl(u16, base, L.l0_deg_off, L.n));
+            try copySlabInto(u32, &self.l0_nbrs, alloc, try take.sl(u32, base, L.l0_nbrs_off, L.n * l0_stride));
+            try copySlabInto(u32, &self.hi_start, alloc, try take.sl(u32, base, L.hi_start_off, L.n));
+            try copySlabInto(u16, &self.hi_deg, alloc, try take.sl(u16, base, L.hi_deg_off, L.hi_slots));
+            try copySlabInto(u32, &self.hi_nbrs, alloc, try take.sl(u32, base, L.hi_nbrs_off, L.hi_slots * hi_stride));
+        }
+
+        /// Read an HMLS (or persist v2) file into heap ArrayLists. No mmap.
+        pub fn loadSlabsFile(self: *Self, path: []const u8) !void {
+            if (self.len() != 0) return error.NotEmpty;
+            const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            defer _ = linux.close(fd);
+            var peek: [4096]u8 = undefined;
+            try sysPreadAll(fd, peek[0..32], 0);
+            const off = try hmlsOffsetIn(peek[0..32]);
+            var hdr: [SLAB_HEADER_SIZE]u8 = undefined;
+            try sysPreadAll(fd, &hdr, off);
+            const parsed = try parseLayout(&hdr);
+            const L = parsed.layout;
+            if (self.dim == 0) self.dim = L.dim;
+            if (self.dim != L.dim) return error.DimensionMismatch;
+            self.opts.m = parsed.m;
+            self.opts.m0_factor = parsed.m0_factor;
+            self.opts.ef_construction = parsed.efc;
+            self.max_level = parsed.max_level;
+            self.entry_point = if (L.n == 0) null else parsed.entry;
+
+            const alloc = self.allocator;
+            const l0_stride = self.l0Stride();
+            const hi_stride = self.hiStride();
+
+            const readInto = struct {
+                fn go(comptime T: type, list: *std.ArrayList(T), a: std.mem.Allocator, f: linux.fd_t, file_off: u64, count: usize) !void {
+                    const dest = try list.addManyAsSlice(a, count);
+                    if (count == 0) return;
+                    try sysPreadAll(f, std.mem.sliceAsBytes(dest), file_off);
+                }
+            };
+            try readInto.go(u32, &self.levels, alloc, fd, off + L.levels_off, L.n);
+            try readInto.go(f32, &self.qscales, alloc, fd, off + L.qscales_off, L.n);
+            try readInto.go(f32, &self.vectors_flat, alloc, fd, off + L.vectors_off, L.n * L.dim);
+            try readInto.go(i8, &self.qvecs_flat, alloc, fd, off + L.qvecs_off, L.n * L.dim);
+            try readInto.go(u16, &self.l0_deg, alloc, fd, off + L.l0_deg_off, L.n);
+            try readInto.go(u32, &self.l0_nbrs, alloc, fd, off + L.l0_nbrs_off, L.n * l0_stride);
+            try readInto.go(u32, &self.hi_start, alloc, fd, off + L.hi_start_off, L.n);
+            try readInto.go(u16, &self.hi_deg, alloc, fd, off + L.hi_deg_off, L.hi_slots);
+            try readInto.go(u32, &self.hi_nbrs, alloc, fd, off + L.hi_nbrs_off, L.hi_slots * hi_stride);
         }
     };
 }
@@ -1077,4 +1760,125 @@ test "hnsw store_f32=false serialize/load and update" {
     try loaded.update(planted, &flip);
     const updated = try loaded.search(&flip, 1, 64, alloc);
     try std.testing.expectEqual(planted, updated[0].id);
+}
+
+fn rssKiBSelf() ?u64 {
+    const fd = posix.openat(posix.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (posix.errno(n) != .SUCCESS) return null;
+    const text = buf[0..n];
+    const key = "VmRSS:";
+    const idx = std.mem.indexOf(u8, text, key) orelse return null;
+    var rest = text[idx + key.len ..];
+    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+}
+
+test "hnsw slab mmap reopen + insert append buffer" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const dim = 32;
+    var rng = std.Random.DefaultPrng.init(11);
+    var index = Hnsw(void).init(alloc, dim, .{});
+    defer index.deinit();
+
+    var v: [dim]f32 = undefined;
+    for (0..60) |_| {
+        for (&v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try index.insert(&v);
+    }
+    @memset(&v, 0);
+    v[2] = 1;
+    const planted = try index.insert(&v);
+    const before = try index.search(&v, 5, 64, alloc);
+
+    const path = "/tmp/openpuffer-mmap-roundtrip.slabs";
+    try index.writeSlabs(path);
+
+    var loaded = Hnsw(void).init(alloc, dim, .{});
+    defer loaded.deinit();
+    try loaded.loadMmap(path);
+    try std.testing.expect(loaded.isMmapBacked());
+    try std.testing.expectEqual(index.len(), loaded.len());
+    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    var id: u32 = 0;
+    while (id < index.len()) : (id += 1) {
+        try std.testing.expectEqual(index.layerCount(id), loaded.layerCount(id));
+        var layer: u32 = 0;
+        while (layer < index.layerCount(id)) : (layer += 1) {
+            try std.testing.expectEqualSlices(u32, index.neighbors(id, layer), loaded.neighbors(id, layer));
+        }
+    }
+    const after = try loaded.search(&v, 5, 64, alloc);
+    try std.testing.expectEqual(planted, after[0].id);
+    for (before, after) |b, a| {
+        try std.testing.expectEqual(b.id, a.id);
+        try std.testing.expectApproxEqAbs(b.distance, a.distance, 1e-6);
+    }
+
+    var extra: [dim]f32 = undefined;
+    @memset(&extra, 0);
+    extra[5] = 1;
+    const new_id = try loaded.insert(&extra);
+    try std.testing.expectEqual(index.len() + 1, loaded.len());
+    try std.testing.expect(new_id >= index.len());
+    const found = try loaded.search(&extra, 1, 16, alloc);
+    try std.testing.expectEqual(new_id, found[0].id);
+
+    var flipped_v: [dim]f32 = undefined;
+    @memset(&flipped_v, 0);
+    flipped_v[7] = 1;
+    try loaded.update(planted, &flipped_v);
+    const flipped = try loaded.search(&flipped_v, 3, 32, alloc);
+    try std.testing.expectEqual(planted, flipped[0].id);
+
+    var copied = Hnsw(void).init(alloc, dim, .{});
+    defer copied.deinit();
+    try copied.loadSlabsFile(path);
+    try std.testing.expect(!copied.isMmapBacked());
+    try std.testing.expectEqual(index.len(), copied.len());
+}
+
+test "slab mmap vs alloc RSS (blank slabs)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const scale = builtin.mode != .debug;
+    const cases = [_]struct { n: usize, dim: usize }{
+        .{ .n = if (scale) 50_000 else 256, .dim = if (scale) 1536 else 64 },
+        .{ .n = if (scale) 200_000 else 0, .dim = 1536 },
+    };
+    const gpa = std.heap.page_allocator;
+    for (cases) |c| {
+        if (c.n == 0) continue;
+        var path_buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}.slabs", .{c.n});
+        try Hnsw(void).writeBlankSlabs(path, c.n, c.dim, .{});
+
+        const baseline = rssKiBSelf() orelse 0;
+
+        var mapped = Hnsw(void).init(gpa, c.dim, .{});
+        try mapped.loadMmap(path);
+        const mmap_idle = rssKiBSelf() orelse 0;
+        const _touch = mapped.vectorConst(0)[0];
+        _ = _touch;
+        mapped.deinit();
+
+        var copied = Hnsw(void).init(gpa, c.dim, .{});
+        try copied.loadSlabsFile(path);
+        const alloc_rss = rssKiBSelf() orelse 0;
+        copied.deinit();
+
+        const mmap_delta = mmap_idle -| baseline;
+        const alloc_delta = alloc_rss -| baseline;
+        if (c.n >= 10_000) {
+            try std.testing.expect(mmap_delta * 4 < alloc_delta);
+            try std.testing.expect(alloc_delta + 1024 >= (c.n * c.dim * 5) / 1024 / 2);
+        }
+    }
 }
