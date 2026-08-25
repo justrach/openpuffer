@@ -224,6 +224,8 @@ const Registry = struct {
 pub const Options = struct {
     port: u16 = 8080,
     ef: u32 = 128,
+    /// Exact-rerank width as a multiple of k. 4 is the engine default.
+    rerank_mult: usize = 4,
     /// null = ncpu. Override with --workers / OPENPUFFER_WORKERS.
     workers: ?usize = null,
     s3_cfg: ?s3_mod.Config = null,
@@ -260,7 +262,7 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", o.port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    try out.print("openpuffer serving turbopuffer-compatible API on http://127.0.0.1:{d} (ef={d})\n", .{ o.port, o.ef });
+    try out.print("openpuffer serving turbopuffer-compatible API on http://127.0.0.1:{d} (ef={d} rerank_mult={d})\n", .{ o.port, o.ef, o.rerank_mult });
     if (registry.store != null) try out.print("persistence: s3 bucket '{s}' (group-commit WAL)\n", .{o.s3_cfg.?.bucket});
     try out.flush();
 
@@ -414,7 +416,7 @@ fn serveIoUring(
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
     const queue = try startWorkerPool(alloc, io, registry, o);
-    try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef });
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
@@ -802,7 +804,7 @@ fn parseU32Field(body: []const u8, key: []const u8) ?u32 {
     return std.fmt.parseInt(u32, body[ns..j], 10) catch null;
 }
 
-fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f32, top_k: usize, ef: ?u32 } {
+fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f32, top_k: usize, ef: ?u32, rerank_mult: ?usize } {
     const ann = std.mem.indexOf(u8, body, "\"ANN\"") orelse return error.BadQuery;
     var i: usize = ann + 5;
     while (i < body.len and body[i] != '[') : (i += 1) {}
@@ -835,7 +837,13 @@ fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f3
         top_k = @max(1, n);
     }
     const ef = parseU32Field(body, "\"ef_search\"") orelse parseU32Field(body, "\"ef\"");
-    return .{ .vec = try vec.toOwnedSlice(alloc), .top_k = top_k, .ef = ef };
+    const rerank_mult = parseU32Field(body, "\"rerank_mult\"") orelse parseU32Field(body, "\"rerank\"");
+    return .{
+        .vec = try vec.toOwnedSlice(alloc),
+        .top_k = top_k,
+        .ef = ef,
+        .rerank_mult = if (rerank_mult) |v| @as(usize, v) else null,
+    };
 }
 
 fn handleRequest(
@@ -1121,7 +1129,8 @@ fn handleQuery(
     }
 
     const ef = spec.ef orelse o.ef;
-    const results = try ns.index.search(query_vec, top_k, ef, alloc);
+    const rerank_mult = spec.rerank_mult orelse o.rerank_mult;
+    const results = try ns.index.searchAdvanced(query_vec, top_k, ef, rerank_mult, alloc);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     const w = &out.writer;
@@ -1145,6 +1154,7 @@ test "parseAnnQuery reads vector and top_k" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), spec.vec[2], 1e-6);
     try std.testing.expectEqual(@as(usize, 7), spec.top_k);
     try std.testing.expectEqual(@as(?u32, null), spec.ef);
+    try std.testing.expectEqual(@as(?usize, null), spec.rerank_mult);
 }
 
 test "parseAnnQuery reads optional ef" {
@@ -1153,4 +1163,13 @@ test "parseAnnQuery reads optional ef" {
     defer std.testing.allocator.free(spec.vec);
     try std.testing.expectEqual(@as(usize, 3), spec.top_k);
     try std.testing.expectEqual(@as(?u32, 64), spec.ef);
+    try std.testing.expectEqual(@as(?usize, null), spec.rerank_mult);
+}
+
+test "parseAnnQuery reads optional rerank_mult" {
+    const body = "{\"rank_by\":[\"vector\",\"ANN\",[1]],\"top_k\":3,\"ef\":64,\"rerank_mult\":8}";
+    const spec = try parseAnnQuery(body, std.testing.allocator);
+    defer std.testing.allocator.free(spec.vec);
+    try std.testing.expectEqual(@as(?u32, 64), spec.ef);
+    try std.testing.expectEqual(@as(?usize, 8), spec.rerank_mult);
 }

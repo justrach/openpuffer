@@ -36,6 +36,12 @@ const BenchOpts = struct {
     dim: usize = 768,
     k: usize = 10,
     ef: usize = 200,
+    rerank_mult: usize = 4,
+    clustered: bool = false,
+    clusters: usize = 0,
+    cluster_noise: f32 = 0.35,
+    ef_sweep: ?[]const u8 = null,
+    skip_scan: bool = false,
     namespace: []const u8 = "openpuffer-bench-1",
     model: []const u8 = "gemini-embedding-2",
     tpuf_key: []const u8 = "",
@@ -84,12 +90,14 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "serve")) {
         var port: u16 = 8080;
         var ef: u32 = 128;
+        var rerank_mult: usize = 4;
         var workers: ?usize = null;
         var s3_cfg: ?s3_mod.Config = null;
         {
             const a = args.items[1..];
             if (optOf(a, "--port")) |v| port = std.fmt.parseInt(u16, v, 10) catch 8080;
             if (optOf(a, "--ef")) |v| ef = std.fmt.parseInt(u32, v, 10) catch 128;
+            if (optOf(a, "--rerank-mult")) |v| rerank_mult = std.fmt.parseInt(usize, v, 10) catch 4;
             if (optOf(a, "--workers")) |v| workers = std.fmt.parseInt(usize, v, 10) catch null;
             if (init.environ_map.get("OPENPUFFER_WORKERS")) |s| {
                 workers = std.fmt.parseInt(usize, s, 10) catch workers;
@@ -108,15 +116,17 @@ pub fn main(init: std.process.Init) !void {
                 };
             }
         }
-        try server_mod.serve(gpa, io, .{ .port = port, .ef = ef, .workers = workers, .s3_cfg = s3_cfg }, &w.interface);
+        try server_mod.serve(gpa, io, .{ .port = port, .ef = ef, .rerank_mult = rerank_mult, .workers = workers, .s3_cfg = s3_cfg }, &w.interface);
     } else {
         try w.interface.writeAll(
             \\openpuffer — fast vector search engine + turbopuffer benchmark
             \\
             \\usage:
             \\  openpuffer selftest
-            \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200] [--no-exact]
-            \\  openpuffer serve [--port 8080] [--ef 128] [--workers N]
+            \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
+            \\                  [--rerank-mult 4] [--ef-sweep 64,128,256,512] [--clustered]
+            \\                  [--clusters N] [--cluster-noise 0.35] [--no-exact] [--skip-scan]
+            \\  openpuffer serve [--port 8080] [--ef 128] [--rerank-mult 4] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
             \\  openpuffer bench-live [--namespace openpuffer-bench-1] [--n 512] [--queries 30] [--dim 768]
@@ -174,10 +184,48 @@ fn optsFromArgs(args: []const []const u8, base: BenchOpts) BenchOpts {
     if (optOf(args, "--dim")) |v| o.dim = std.fmt.parseInt(usize, v, 10) catch o.dim;
     if (optOf(args, "--k")) |v| o.k = std.fmt.parseInt(usize, v, 10) catch o.k;
     if (optOf(args, "--ef")) |v| o.ef = std.fmt.parseInt(usize, v, 10) catch o.ef;
+    if (optOf(args, "--rerank-mult")) |v| o.rerank_mult = std.fmt.parseInt(usize, v, 10) catch o.rerank_mult;
+    if (optOf(args, "--clusters")) |v| o.clusters = std.fmt.parseInt(usize, v, 10) catch o.clusters;
+    if (optOf(args, "--cluster-noise")) |v| o.cluster_noise = std.fmt.parseFloat(f32, v) catch o.cluster_noise;
+    if (optOf(args, "--ef-sweep")) |v| o.ef_sweep = v;
+    o.clustered = hasFlag(args, "--clustered");
+    o.skip_scan = hasFlag(args, "--skip-scan");
     if (optOf(args, "--namespace")) |v| o.namespace = v;
     if (optOf(args, "--model")) |v| o.model = v;
     if (optOf(args, "--local-endpoint")) |v| o.local_endpoint = v;
     return o;
+}
+
+fn parseU32List(alloc: std.mem.Allocator, s: []const u8) ![]u32 {
+    var n: usize = 1;
+    for (s) |c| {
+        if (c == ',') n += 1;
+    }
+    const out = try alloc.alloc(u32, n);
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) continue;
+        out[i] = std.fmt.parseInt(u32, t, 10) catch continue;
+        i += 1;
+    }
+    return out[0..i];
+}
+
+/// Uniform Gaussian (ANN worst case) or mixture-of-Gaussians (SQuAD-style clusters).
+/// Clustered: v = normalize(center + noise * unit_noise). noise=0.35 ⇒ cosine to
+/// center ≈ 0.94 — tight topic clusters, the product-relevant quality axis.
+fn fillVec(rand: std.Random, row: []f32, centers: []const []const f32, noise: f32) void {
+    if (centers.len == 0) {
+        for (row) |*x| x.* = rand.floatNorm(f32);
+    } else {
+        const c = centers[rand.uintLessThan(usize, centers.len)];
+        for (row) |*x| x.* = rand.floatNorm(f32);
+        vecmath.normalize(row);
+        for (row, c) |*x, cv| x.* = cv + noise * x.*;
+    }
+    vecmath.normalize(row);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +323,19 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
         },
     );
 
+    var centers: [][]f32 = &.{};
+    if (o.clustered) {
+        const n_clusters = if (o.clusters > 0) o.clusters else @max(@as(usize, 32), o.n / 256);
+        centers = try alloc.alloc([]f32, n_clusters);
+        for (centers) |*c| {
+            c.* = try alloc.alloc(f32, o.dim);
+            var i: usize = 0;
+            while (i < o.dim) : (i += 1) c.*[i] = rand.floatNorm(f32);
+            vecmath.normalize(c.*);
+        }
+        try out.print("clustered: {d} centers, noise={d:.3} (SQuAD-style mixture)\n", .{ n_clusters, o.cluster_noise });
+    }
+
     var index = Hnsw.init(gpa, o.dim, .{});
     defer index.deinit();
 
@@ -283,13 +344,14 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
     var data: [][]f32 = &.{};
     var build_timer = Sw.start(io);
     if (no_exact) {
-        try out.print("generating+inserting {d} random {d}-dim vectors (no corpus retain)...\n", .{ o.n, o.dim });
+        try out.print("generating+inserting {d} {s} {d}-dim vectors (no corpus retain)...\n", .{
+            o.n, if (o.clustered) "clustered" else "random", o.dim,
+        });
         try out.flush();
         const row = try alloc.alloc(f32, o.dim);
         var i: usize = 0;
         while (i < o.n) : (i += 1) {
-            for (row) |*x| x.* = rand.floatNorm(f32);
-            vecmath.normalize(row);
+            fillVec(rand, row, centers, o.cluster_noise);
             _ = try index.insert(row);
             if (i > 0 and i % 100_000 == 0) {
                 try out.print("  inserted {d}/{d}\n", .{ i, o.n });
@@ -298,12 +360,13 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
             }
         }
     } else {
-        try out.print("generating {d} random {d}-dim vectors...\n", .{ o.n, o.dim });
+        try out.print("generating {d} {s} {d}-dim vectors...\n", .{
+            o.n, if (o.clustered) "clustered" else "random", o.dim,
+        });
         data = try alloc.alloc([]f32, o.n);
         for (data) |*row| {
             row.* = try alloc.alloc(f32, o.dim);
-            for (row.*) |*x| x.* = rand.floatNorm(f32);
-            vecmath.normalize(row.*);
+            fillVec(rand, row.*, centers, o.cluster_noise);
         }
         for (data) |v| _ = try index.insert(v);
     }
@@ -317,34 +380,64 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
     const queries: [][]f32 = try alloc.alloc([]f32, o.q);
     for (queries) |*row| {
         row.* = try alloc.alloc(f32, o.dim);
-        for (row.*) |*x| x.* = rand.floatNorm(f32);
-        vecmath.normalize(row.*);
+        fillVec(rand, row.*, centers, o.cluster_noise);
     }
 
-    // local ANN
-    var lat_local = try Lat.init(alloc, o.q);
-    var recall_sum: f64 = 0;
-    for (queries) |q| {
-        var t = Sw.start(io);
-        const res = try index.search(q, o.k, @intCast(o.ef), alloc);
-        lat_local.push(t.readNs());
-        if (!no_exact) {
-            var got: [64]u32 = undefined;
-            for (res, 0..) |r, i| got[i] = r.id;
-            const gt = try bruteForce(alloc, data, q, o.k);
-            recall_sum += recallAtK(gt, got[0..res.len]);
+    const sweep = if (o.ef_sweep) |s| try parseU32List(alloc, s) else blk: {
+        const one = try alloc.alloc(u32, 1);
+        one[0] = @intCast(o.ef);
+        break :blk one;
+    };
+    const multi = sweep.len > 1;
+    if (multi) {
+        try out.print("ef-sweep n={d} q={d} dim={d} k={d} rerank_mult={d} clustered={} efs=", .{
+            o.n, o.q, o.dim, o.k, o.rerank_mult, o.clustered,
+        });
+        for (sweep, 0..) |ef, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.print("{d}", .{ef});
         }
+        try out.writeAll("\n");
+        try out.flush();
     }
-    const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
-    try report(out, "openpuffer (ANN)", &lat_local, qps_local);
-    if (no_exact) {
-        try out.print("openpuffer recall@{d} vs exact: skipped (--no-exact)\n", .{o.k});
-    } else {
-        try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
-    }
-    try printRss(io, out, "post-query");
 
-    if (no_exact) return;
+    for (sweep) |ef| {
+        var lat_local = try Lat.init(alloc, o.q);
+        var recall_sum: f64 = 0;
+        for (queries) |q| {
+            var t = Sw.start(io);
+            const res = try index.searchAdvanced(q, o.k, ef, o.rerank_mult, alloc);
+            lat_local.push(t.readNs());
+            if (!no_exact) {
+                var got: [64]u32 = undefined;
+                for (res, 0..) |r, i| got[i] = r.id;
+                const gt = try bruteForce(alloc, data, q, o.k);
+                recall_sum += recallAtK(gt, got[0..res.len]);
+            }
+        }
+        const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
+        if (multi) {
+            var label_buf: [32]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "ANN ef={d}", .{ef}) catch "ANN";
+            try report(out, label, &lat_local, qps_local);
+            if (no_exact) {
+                try out.print("recall@{d} ef={d}: skipped (--no-exact)\n", .{ o.k, ef });
+            } else {
+                try out.print("recall@{d} ef={d}: {d:.4}\n", .{ o.k, ef, recall_sum / @as(f64, @floatFromInt(o.q)) });
+            }
+        } else {
+            try report(out, "openpuffer (ANN)", &lat_local, qps_local);
+            if (no_exact) {
+                try out.print("openpuffer recall@{d} vs exact: skipped (--no-exact)\n", .{o.k});
+            } else {
+                try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
+            }
+        }
+        try printRss(io, out, "post-query");
+        try out.flush();
+    }
+
+    if (no_exact or o.skip_scan or multi) return;
 
     // brute force baseline
     var lat_bf = try Lat.init(alloc, o.q);

@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--queries", type=int, default=100)
     ap.add_argument("--dim", type=int, default=1536)
     ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--ef", type=int, default=256, help="local serve ef (default 256; clustered SQuAD historically ~1.0 recall)")
     ap.add_argument("--namespace", default="openpuffer-squad-qa")
     ap.add_argument("--model", default="gemini-embedding-2")
     ap.add_argument("--port", type=int, default=8091)
@@ -149,7 +150,7 @@ def main():
     # (recall@10 ≈ 1.0). Pin 256 so this quality comparison stays comparable.
     binary = "./zig-out/bin/openpuffer"
     server = subprocess.Popen(
-        [binary, "serve", "--port", str(args.port), "--ef", "256"],
+        [binary, "serve", "--port", str(args.port), "--ef", str(args.ef)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     base = f"http://127.0.0.1:{args.port}/v2/namespaces/{args.namespace}"
@@ -224,7 +225,7 @@ def main():
     n = len(questions)
     print("\n=== SQuAD QA retrieval benchmark ===")
     print(f"dataset: {len(docs)} Wikipedia paragraphs (SQuAD dev), {n} real questions, "
-          f"k={args.k}, dim={args.dim}, ef(local)=256")
+          f"k={args.k}, dim={args.dim}, ef(local)={args.ef}")
     print(f"{'engine':<22} {'p50':>9} {'p95':>9}   recall@k(exact)  gold-hit@k(QA)")
     print(f"{'openpuffer (local)':<22} {l50*1000:8.2f}ms {l95*1000:8.2f}ms   "
           f"{ann_local_hits/total_ann:>14.4f}  {gold_local/n:>12.4f}")
