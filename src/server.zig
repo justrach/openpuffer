@@ -363,13 +363,14 @@ const PoolCtx = struct {
     registry: *Registry,
     o: Options,
     queue: *FdQueue,
+    listen_fd: std.posix.fd_t,
 };
 
-fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options) !*FdQueue {
+fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options, listen_fd: std.posix.fd_t) !*FdQueue {
     const queue = try alloc.create(FdQueue);
     queue.* = .{ .io = io };
     const ctx = try alloc.create(PoolCtx);
-    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue };
+    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue, .listen_fd = listen_fd };
     const n = workerCount(ctx.o);
     for (0..n) |_| {
         const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
@@ -387,7 +388,7 @@ fn poolWorker(ctx: *PoolCtx) void {
     var xfer = ConnXfer{};
     while (true) {
         const fd = ctx.queue.pop();
-        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.queue) catch .close;
+        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.queue, ctx.listen_fd) catch .close;
         if (end == .close) _ = std.os.linux.close(fd);
     }
 }
@@ -426,7 +427,7 @@ fn serveIoUring(
     out: *std.Io.Writer,
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
-    const queue = try startWorkerPool(alloc, io, registry, o);
+    const queue = try startWorkerPool(alloc, io, registry, o, listen_fd);
     try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
     try out.flush();
     var ring = try iouring.Ring.init();
@@ -449,7 +450,7 @@ fn serveIoUring(
         // A lone connection is handled inline to avoid a futex wake (~0.3ms).
         drainListenBacklog(listen_fd, queue);
         if (queue.isEmpty()) {
-            const end = handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state, queue) catch .close;
+            const end = handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state, queue, listen_fd) catch .close;
             if (end == .close) _ = std.os.linux.close(fd);
         } else {
             queue.push(fd);
@@ -483,6 +484,7 @@ fn handleIoUringConn(
     store: *std.ArrayList(u8),
     arena_state: *std.heap.ArenaAllocator,
     queue: ?*FdQueue,
+    listen_fd: ?std.posix.fd_t,
 ) !ConnEnd {
     var n: usize = 0;
     while (true) {
@@ -520,10 +522,12 @@ fn handleIoUringConn(
             continue;
         }
         n = 0;
-        // Keep-alive would otherwise pin this worker until the client hangs up.
-        // Mixed query+upsert traffic then starves: ncpu query sockets occupy
-        // every worker and writes sit in FdQueue until a query conn closes.
+        // Keep-alive would otherwise pin this worker (or the accept thread)
+        // until the client hangs up. New upserts then sit in the listen
+        // backlog, never accepted. Drain pending accepts into FdQueue and
+        // yield this connection if anyone is waiting.
         if (queue) |q| {
+            if (listen_fd) |lfd| drainListenBacklog(lfd, q);
             if (!q.isEmpty() and q.tryPush(fd)) return .requeued;
         }
     }
