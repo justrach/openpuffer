@@ -13,6 +13,7 @@ const hnsw_mod = @import("hnsw.zig");
 const gemini = @import("gemini.zig");
 const tpuf_mod = @import("tpuf.zig");
 const server_mod = @import("server.zig");
+const s3_mod = @import("s3.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -81,11 +82,26 @@ pub fn main(init: std.process.Init) !void {
             .tpuf_key = tpuf_key, .google_key = google_key,
         }));
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        const port: u16 = if (optOf(args.items[1..], "--port")) |v|
-            std.fmt.parseInt(u16, v, 10) catch 8080
-        else
-            8080;
-        try server_mod.serve(gpa, io, .{ .port = port }, &w.interface);
+        var port: u16 = 8080;
+        var s3_cfg: ?s3_mod.Config = null;
+        {
+            const a = args.items[1..];
+            if (optOf(a, "--port")) |v| port = std.fmt.parseInt(u16, v, 10) catch 8080;
+            if (optOf(a, "--s3-bucket")) |bucket| {
+                const creds = s3_mod.resolveCredentials(gpa, io, init.environ_map) catch {
+                    try w.interface.print("no AWS/R2 credentials found (env AWS_ACCESS_KEY_ID/SECRET or ~/.aws/credentials)\n", .{});
+                    return error.MissingCredentials;
+                };
+                s3_cfg = .{
+                    .access_key = creds.access,
+                    .secret_key = creds.secret,
+                    .region = optOf(a, "--s3-region") orelse creds.region,
+                    .bucket = bucket,
+                    .endpoint = optOf(a, "--s3-endpoint"),
+                };
+            }
+        }
+        try server_mod.serve(gpa, io, .{ .port = port, .s3_cfg = s3_cfg }, &w.interface);
     } else {
         try w.interface.writeAll(
             \\openpuffer — fast vector search engine + turbopuffer benchmark

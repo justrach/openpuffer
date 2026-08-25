@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Render experiments/log.md into experiments/results.svg.
+
+Dependency-free (stdlib only). Run after logging any experiment:
+
+    python3 tools/plot_results.py
+
+Parses the ledger table generically: each row's `p50 (ms)` cell may hold one
+value or two slash-separated runs (run1 / run2). Rows with no numbers
+(pending/crash) are skipped for latency bars but still listed.
+"""
+import html
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+LOG = ROOT / "experiments" / "log.md"
+OUT = ROOT / "experiments" / "results.svg"
+
+ROW_RE = re.compile(r"^\|\s*(E\d+)\s*\|")
+
+
+def parse_ledger(text):
+    rows = []
+    for line in text.splitlines():
+        m = ROW_RE.match(line)
+        if not m:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 11:
+            continue
+        eid, verdict, recall = cells[0], cells[9], cells[7]
+        try:
+            recall_v = float(recall) if recall not in ("—", "-", "") else None
+        except ValueError:
+            recall_v = None
+        runs = []
+        for tok in cells[6].split("/"):
+            tok = tok.strip()
+            try:
+                runs.append(float(tok))
+            except ValueError:
+                pass
+        rows.append({"id": eid, "runs": runs, "verdict": verdict, "recall": recall_v})
+    return rows
+
+
+def main():
+    rows = parse_ledger(LOG.read_text())
+    plotted = [r for r in rows if r["runs"]]
+    if not plotted:
+        sys.exit("no numeric p50 rows found in " + str(LOG))
+
+    best_id, best = min(
+        ((r["id"], min(r["runs"])) for r in plotted if r["verdict"] == "keep"),
+        key=lambda t: t[1],
+    )  # lineage best: KEPT rows only — discards don't advance the best line
+    floor = best * 0.96  # noise-floor rule: >=4% faster than best to keep
+
+    W, H = 960, 420
+    ML, MR, MT, MB = 70, 30, 60, 70
+    pw, ph = W - ML - MR, H - MT - MB
+    y0, y1 = 0.90, max(1.10, max(max(r["runs"]) for r in plotted) + 0.03)
+
+    def Y(v):
+        return MT + ph * (1 - (v - y0) / (y1 - y0))
+
+    colors = {
+        "keep": "#059669",
+        "discard": "#d97706",
+        "crash": "#dc2626",
+        "running": "#6b7280",
+    }
+    s = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+         f'viewBox="0 0 {W} {H}" font-family="monospace" font-size="12">']
+    s.append(f'<rect width="{W}" height="{H}" fill="#0b0f0e"/>')
+    s.append(f'<text x="{ML}" y="26" fill="#d1d5db" font-size="15" '
+             f'font-weight="bold">openpuffer bench-synthetic · p50 per experiment '
+             f'(n=20000 dim=1536 ef=128)</text>')
+    s.append(f'<text x="{ML}" y="44" fill="#9ca3af">best {best:.3f} ms ({best_id})'
+             f' · keep requires ≥4% reproduced win · dashed = best, shaded = noise band</text>')
+
+    # gridlines + y labels
+    t = y0
+    while t <= y1 + 1e-9:
+        yt = Y(t)
+        s.append(f'<line x1="{ML}" x2="{W-MR}" y1="{yt:.1f}" y2="{yt:.1f}" '
+                 f'stroke="#1f2937" stroke-width="1"/>')
+        s.append(f'<text x="{ML-8}" y="{yt+4:.1f}" fill="#6b7280" text-anchor="end">'
+                 f'{t:.2f}</text>')
+        t += 0.05
+
+    # noise band + best line
+    s.append(f'<rect x="{ML}" y="{Y(floor):.1f}" width="{pw}" '
+             f'height="{Y(best)-Y(floor):.1f}" fill="#059669" opacity="0.08"/>')
+    s.append(f'<line x1="{ML}" x2="{W-MR}" y1="{Y(best):.1f}" y2="{Y(best):.1f}" '
+             f'stroke="#059669" stroke-dasharray="5 4" opacity="0.8"/>')
+
+    n = len(plotted)
+    slot = pw / n
+    bw = min(64, slot * 0.55)
+    for gi, r in enumerate(plotted):
+        cx = ML + slot * (gi + 0.5)
+        color = colors.get(r["verdict"], "#6b7280")
+        for ri, v in enumerate(r["runs"]):
+            bx = cx - (len(r["runs"]) * (bw + 6) - 6) / 2 + ri * (bw + 6)
+            by = Y(v)
+            s.append(f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bw}" '
+                     f'height="{Y(y0)-by:.1f}" fill="{color}" rx="2">'
+                     f'<title>{r["id"]} run{ri+1}: {v:.3f} ms · {r["verdict"]}</title></rect>')
+            s.append(f'<text x="{bx+bw/2:.1f}" y="{by-5:.1f}" fill="#d1d5db" '
+                     f'font-size="10" text-anchor="middle">{v:.3f}</text>')
+        label = r["id"] + ("*" if r["id"] == best_id else "")
+        s.append(f'<text x="{cx:.1f}" y="{H-MB+22}" fill="#9ca3af" text-anchor="middle">'
+                 f'{html.escape(label)}</text>')
+        sub = f'recall {r["recall"]:.3f}' if r["recall"] is not None else r["verdict"]
+        s.append(f'<text x="{cx:.1f}" y="{H-MB+38}" fill="{color}" font-size="10" '
+                 f'text-anchor="middle">{html.escape(sub)}</text>')
+        s.append(f'<text x="{cx:.1f}" y="{H-MB+52}" fill="#6b7280" font-size="10" '
+                 f'text-anchor="middle">{html.escape(r["verdict"])}</text>')
+
+    s.append(f'<text x="{W-MR}" y="{H-8}" fill="#4b5563" '
+             f'font-size="10" text-anchor="end">generated by tools/plot_results.py '
+             f'· y-axis truncated at {y0:.2f} ms</text>')
+    s.append("</svg>")
+    OUT.write_text("\n".join(s))
+    print(f"wrote {OUT} ({len(plotted)} experiment groups, best {best:.3f} ms @ {best_id})")
+
+
+if __name__ == "__main__":
+    main()
