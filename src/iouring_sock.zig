@@ -72,6 +72,12 @@ const RingLinux = struct {
             off += @as(usize, @intCast(res));
         }
     }
+
+    pub fn connect(self: *RingLinux, fd: std.posix.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
+        _ = try self.ring.connect(4, fd, addr, addrlen);
+        const res = try self.wait1();
+        if (res < 0) return error.ConnectFailed;
+    }
 };
 
 /// Blocking read/write for worker threads when a second io_uring cannot be created.
@@ -151,6 +157,52 @@ pub fn wantsClose(buf: []const u8) bool {
     return false;
 }
 
+/// How many bytes of `buf` form a complete HTTP/1.1 response, or 0 if more data needed.
+pub fn completeHttpResponse(buf: []const u8) usize {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return 0;
+    const header_end = sep + 4;
+    const headers = buf[0..sep];
+    var content_len: usize = 0;
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = it.next(); // status line
+    while (it.next()) |line| {
+        if (line.len >= 15 and std.ascii.eqlIgnoreCase(line[0..15], "content-length:")) {
+            const n = std.mem.trim(u8, line[15..], " \t");
+            content_len = std.fmt.parseInt(usize, n, 10) catch 0;
+        }
+    }
+    const need = header_end + content_len;
+    if (buf.len < need) return 0;
+    return need;
+}
+
+pub fn parseHttpStatus(buf: []const u8) !u16 {
+    const nl = std.mem.indexOf(u8, buf, "\r\n") orelse return error.BadResponse;
+    const line = buf[0..nl];
+    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadResponse;
+    const rest = line[sp1 + 1 ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return error.BadResponse;
+    return std.fmt.parseInt(u16, rest[0..end], 10) catch error.BadResponse;
+}
+
+pub fn formatRequest(alloc: std.mem.Allocator, method: []const u8, path: []const u8, body: ?[]const u8) ![]u8 {
+    const payload = body orelse "";
+    if (body != null) {
+        return std.fmt.allocPrint(
+            alloc,
+            "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ method, path, payload.len, payload },
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        .{ method, path },
+    );
+}
+
 pub fn formatResponse(alloc: std.mem.Allocator, status: u16, reason: []const u8, body: []const u8, keepalive: bool) ![]u8 {
     const conn = if (keepalive) "keep-alive" else "close";
     return std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n{s}", .{
@@ -180,4 +232,16 @@ test "parseHttpRequest extracts method path body" {
     try std.testing.expectEqualStrings("POST", r.method);
     try std.testing.expectEqualStrings("/v2/namespaces/ns/query", r.path);
     try std.testing.expectEqualStrings("ABCD", r.body);
+}
+
+test "completeHttpResponse waits for body" {
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab";
+    try std.testing.expectEqual(@as(usize, 0), completeHttpResponse(partial));
+    const full = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde";
+    try std.testing.expectEqual(full.len, completeHttpResponse(full));
+}
+
+test "parseHttpStatus reads code" {
+    try std.testing.expectEqual(@as(u16, 200), try parseHttpStatus("HTTP/1.1 200 OK\r\n\r\n"));
+    try std.testing.expectEqual(@as(u16, 404), try parseHttpStatus("HTTP/1.1 404 Not Found\r\n\r\n"));
 }

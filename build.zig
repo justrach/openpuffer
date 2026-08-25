@@ -40,7 +40,25 @@ pub fn build(b: *std.Build) void {
     const hnsw_tests = b.addTest(.{ .root_module = hnsw_mod });
     const run_hnsw_tests = b.addRunArtifact(hnsw_tests);
 
+    const shard_mod = b.createModule(.{
+        .root_source_file = b.path("src/shard_router.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const shard_tests = b.addTest(.{ .root_module = shard_mod });
+    const run_shard_tests = b.addRunArtifact(shard_tests);
+
+    const iouring_mod = b.createModule(.{
+        .root_source_file = b.path("src/iouring_sock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const iouring_tests = b.addTest(.{ .root_module = iouring_mod });
+    const run_iouring_tests = b.addRunArtifact(iouring_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_hnsw_tests.step);
+    test_step.dependOn(&run_shard_tests.step);
+    test_step.dependOn(&run_iouring_tests.step);
 }

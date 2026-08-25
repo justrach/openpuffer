@@ -8,13 +8,13 @@ Does not launch 1M / 2M single-process benches.
 
 Measures, for the same total vectors:
   * direct 1-instance serve (no router)
-  * router + 1 / 2 / 4 child serve processes
+  * Zig/io_uring ``openpuffer shard-router`` + 1 / 4 child serve processes
+    (Python ``tools/shard_router.py`` is the fallback via ``--router python``)
   * write-routing correctness (doc comes back only from the owning shard)
   * merge correctness (global top-k ≈ single-index top-k on a clustered set)
   * query p50 / QPS (keepalive serial + keepalive concurrency=4)
 
-RSS is the sum of child ``openpuffer serve`` processes (router Python RSS
-is listed separately and is not the scale problem).
+RSS is the sum of child ``openpuffer serve`` processes.
 """
 
 from __future__ import annotations
@@ -191,6 +191,73 @@ class DirectServe:
     @property
     def shard_ports(self):
         return [self.port]
+
+
+class ZigRoutedCluster:
+    """External ``openpuffer shard-router`` process (keep-alive to children)."""
+
+    def __init__(self, binary, router_port, n_shards, shard_port_base, ef, workers, shard_by="doc"):
+        self.router_port = router_port
+        self.n_shards = n_shards
+        self.shard_port_base = shard_port_base
+        self.binary = binary
+        self.ef = ef
+        self.workers = workers
+        self.shard_by = shard_by
+        self.proc = None
+        self.backend = "zig"
+
+    @property
+    def port(self):
+        return self.router_port
+
+    @property
+    def shard_ports(self):
+        return [self.shard_port_base + i for i in range(self.n_shards)]
+
+    def start(self):
+        cmd = [
+            self.binary,
+            "shard-router",
+            "--port",
+            str(self.router_port),
+            "--shards",
+            str(self.n_shards),
+            "--shard-port-base",
+            str(self.shard_port_base),
+            "--ef",
+            str(self.ef),
+            "--shard-by",
+            self.shard_by,
+        ]
+        if self.workers is not None:
+            cmd.extend(["--workers", str(self.workers)])
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        wait_port(self.router_port, self.proc, timeout=20.0)
+        try:
+            info, _ = http_json(f"http://127.0.0.1:{self.router_port}/health")
+            if info.get("impl") != "zig-iouring":
+                raise RuntimeError(f"unexpected router impl {info.get('impl')!r}")
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+        self.proc = None
+
+    def rss_total_mib(self):
+        try:
+            info, _ = http_json(f"http://127.0.0.1:{self.router_port}/health")
+            return float(info.get("rss_mib") or 0)
+        except Exception:
+            return 0.0
 
 
 class RoutedCluster:
@@ -433,6 +500,8 @@ def main():
     ap.add_argument("--binary", default="./zig-out/bin/openpuffer")
     ap.add_argument("--workers", type=int, default=2, help="per serve process (2 avoids keep-alive pinning accept)")
     ap.add_argument("--skip-direct", action="store_true")
+    ap.add_argument("--router", choices=("zig", "python"), default="zig", help="Zig shard-router (default) or Python fallback")
+    ap.add_argument("--with-n2", action="store_true", help="also bench router-2")
     args = ap.parse_args()
 
     if args.n > 20000:
@@ -451,27 +520,51 @@ def main():
 
     configs = []
     if not args.skip_direct:
-        configs.append(("1-direct", 1, True))
-    configs.extend([("router-1", 1, False), ("router-2", 2, False), ("router-4", 4, False)])
+        configs.append(("1-direct", 1, True, args.router))
+    if args.router == "zig":
+        configs.append(("zig-router-1", 1, False, "zig"))
+        if args.with_n2:
+            configs.append(("zig-router-2", 2, False, "zig"))
+        configs.append(("zig-router-4", 4, False, "zig"))
+    else:
+        configs.append(("router-1", 1, False, "python"))
+        if args.with_n2:
+            configs.append(("router-2", 2, False, "python"))
+        configs.append(("router-4", 4, False, "python"))
 
     results = []
     merge_report = None
     single_merge_port = None
     single_merge_ns = None
 
-    for label, n_shards, direct in configs:
+    for label, n_shards, direct, router_kind in configs:
         router_port = args.port + (0 if direct else 10 + n_shards)
         shard_base = router_port + 20
         ns = f"shard-bench-{label}"
         print(f"\n=== {label}  n={args.n} shards={n_shards} port={router_port} ===", flush=True)
         if direct:
             target = DirectServe(args.binary, router_port, args.ef, args.workers)
+        elif router_kind == "zig":
+            try:
+                target = ZigRoutedCluster(
+                    args.binary, router_port, n_shards, shard_base, args.ef, args.workers
+                )
+                target.start()
+                target._started = True
+            except Exception as e:
+                print(f"  zig shard-router failed ({e}); falling back to Python", flush=True)
+                target = RoutedCluster(
+                    args.binary, router_port, n_shards, shard_base, args.ef, args.workers
+                )
+                target._started = False
         else:
             target = RoutedCluster(
                 args.binary, router_port, n_shards, shard_base, args.ef, args.workers
             )
+            target._started = False
         try:
-            target.start()
+            if not getattr(target, "_started", False):
+                target.start()
             row = bench_one(label, target, ns, docs, queries, args.k, args.ef, n_shards)
             print_result(row)
             results.append(row)
@@ -480,7 +573,7 @@ def main():
             c_ns = f"{ns}-cluster"
             c_base = f"http://127.0.0.1:{target.port}/v2/namespaces/{c_ns}"
             upsert_docs(c_base, c_docs, batch=50)
-            if label == "1-direct" or (label == "router-1" and single_merge_port is None):
+            if label == "1-direct" or (label in ("router-1", "zig-router-1") and single_merge_port is None):
                 single_merge_port = target.port
                 single_merge_ns = c_ns
                 # hold this process until we finish merge vs router-4: run merge later

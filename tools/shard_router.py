@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Thin shard router in front of N independent ``openpuffer serve`` processes.
+"""Python fallback shard router in front of N ``openpuffer serve`` processes.
 
-This is the scale path that does not put 2M vectors in one 16 GiB address
-space: each child holds ~1/N of the documents and has its own HNSW graph.
+Prefer the Zig/io_uring path (keep-alive to children):
+
+    ./zig-out/bin/openpuffer shard-router --shards 4 --port 8800 --ef 128
+
+This Python process is the fallback when that binary is unavailable.
+Each child holds ~1/N of the documents and has its own HNSW graph.
 
     python3 tools/shard_router.py --shards 4 --port 8800
     OPENPUFFER_SHARDS=4 python3 tools/shard_router.py --port 8800
