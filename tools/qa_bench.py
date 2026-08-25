@@ -144,9 +144,12 @@ def main():
             raise
 
     # 4a) local openpuffer server
+    # Serve default is now ef=128 (scored engine bench). qa_bench historically
+    # assumed the old serve default of 256 on clustered SQuAD embeddings
+    # (recall@10 ≈ 1.0). Pin 256 so this quality comparison stays comparable.
     binary = "./zig-out/bin/openpuffer"
     server = subprocess.Popen(
-        [binary, "serve", "--port", str(args.port)],
+        [binary, "serve", "--port", str(args.port), "--ef", "256"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     base = f"http://127.0.0.1:{args.port}/v2/namespaces/{args.namespace}"

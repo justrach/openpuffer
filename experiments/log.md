@@ -7,6 +7,7 @@ Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
 Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
+Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB (no recall; `--no-exact`). 2M does not fit. Numbers live in the Scale section below — do not put them in the E-table p50 cell or results.svg.
 
 ![p50 per experiment](results.svg)
 
@@ -39,3 +40,41 @@ Chart regenerated with `python3 tools/plot_results.py` after every completed exp
 | E022 | 2026-08-23 | only prefetch the next neighbor qvec when it is not already visited (skip wasted prefetches) | guard E015 prefetch with !visited.isSet | src/hnsw.zig | pass | 0.710 / 0.575 | 0.3130 | +15.3% / -6.7% | keep | parallel cloud-agent row (originally E014). run1 miss, run2 decides (-6.7%); recall 0.3130. exact-scan also dipped on run2 (5.55→4.85) so treat 0.575 as noisy; still a protocol keep. New host best 0.575 |
 | E023 | 2026-08-25 | HTTP serve overhead (not ANN dots) is the leftover ~1ms on Linux; io_uring accept/recv/send + TCP_NODELAY + scan query JSON without a 1536-node AST | Linux io_uring serve loop; nodelay; parseAnnQuery; tools/serve_bench.py | src/iouring_sock.zig src/server.zig | pass | 1.084 / 1.089 / 1.113 | — | −34% vs HTTP baseline 1.646 | keep | SERVING metric (urllib, new TCP conn/query, n=2000 dim=1536). Engine bench-synthetic unchanged. Chart not regenerated — different metric. |
 | E024 | 2026-08-25 | at-scale HTTP: E023 serialized all connections on one accept+handle loop; a fixed OS-thread pool should run concurrent ANN queries on all cores and keep-alive without per-conn pthread_create | io_uring accept + ncpu posix keep-alive workers; per-worker arena; inline lone-conn (drain backlog to pool); serve_bench concurrent keepalive | src/server.zig src/iouring_sock.zig tools/serve_bench.py | pass | HTTP serial 1.026 / ka 0.435 | — | −5.4% vs E023 serial 1.084; ka −60% | keep | SERVING scale (not ANN chart). n=2000 dim=1536: conc8 6.845ms / 988 qps, conc32 19.7ms / 1065 qps, ka+conc8 1.483ms / 1298 qps. n=20000: serial 1.931ms, ka 1.292ms. /proc: all 4 workers take CPU — conc p50 is 4-core DRAM-bound, not a 1-thread queue. |
+
+## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
+
+Not an E-row. Numeric ANN p50s here must not be copied into the table above or `results.svg` (they are 10–20× the 20k metric and would flatten the chart). HTTP p50 stays out of the chart.
+
+Host: MemTotal 16398384 kB, ulimit -v 14 GiB so a failed alloc dies instead of taking the machine. Payload estimate: n × 1536 × 5 B = 7.7 GiB (1M) / 15.4 GiB (2M) plus HNSW graph and GPA overhead.
+
+Exact commands:
+
+```
+./zig-out/bin/openpuffer bench-synthetic --n 1000000 --queries 50 --dim 1536 --k 10 --ef 128 --no-exact
+./zig-out/bin/openpuffer bench-synthetic --n 200000 --queries 50 --dim 1536 --k 10 --ef 128
+./zig-out/bin/openpuffer bench-synthetic --n 50000 --queries 50 --dim 1536 --k 10 --ef 128
+./zig-out/bin/openpuffer bench-synthetic --n 20000 --queries 50 --dim 1536 --k 10 --ef 128
+python3 tools/serve_bench.py --n 20000 --queries 50 --dim 1536 --k 10 --ef 128 --keepalive --port 8098
+```
+
+2M command was **not launched**: 1M post-build RSS was already 11153 MiB; 2× ≈ 22 GiB exceeds both the 16 GiB host and the 14 GiB ulimit.
+
+| n | build | ANN p50 | p95 | p99 | recall@10 | RSS | notes |
+|---|-------|---------|-----|-----|-----------|-----|-------|
+| 20k | 43.8 s (457 vec/s) | 0.532 ms | 1.596 ms | 3.820 ms | **0.3280** | — | control; 50 queries (metric uses 200 → recall 0.313) |
+| 50k | 119.1 s (420 vec/s) | 1.237 ms | 4.901 ms | 8.579 ms | **0.1860** | — | recall already under the 0.30 floor |
+| 200k | 661.4 s (302 vec/s) | 2.826 ms | 8.295 ms | 11.085 ms | **0.0400** | — | exact scan p50 107 ms; random 1536-d collapse |
+| 1M | 4657.7 s (215 vec/s) | 12.706 ms | 17.359 ms | 23.969 ms | skipped (`--no-exact`) | **11153 MiB** post-build / 11160 post-query | mean 12.645 ms, 3954 qps |
+| 2M | — | — | — | — | — | would be ~22 GiB | skipped; cannot fit |
+| HTTP 20k ka | upsert 60.0 s | 1.118 ms | 2.445 ms | 3.997 ms | nonempty 50/50 | — | `serve --ef 128`; E024 ka at n=20k was 1.292 ms (old implicit ef=256) |
+
+Recall@10 on uniform random 1536-d vectors falls off a cliff as n grows at fixed ef=128 (0.33 → 0.19 → 0.04). The 1M p50 is a latency number, not a quality number. Clustered data (qa_bench) historically held recall ≈ 1.0 at ef=256; qa_bench now **pins `--ef 256`** because serve default changed 256→128.
+
+What is left at 1–2M:
+
+- **Recall at scale**: raise ef (or M / ef_construction) once n is large; measure on clustered embeddings, not only random.
+- **Memory layout**: 11.2 GiB RSS vs 7.1 GiB payload — GPA headers on ~4M live allocs. A parallel flatten-slabs change (E025 on `cursor/index-memory-3cfd`) estimates ~7.5 GiB at 1M.
+- **Drop the f32 copy** (int8-only / optional rerank): saves 5.7 GiB; that plus flatten is how 2M could fit on 16 GiB.
+- **mmap** the flat pools so RSS is demand-paged.
+- `rerank_mult` is still hardcoded 4.
+- Do not HTTP-upsert 1–2M; in-process insert is the only sane load path.

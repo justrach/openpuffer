@@ -53,19 +53,27 @@ def percentiles(samples):
     return pct(0.50), pct(0.95), pct(0.99)
 
 
-def query_new_conn(base, qv, k, timeout=60):
+def query_payload(qv, k, ef=None):
+    p = {"rank_by": ["vector", "ANN", qv], "top_k": k}
+    if ef is not None:
+        p["ef"] = ef
+    return p
+
+
+def query_new_conn(base, qv, k, ef=None, timeout=60):
     t0 = time.perf_counter()
-    r = http_json(f"{base}/query", {"rank_by": ["vector", "ANN", qv], "top_k": k}, timeout=timeout)
+    r = http_json(f"{base}/query", query_payload(qv, k, ef), timeout=timeout)
     return time.perf_counter() - t0, bool(r.get("rows"))
 
 
 class KeepaliveClient:
-    def __init__(self, host, port, ns):
+    def __init__(self, host, port, ns, ef=None):
         self.path = f"/v2/namespaces/{ns}/query"
         self.conn = http.client.HTTPConnection(host, port, timeout=60)
+        self.ef = ef
 
     def query(self, qv, k):
-        body = json.dumps({"rank_by": ["vector", "ANN", qv], "top_k": k}).encode()
+        body = json.dumps(query_payload(qv, k, self.ef)).encode()
         t0 = time.perf_counter()
         self.conn.request("POST", self.path, body=body, headers={"content-type": "application/json"})
         resp = self.conn.getresponse()
@@ -80,8 +88,8 @@ class KeepaliveClient:
         self.conn.close()
 
 
-def run_keepalive_batch(host, port, ns, queries, k):
-    client = KeepaliveClient(host, port, ns)
+def run_keepalive_batch(host, port, ns, queries, k, ef=None):
+    client = KeepaliveClient(host, port, ns, ef=ef)
     samples = []
     hits = 0
     try:
@@ -100,6 +108,7 @@ def main():
     ap.add_argument("--queries", type=int, default=200)
     ap.add_argument("--dim", type=int, default=1536)
     ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--ef", type=int, default=128)
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--keepalive", action="store_true")
@@ -115,7 +124,7 @@ def main():
     queries = [unit_vec(args.dim, rng) for _ in range(args.queries)]
 
     server = subprocess.Popen(
-        [args.binary, "serve", "--port", str(args.port)],
+        [args.binary, "serve", "--port", str(args.port), "--ef", str(args.ef)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -153,7 +162,7 @@ def main():
             )
         load_s = time.perf_counter() - t0
 
-        http_json(f"{base}/query", {"rank_by": ["vector", "ANN", queries[0]], "top_k": args.k})
+        http_json(f"{base}/query", query_payload(queries[0], args.k, args.ef))
 
         samples = []
         hits = 0
@@ -162,7 +171,7 @@ def main():
             chunks = [queries[i :: args.concurrency] for i in range(args.concurrency)]
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                 futs = [
-                    pool.submit(run_keepalive_batch, "127.0.0.1", args.port, ns, chunk, args.k)
+                    pool.submit(run_keepalive_batch, "127.0.0.1", args.port, ns, chunk, args.k, args.ef)
                     for chunk in chunks
                     if chunk
                 ]
@@ -172,7 +181,7 @@ def main():
                     hits += ok
             mode = f"keepalive concurrency={args.concurrency}"
         elif args.keepalive:
-            client = KeepaliveClient("127.0.0.1", args.port, ns)
+            client = KeepaliveClient("127.0.0.1", args.port, ns, ef=args.ef)
             try:
                 for qv in queries:
                     elapsed, ok = client.query(qv, args.k)
@@ -183,13 +192,13 @@ def main():
             mode = "keepalive"
         elif args.concurrency <= 1:
             for qv in queries:
-                elapsed, ok = query_new_conn(base, qv, args.k)
+                elapsed, ok = query_new_conn(base, qv, args.k, args.ef)
                 samples.append(elapsed)
                 hits += int(ok)
             mode = "serial"
         else:
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-                futs = [pool.submit(query_new_conn, base, qv, args.k) for qv in queries]
+                futs = [pool.submit(query_new_conn, base, qv, args.k, args.ef) for qv in queries]
                 for fut in as_completed(futs):
                     elapsed, ok = fut.result()
                     samples.append(elapsed)
@@ -202,7 +211,7 @@ def main():
         qps = args.queries / wall if wall > 0 else 0
         print("=== openpuffer serve HTTP bench ===")
         print(
-            f"mode={mode} n={args.n} queries={args.queries} dim={args.dim} k={args.k} "
+            f"mode={mode} n={args.n} queries={args.queries} dim={args.dim} k={args.k} ef={args.ef} "
             f"load={load_s:.2f}s wall={wall:.2f}s qps={qps:.1f}"
         )
         print(
