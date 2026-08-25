@@ -914,12 +914,14 @@ fn spawnChildren(cluster: *Cluster, out: *std.Io.Writer) !void {
     cluster.io.sleep(.{ .nanoseconds = 80_000_000 }, .awake) catch {};
     for (cluster.children, 0..) |ch, i| {
         if (ch.pid) |pid| {
-            const r = std.os.linux.kill(pid, 0);
-            if (std.os.linux.errno(r) != .SUCCESS) {
+            var path_buf: [48]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return error.ChildDied;
+            const st = std.Io.Dir.openFileAbsolute(cluster.io, path, .{}) catch {
                 try out.print("shard[{d}] pid={d} died immediately (port {d} busy?)\n", .{ i, pid, ch.port });
                 try out.flush();
                 return error.ChildDied;
-            }
+            };
+            st.close(cluster.io);
         }
     }
 }
