@@ -70,7 +70,7 @@ Exact commands:
 python3 tools/serve_bench.py --n 20000 --queries 50 --dim 1536 --k 10 --ef 128 --keepalive --port 8098
 ```
 
-2M command was **not launched**: 1M post-build RSS was already 11153 MiB; 2× ≈ 22 GiB exceeds both the 16 GiB host and the 14 GiB ulimit.
+2M command was **not launched**. Old-layout 1M was 11153 MiB (2× ≈ 22 GiB). Flatten 1M is **7481 MiB**; 2× ≈ 14.6 GiB still exceeds a comfortable 16 GiB / no-swap budget. Drop-f32 or mmap is what would open 2M.
 
 | n | build | ANN p50 | p95 | p99 | recall@10 | RSS | notes |
 |---|-------|---------|-----|-----|-----------|-----|-------|
