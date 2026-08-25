@@ -42,6 +42,8 @@ const BenchOpts = struct {
     cluster_noise: f32 = 0.35,
     ef_sweep: ?[]const u8 = null,
     skip_scan: bool = false,
+    /// Default true: scored 20k p50 stays comparable. `--no-f32` drops the slab.
+    store_f32: bool = true,
     namespace: []const u8 = "openpuffer-bench-1",
     model: []const u8 = "gemini-embedding-2",
     tpuf_key: []const u8 = "",
@@ -126,6 +128,7 @@ pub fn main(init: std.process.Init) !void {
             \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
             \\                  [--rerank-mult 4] [--ef-sweep 64,128,256,512] [--clustered]
             \\                  [--clusters N] [--cluster-noise 0.35] [--no-exact] [--skip-scan]
+            \\                  [--no-f32]
             \\  openpuffer serve [--port 8080] [--ef 128] [--rerank-mult 4] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
@@ -190,6 +193,7 @@ fn optsFromArgs(args: []const []const u8, base: BenchOpts) BenchOpts {
     if (optOf(args, "--ef-sweep")) |v| o.ef_sweep = v;
     o.clustered = hasFlag(args, "--clustered");
     o.skip_scan = hasFlag(args, "--skip-scan");
+    o.store_f32 = !hasFlag(args, "--no-f32");
     if (optOf(args, "--namespace")) |v| o.namespace = v;
     if (optOf(args, "--model")) |v| o.model = v;
     if (optOf(args, "--local-endpoint")) |v| o.local_endpoint = v;
@@ -310,16 +314,17 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
     var rng = std.Random.DefaultPrng.init(7);
     const rand = rng.random();
 
-    const bytes_f32 = o.n * o.dim * @sizeOf(f32);
+    const bytes_f32 = if (o.store_f32) o.n * o.dim * @sizeOf(f32) else 0;
     const bytes_i8 = o.n * o.dim;
     try out.print(
-        "memory estimate: n={d} dim={d}  f32={d:.1}GiB  int8={d:.1}GiB  (plus HNSW graph; --no-exact={})\n",
+        "memory estimate: n={d} dim={d}  f32={d:.1}GiB  int8={d:.1}GiB  (plus HNSW graph; --no-exact={} store_f32={})\n",
         .{
             o.n,
             o.dim,
             @as(f64, @floatFromInt(bytes_f32)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(bytes_i8)) / (1024.0 * 1024.0 * 1024.0),
             no_exact,
+            o.store_f32,
         },
     );
 
@@ -336,7 +341,7 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
         try out.print("clustered: {d} centers, noise={d:.3} (SQuAD-style mixture)\n", .{ n_clusters, o.cluster_noise });
     }
 
-    var index = Hnsw.init(gpa, o.dim, .{});
+    var index = Hnsw.init(gpa, o.dim, .{ .store_f32 = o.store_f32 });
     defer index.deinit();
 
     // --no-exact: insert from a reused row so the corpus is not retained.
