@@ -61,7 +61,9 @@ def main():
     W, H = 960, 420
     ML, MR, MT, MB = 70, 30, 60, 70
     pw, ph = W - ML - MR, H - MT - MB
-    y0, y1 = 0.90, max(1.10, max(max(r["runs"]) for r in plotted) + 0.03)
+    ymin = min(min(r["runs"]) for r in plotted)
+    ymax = max(max(r["runs"]) for r in plotted)
+    y0, y1 = ymin - 0.05, max(ymax + 0.05, ymin + 0.20)
 
     def Y(v):
         return MT + ph * (1 - (v - y0) / (y1 - y0))
