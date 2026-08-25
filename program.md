@@ -162,3 +162,26 @@ One markdown table row per experiment:
   with less code? Keep.
 - Crashes/build breaks: fix trivial ones (typo, missing import); if
   fundamentally broken after the retry budget, log `crash`, revert, move on.
+
+## Amendments
+
+### 2026-08-23 — real-data metric + serving-path scope (human-authorized)
+
+1. **Secondary real-data metric registered**: `python3 tools/qa_bench.py`
+   benchmarks SQuAD dev passages/questions through `openpuffer serve` vs
+   turbopuffer cloud (latency, ANN recall vs exact, gold-passage hit@k).
+   It does NOT replace the scored `bench-synthetic` p50; use it to confirm
+   that engine changes don't regress real-world retrieval quality
+   (measured 2026-08-23: recall@10 0.9997, gold-hit@10 1.0000 at 2k docs).
+2. **Scope expansion**: `src/server.zig`'s query path (`handleQuery`,
+   `Options.ef`) may now be edited for serving-latency experiments,
+   CONDITIONAL on the peer session having no uncommitted changes to that
+   file (`git status --short src/server.zig` must be clean before editing).
+   The same gate/ledger/noise-floor rules apply; ledger rows note that p50
+   includes HTTP+JSON overhead.
+3. Measured context for future experiments: local serve p50 is ~1.31ms vs
+   ~0.83ms direct library call at ef=128 — roughly 0.5ms of HTTP+JSON
+   per-request overhead is the largest remaining target, bigger than any
+   remaining engine-side effect (E010/E011 confirmed the traversal loop is
+   at a plateau: prefetch-fed dot products dominate, everything else is
+   below this machine's noise floor).
