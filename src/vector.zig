@@ -99,16 +99,20 @@ test "cosine basics" {
 }
 
 test "dotI8 matches scalar, including signed extremes" {
-    const cases = [_]struct { a: []const i8, b: []const i8, want: i32 }{
-        .{ .a = &.{}, .b = &.{}, .want = 0 },
-        .{ .a = &.{ 1, -1, 0, 127 }, .b = &.{ 2, 3, 9, -1 }, .want = 2 - 3 + 0 - 127 },
-        .{ .a = &(.{ -128 } ** 64), .b = &(.{ 127 } ** 64), .want = -128 * 127 * 64 },
-        .{ .a = &(.{ 127 } ** 67), .b = &(.{ -128 } ** 67), .want = 127 * -128 * 67 },
-    };
-    for (cases) |c| {
-        try std.testing.expectEqual(c.want, dotI8(c.a, c.b));
-        try std.testing.expectEqual(c.want, dotI8Widen(c.a, c.b));
-    }
+    try std.testing.expectEqual(@as(i32, 0), dotI8(&.{}, &.{}));
+    try std.testing.expectEqual(@as(i32, 2 - 3 + 0 - 127), dotI8(&.{ 1, -1, 0, 127 }, &.{ 2, 3, 9, -1 }));
+
+    const lo64: [64]i8 = @splat(-128);
+    const hi64: [64]i8 = @splat(127);
+    const want64: i32 = @as(i32, -128) * @as(i32, 127) * 64;
+    try std.testing.expectEqual(want64, dotI8(&lo64, &hi64));
+    try std.testing.expectEqual(want64, dotI8Widen(&lo64, &hi64));
+
+    const hi67: [67]i8 = @splat(127);
+    const lo67: [67]i8 = @splat(-128);
+    const want67: i32 = @as(i32, 127) * @as(i32, -128) * 67;
+    try std.testing.expectEqual(want67, dotI8(&hi67, &lo67));
+    try std.testing.expectEqual(want67, dotI8Widen(&hi67, &lo67));
 
     var a: [1536]i8 = undefined;
     var b: [1536]i8 = undefined;
