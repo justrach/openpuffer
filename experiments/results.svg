@@ -14,52 +14,59 @@
 <text x="62" y="64.0" fill="#6b7280" text-anchor="end">1.10</text>
 <rect x="70" y="289.4" width="860" height="-56.9" fill="#059669" opacity="0.08"/>
 <line x1="70" x2="930" y1="232.6" y2="232.6" stroke="#059669" stroke-dasharray="5 4" opacity="0.8"/>
-<rect x="64.4" y="186.2" width="64" height="163.8" fill="#059669" rx="2"><title>E000 run1: 1.013 ms · keep</title></rect>
-<text x="96.4" y="181.2" fill="#d1d5db" font-size="10" text-anchor="middle">1.013</text>
-<rect x="134.4" y="232.6" width="64" height="117.4" fill="#059669" rx="2"><title>E000 run2: 0.981 ms · keep</title></rect>
-<text x="166.4" y="227.6" fill="#d1d5db" font-size="10" text-anchor="middle">0.981</text>
-<text x="131.4" y="372" fill="#9ca3af" text-anchor="middle">E000*</text>
-<text x="131.4" y="388" fill="#059669" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="131.4" y="402" fill="#6b7280" font-size="10" text-anchor="middle">keep</text>
-<rect x="222.3" y="232.6" width="64" height="117.4" fill="#d97706" rx="2"><title>E001 run1: 0.981 ms · discard</title></rect>
-<text x="254.3" y="227.6" fill="#d1d5db" font-size="10" text-anchor="middle">0.981</text>
-<text x="254.3" y="372" fill="#9ca3af" text-anchor="middle">E001</text>
-<text x="254.3" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="254.3" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
-<rect x="310.1" y="167.3" width="64" height="182.7" fill="#d97706" rx="2"><title>E002 run1: 1.026 ms · discard</title></rect>
-<text x="342.1" y="162.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.026</text>
-<rect x="380.1" y="183.3" width="64" height="166.7" fill="#d97706" rx="2"><title>E002 run2: 1.015 ms · discard</title></rect>
-<text x="412.1" y="178.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.015</text>
-<text x="377.1" y="372" fill="#9ca3af" text-anchor="middle">E002</text>
-<text x="377.1" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="377.1" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
-<rect x="433.0" y="167.3" width="64" height="182.7" fill="#d97706" rx="2"><title>E003 run1: 1.026 ms · discard</title></rect>
-<text x="465.0" y="162.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.026</text>
-<rect x="503.0" y="194.9" width="64" height="155.1" fill="#d97706" rx="2"><title>E003 run2: 1.007 ms · discard</title></rect>
-<text x="535.0" y="189.9" fill="#d1d5db" font-size="10" text-anchor="middle">1.007</text>
-<text x="500.0" y="372" fill="#9ca3af" text-anchor="middle">E003</text>
-<text x="500.0" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="500.0" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
-<rect x="555.9" y="276.1" width="64" height="73.9" fill="#d97706" rx="2"><title>E004 run1: 0.951 ms · discard</title></rect>
-<text x="587.9" y="271.1" fill="#d1d5db" font-size="10" text-anchor="middle">0.951</text>
-<rect x="625.9" y="267.4" width="64" height="82.6" fill="#d97706" rx="2"><title>E004 run2: 0.957 ms · discard</title></rect>
-<text x="657.9" y="262.4" fill="#d1d5db" font-size="10" text-anchor="middle">0.957</text>
-<text x="622.9" y="372" fill="#9ca3af" text-anchor="middle">E004</text>
-<text x="622.9" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="622.9" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
-<rect x="678.7" y="203.6" width="64" height="146.4" fill="#d97706" rx="2"><title>E005 run1: 1.001 ms · discard</title></rect>
-<text x="710.7" y="198.6" fill="#d1d5db" font-size="10" text-anchor="middle">1.001</text>
-<rect x="748.7" y="231.1" width="64" height="118.9" fill="#d97706" rx="2"><title>E005 run2: 0.982 ms · discard</title></rect>
-<text x="780.7" y="226.1" fill="#d1d5db" font-size="10" text-anchor="middle">0.982</text>
-<text x="745.7" y="372" fill="#9ca3af" text-anchor="middle">E005</text>
-<text x="745.7" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.312</text>
-<text x="745.7" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
-<rect x="801.6" y="279.0" width="64" height="71.0" fill="#d97706" rx="2"><title>E007 run1: 0.949 ms · discard</title></rect>
-<text x="833.6" y="274.0" fill="#d1d5db" font-size="10" text-anchor="middle">0.949</text>
-<rect x="871.6" y="219.5" width="64" height="130.5" fill="#d97706" rx="2"><title>E007 run2: 0.990 ms · discard</title></rect>
-<text x="903.6" y="214.5" fill="#d1d5db" font-size="10" text-anchor="middle">0.990</text>
-<text x="868.6" y="372" fill="#9ca3af" text-anchor="middle">E007</text>
-<text x="868.6" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
-<text x="868.6" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="61.6" y="186.2" width="59.12500000000001" height="163.8" fill="#059669" rx="2"><title>E000 run1: 1.013 ms · keep</title></rect>
+<text x="91.2" y="181.2" fill="#d1d5db" font-size="10" text-anchor="middle">1.013</text>
+<rect x="126.8" y="232.6" width="59.12500000000001" height="117.4" fill="#059669" rx="2"><title>E000 run2: 0.981 ms · keep</title></rect>
+<text x="156.3" y="227.6" fill="#d1d5db" font-size="10" text-anchor="middle">0.981</text>
+<text x="123.8" y="372" fill="#9ca3af" text-anchor="middle">E000*</text>
+<text x="123.8" y="388" fill="#059669" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="123.8" y="402" fill="#6b7280" font-size="10" text-anchor="middle">keep</text>
+<rect x="201.7" y="232.6" width="59.12500000000001" height="117.4" fill="#d97706" rx="2"><title>E001 run1: 0.981 ms · discard</title></rect>
+<text x="231.2" y="227.6" fill="#d1d5db" font-size="10" text-anchor="middle">0.981</text>
+<text x="231.2" y="372" fill="#9ca3af" text-anchor="middle">E001</text>
+<text x="231.2" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="231.2" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="276.6" y="167.3" width="59.12500000000001" height="182.7" fill="#d97706" rx="2"><title>E002 run1: 1.026 ms · discard</title></rect>
+<text x="306.2" y="162.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.026</text>
+<rect x="341.8" y="183.3" width="59.12500000000001" height="166.7" fill="#d97706" rx="2"><title>E002 run2: 1.015 ms · discard</title></rect>
+<text x="371.3" y="178.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.015</text>
+<text x="338.8" y="372" fill="#9ca3af" text-anchor="middle">E002</text>
+<text x="338.8" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="338.8" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="384.1" y="167.3" width="59.12500000000001" height="182.7" fill="#d97706" rx="2"><title>E003 run1: 1.026 ms · discard</title></rect>
+<text x="413.7" y="162.3" fill="#d1d5db" font-size="10" text-anchor="middle">1.026</text>
+<rect x="449.2" y="194.9" width="59.12500000000001" height="155.1" fill="#d97706" rx="2"><title>E003 run2: 1.007 ms · discard</title></rect>
+<text x="478.8" y="189.9" fill="#d1d5db" font-size="10" text-anchor="middle">1.007</text>
+<text x="446.2" y="372" fill="#9ca3af" text-anchor="middle">E003</text>
+<text x="446.2" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="446.2" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="491.6" y="276.1" width="59.12500000000001" height="73.9" fill="#d97706" rx="2"><title>E004 run1: 0.951 ms · discard</title></rect>
+<text x="521.2" y="271.1" fill="#d1d5db" font-size="10" text-anchor="middle">0.951</text>
+<rect x="556.8" y="267.4" width="59.12500000000001" height="82.6" fill="#d97706" rx="2"><title>E004 run2: 0.957 ms · discard</title></rect>
+<text x="586.3" y="262.4" fill="#d1d5db" font-size="10" text-anchor="middle">0.957</text>
+<text x="553.8" y="372" fill="#9ca3af" text-anchor="middle">E004</text>
+<text x="553.8" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="553.8" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="599.1" y="203.6" width="59.12500000000001" height="146.4" fill="#d97706" rx="2"><title>E005 run1: 1.001 ms · discard</title></rect>
+<text x="628.7" y="198.6" fill="#d1d5db" font-size="10" text-anchor="middle">1.001</text>
+<rect x="664.2" y="231.1" width="59.12500000000001" height="118.9" fill="#d97706" rx="2"><title>E005 run2: 0.982 ms · discard</title></rect>
+<text x="693.8" y="226.1" fill="#d1d5db" font-size="10" text-anchor="middle">0.982</text>
+<text x="661.2" y="372" fill="#9ca3af" text-anchor="middle">E005</text>
+<text x="661.2" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.312</text>
+<text x="661.2" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="706.6" y="279.0" width="59.12500000000001" height="71.0" fill="#d97706" rx="2"><title>E007 run1: 0.949 ms · discard</title></rect>
+<text x="736.2" y="274.0" fill="#d1d5db" font-size="10" text-anchor="middle">0.949</text>
+<rect x="771.8" y="219.5" width="59.12500000000001" height="130.5" fill="#d97706" rx="2"><title>E007 run2: 0.990 ms · discard</title></rect>
+<text x="801.3" y="214.5" fill="#d1d5db" font-size="10" text-anchor="middle">0.990</text>
+<text x="768.8" y="372" fill="#9ca3af" text-anchor="middle">E007</text>
+<text x="768.8" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.313</text>
+<text x="768.8" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
+<rect x="814.1" y="260.1" width="59.12500000000001" height="89.9" fill="#d97706" rx="2"><title>E008 run1: 0.962 ms · discard</title></rect>
+<text x="843.7" y="255.1" fill="#d1d5db" font-size="10" text-anchor="middle">0.962</text>
+<rect x="879.2" y="270.3" width="59.12500000000001" height="79.7" fill="#d97706" rx="2"><title>E008 run2: 0.955 ms · discard</title></rect>
+<text x="908.8" y="265.3" fill="#d1d5db" font-size="10" text-anchor="middle">0.955</text>
+<text x="876.2" y="372" fill="#9ca3af" text-anchor="middle">E008</text>
+<text x="876.2" y="388" fill="#d97706" font-size="10" text-anchor="middle">recall 0.318</text>
+<text x="876.2" y="402" fill="#6b7280" font-size="10" text-anchor="middle">discard</text>
 <text x="930" y="412" fill="#4b5563" font-size="10" text-anchor="end">generated by tools/plot_results.py · y-axis truncated at 0.90 ms</text>
 </svg>
