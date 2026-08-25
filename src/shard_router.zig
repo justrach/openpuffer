@@ -3,7 +3,9 @@
 //! Same FNV-1a contract as `tools/shard_key.py`:
 //!   utf-8(namespace) + NUL + utf-8(decimal_id)   then  key % N
 //! Writes go to exactly one child. Queries scatter-gather and merge by `$distance`.
-//! Children are reached over keep-alive TCP_NODELAY sockets.
+//! Children are reached over one keep-alive TCP_NODELAY socket each
+//! (mutex-shared across router workers so idle keep-alives cannot pin
+//! every child serve thread).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -349,8 +351,9 @@ fn closeFd(fd: std.posix.fd_t) void {
 
 const ChildConn = struct {
     port: u16,
+    io: std.Io,
     fd: ?std.posix.fd_t = null,
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     fn close(self: *ChildConn) void {
         if (self.fd) |fd| {
@@ -369,8 +372,8 @@ const ChildConn = struct {
         // Per-worker sockets pin child serve workers in recv() on idle
         // keep-alives (serve requeues after one request), so a third
         // connection is never read.
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         var last: ?anyerror = null;
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
@@ -1025,7 +1028,7 @@ fn serveIoUring(alloc: std.mem.Allocator, io: std.Io, listen_fd: std.posix.fd_t,
     const queue = try alloc.create(FdQueue);
     queue.* = .{ .io = io };
     const conns = try alloc.alloc(ChildConn, cluster.ports.len);
-    for (conns, cluster.ports) |*c, p| c.* = .{ .port = p };
+    for (conns, cluster.ports) |*c, p| c.* = .{ .port = p, .io = io };
     const ctx = try alloc.create(PoolCtx);
     ctx.* = .{ .alloc = alloc, .io = io, .cluster = cluster, .queue = queue, .listen_fd = listen_fd, .conns = conns };
     const n = routerWorkerCount(cluster.o);
