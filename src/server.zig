@@ -428,16 +428,10 @@ fn serveIoUring(
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
     const queue = try startWorkerPool(alloc, io, registry, o, listen_fd);
-    try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers (fair rotate), ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
-    var store: std.ArrayList(u8) = .empty;
-    defer store.deinit(alloc);
-    try store.resize(alloc, 1 << 16);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var xfer = ConnXfer{};
     while (true) {
         const fd = ring.accept(listen_fd) catch |e| {
             try out.print("io_uring accept error: {any}\n", .{e});
@@ -445,16 +439,11 @@ fn serveIoUring(
             continue;
         };
         iouring.enableTcpNoDelay(fd);
-        // If more clients are already in the listen backlog, hand everyone
-        // (including this fd) to the pool so ANN work runs on all cores.
-        // A lone connection is handled inline to avoid a futex wake (~0.3ms).
+        // Never handle on the accept thread: a keep-alive query would pin
+        // accept and leave upserts sitting in the listen backlog until they
+        // time out (~3s). Always queue; workers rotate after each request.
         drainListenBacklog(listen_fd, queue);
-        if (queue.isEmpty()) {
-            const end = handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state, queue, listen_fd) catch .close;
-            if (end == .close) _ = std.os.linux.close(fd);
-        } else {
-            queue.push(fd);
-        }
+        queue.push(fd);
     }
 }
 
@@ -515,6 +504,12 @@ fn handleIoUringConn(
         try xfer.sendAll(fd, wire);
 
         if (!keepalive) return .close;
+        // One request per pop. Requeue the keep-alive fd so a waiting
+        // insert/update is not stuck behind this client's next recv.
+        if (queue) |q| {
+            if (listen_fd) |lfd| drainListenBacklog(lfd, q);
+            if (q.tryPush(fd)) return .requeued;
+        }
         if (used < n) {
             const rest = n - used;
             std.mem.copyForwards(u8, store.items[0..rest], store.items[used..n]);
@@ -522,14 +517,6 @@ fn handleIoUringConn(
             continue;
         }
         n = 0;
-        // Keep-alive would otherwise pin this worker (or the accept thread)
-        // until the client hangs up. New upserts then sit in the listen
-        // backlog, never accepted. Drain pending accepts into FdQueue and
-        // yield this connection if anyone is waiting.
-        if (queue) |q| {
-            if (listen_fd) |lfd| drainListenBacklog(lfd, q);
-            if (!q.isEmpty() and q.tryPush(fd)) return .requeued;
-        }
     }
 }
 
