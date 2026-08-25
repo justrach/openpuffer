@@ -152,8 +152,16 @@ pub fn Hnsw(comptime D: type) type {
                 for (neighbors, 0..) |nid, ni| {
                     // one-ahead software prefetch: the next neighbor's int8
                     // vector starts its memory fetch while we dot this one.
+                    // Skip already-visited neighbors (wasted prefetches).
                     if (ni + 1 < neighbors.len) {
-                        @prefetch(self.qvecs.items[neighbors[ni + 1]], .{});
+                        const nxt = neighbors[ni + 1];
+                        if (!visited.isSet(nxt)) {
+                            @prefetch(self.qvecs.items[nxt].ptr, .{
+                                .rw = .read,
+                                .locality = 3,
+                                .cache = .data,
+                            });
+                        }
                     }
                     if (visited.isSet(nid)) continue;
                     visited.set(nid);
