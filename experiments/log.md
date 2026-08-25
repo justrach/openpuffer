@@ -114,8 +114,12 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 | 50k | 256 | 2.171 | 2.392 | 0.2940 | 731 / 794 MiB | no (just under) |
 | 50k | 512 | 3.446 | 3.923 | **0.4500** | 731 / 816 MiB | **yes** (smallest measured) |
 | 50k | 1024 | 4.814 | 5.210 | 0.6580 | 731 / 839 MiB | yes |
-| 200k | — | — | — | — | — | running |
-| 1M | — | — | — | — | — | one `--no-exact` run pending if RSS fits |
+| 200k | 64 | 1.249 | 1.505 | 0.0220 | 2733 / 2812 MiB | no |
+| 200k | 128 | 1.692 | 1.950 | 0.0400 | 2733 / 2891 MiB | no |
+| 200k | 256 | 2.940 | 3.175 | 0.0760 | 2733 / 2970 MiB | no |
+| 200k | 512 | 5.043 | 5.477 | 0.1420 | 2733 / 3050 MiB | no |
+| 200k | 1024 | 8.480 | 8.865 | 0.2640 | 2733 / 3132 MiB | no (still under; random cannot hold 0.30) |
+| 1M | — | — | — | — | — | one `--no-exact` run pending |
 
 20k rerank_mult at ef=128 (random, 50q): mult=1 p50 0.551 ms recall 0.3280; default 4 p50 0.618 ms recall 0.3280; mult=8 p50 0.591 ms recall 0.3280. Same recall — not a quality knob on this cliff.
 
@@ -133,7 +137,11 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 | 50k | 256 | 0.327 | 0.398 | 1.0000 | 670 / 732 MiB | yes |
 | 50k | 512 | 0.782 | 1.086 | 1.0000 | 670 / 753 MiB | yes |
 | 50k | 1024 | 1.480 | 1.844 | 1.0000 | 670 / 775 MiB | yes |
-| 200k | — | — | — | — | — | running |
+| 200k | 64 | 0.268 | 0.370 | **0.9800** | 2675 / 2753 MiB | **yes** (781 centers) |
+| 200k | 128 | 0.314 | 0.477 | 0.9980 | 2675 / 2832 MiB | yes |
+| 200k | 256 | 0.478 | 0.640 | 0.9980 | 2675 / 2911 MiB | yes |
+| 200k | 512 | 1.101 | 1.488 | 0.9980 | 2675 / 2991 MiB | yes |
+| 200k | 1024 | 2.100 | 2.473 | 0.9980 | 2675 / 3071 MiB | yes |
 
 ### Recommended operating points (so far)
 
@@ -141,7 +149,7 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 |---|----------------------------|---------------------|-------|
 | 20k | **ef=128** (0.33 @ 0.62 ms) | **ef=64** (1.00 @ 0.16 ms) | scored default is already the random floor |
 | 50k | **ef=512** (0.45 @ 3.45 ms); ef=256 is 0.294 | **ef=64** (1.00 @ 0.20 ms) | random cannot hold 0.30 at serve default 128 |
-| 200k | TBD | TBD | |
-| 1M | latency/RSS only (`--no-exact`) | — | |
+| 200k | **cannot hold 0.30** (ef=1024 → 0.264 @ 8.48 ms) | **ef=64** (0.98 @ 0.27 ms) or ef=128 (0.998 @ 0.31 ms) | random is not the quality axis at this n |
+| 1M | latency/RSS only (`--no-exact`, running) | treat as clustered: ef=128 | flatten RSS target ~7.5 GiB |
 
 Serve default ef=128 is correct for 20k random and for clustered at all measured n. Raise `--ef` only when the workload is closer to uniform-random and n ≥ 50k.
