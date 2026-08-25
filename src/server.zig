@@ -313,7 +313,33 @@ const FdQueue = struct {
         self.mu.unlock(self.io);
         return fd;
     }
+
+    fn isEmpty(self: *FdQueue) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.count == 0;
+    }
 };
+
+fn listenPending(listen_fd: std.posix.fd_t) bool {
+    var pfd = [1]std.os.linux.pollfd{.{
+        .fd = listen_fd,
+        .events = std.os.linux.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.os.linux.poll(&pfd, 1, 0);
+    return n > 0 and pfd[0].revents & std.os.linux.POLL.IN != 0;
+}
+
+fn drainListenBacklog(listen_fd: std.posix.fd_t, queue: *FdQueue) void {
+    while (listenPending(listen_fd)) {
+        const res = std.os.linux.accept4(listen_fd, null, null, std.os.linux.SOCK.CLOEXEC);
+        if (std.os.linux.errno(res) != .SUCCESS) return;
+        const fd: std.posix.fd_t = @intCast(res);
+        iouring.enableTcpNoDelay(fd);
+        queue.push(fd);
+    }
+}
 
 const PoolCtx = struct {
     alloc: std.mem.Allocator,
@@ -389,6 +415,12 @@ fn serveIoUring(
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(alloc);
+    try store.resize(alloc, 1 << 16);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var xfer = ConnXfer{};
     while (true) {
         const fd = ring.accept(listen_fd) catch |e| {
             try out.print("io_uring accept error: {any}\n", .{e});
@@ -396,7 +428,16 @@ fn serveIoUring(
             continue;
         };
         iouring.enableTcpNoDelay(fd);
-        queue.push(fd);
+        // If more clients are already in the listen backlog, hand everyone
+        // (including this fd) to the pool so ANN work runs on all cores.
+        // A lone connection is handled inline to avoid a futex wake (~0.3ms).
+        drainListenBacklog(listen_fd, queue);
+        if (queue.isEmpty()) {
+            handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state) catch {};
+            _ = std.os.linux.close(fd);
+        } else {
+            queue.push(fd);
+        }
     }
 }
 
