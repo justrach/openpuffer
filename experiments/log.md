@@ -6,6 +6,7 @@ Protocol: see `program.md`. Append-only EXCEPT completing the current experiment
 Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
+Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 (io_uring + TCP_NODELAY + fast query JSON). Not comparable to the in-process ANN metric.
 
 ![p50 per experiment](results.svg)
 
@@ -36,3 +37,4 @@ Chart regenerated with `python3 tools/plot_results.py` after every completed exp
 | E020 | 2026-08-23 | prefetch next f32 vector during exact rerank (40 random 6 KiB loads) | @prefetch next stored vector in rerank loop | src/hnsw.zig | pass | 0.678 / 0.630 | 0.3130 | +10.1% / +2.3% | discard | parallel cloud-agent row (originally E012). rerank is a small slice of p50; prefetch did not clear 4%. Reverted |
 | E021 | 2026-08-23 | two independent 16-wide f32 accumulators in dot() to hide FMA latency on rerank | dual-acc f32 dot, bit-exact enough for ranking | src/vector.zig | pass | 0.674 / 0.610 | 0.3130 | +9.4% / -1.0% | discard | parallel cloud-agent row (originally E013). query p50 not a 4% win (build *was* faster, ~38.7s vs ~46s, but metric is query). Reverted |
 | E022 | 2026-08-23 | only prefetch the next neighbor qvec when it is not already visited (skip wasted prefetches) | guard E015 prefetch with !visited.isSet | src/hnsw.zig | pass | 0.710 / 0.575 | 0.3130 | +15.3% / -6.7% | keep | parallel cloud-agent row (originally E014). run1 miss, run2 decides (-6.7%); recall 0.3130. exact-scan also dipped on run2 (5.55→4.85) so treat 0.575 as noisy; still a protocol keep. New host best 0.575 |
+| E023 | 2026-08-25 | HTTP serve overhead (not ANN dots) is the leftover ~1ms on Linux; io_uring accept/recv/send + TCP_NODELAY + scan query JSON without a 1536-node AST | Linux io_uring serve loop; nodelay; parseAnnQuery; tools/serve_bench.py | src/iouring_sock.zig src/server.zig | pass | 1.084 / 1.089 / 1.113 | — | −34% vs HTTP baseline 1.646 | keep | SERVING metric (urllib, new TCP conn/query, n=2000 dim=1536). Engine bench-synthetic unchanged. Chart not regenerated — different metric. |

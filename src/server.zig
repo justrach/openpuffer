@@ -11,9 +11,11 @@
 //! Responses use the same shapes: {"rows":[{"id":N,"$distance":D}],...}
 
 const std = @import("std");
+const builtin = @import("builtin");
 const hnsw_mod = @import("hnsw.zig");
 const s3_mod = @import("s3.zig");
 const persist_mod = @import("persist.zig");
+const iouring = @import("iouring_sock.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -260,20 +262,104 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     if (registry.store != null) try out.print("persistence: s3 bucket '{s}' (group-commit WAL)\n", .{o.s3_cfg.?.bucket});
     try out.flush();
 
+    if (builtin.os.tag == .linux) {
+        try out.print("linux serve: io_uring accept/recv/send + TCP_NODELAY\n", .{});
+        try out.flush();
+        serveIoUring(alloc, io, listener.socket.handle, &registry, o, out) catch |e| {
+            try out.print("io_uring serve failed ({any}); falling back to thread-per-conn\n", .{e});
+            try out.flush();
+            try serveThreaded(alloc, io, &listener, &registry, o, out);
+        };
+    } else {
+        try serveThreaded(alloc, io, &listener, &registry, o, out);
+    }
+}
+
+fn serveThreaded(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    registry: *Registry,
+    o: Options,
+    out: *std.Io.Writer,
+) !void {
     var conn_sem = std.Io.Semaphore{ .permits = 32 };
     while (true) {
         const stream = listener.accept(io) catch |e| {
             try out.print("accept error: {any}\n", .{e});
             continue;
         };
+        iouring.enableTcpNoDelay(stream.socket.handle);
         conn_sem.waitUncancelable(io);
-        const t = std.Thread.spawn(.{}, handleConnectionThread, .{ alloc, io, stream, &registry, o, &conn_sem }) catch {
+        const t = std.Thread.spawn(.{}, handleConnectionThread, .{ alloc, io, stream, registry, o, &conn_sem }) catch {
             conn_sem.post(io);
-            handleConnection(alloc, io, stream, &registry, o) catch {};
+            handleConnection(alloc, io, stream, registry, o) catch {};
             continue;
         };
         t.detach();
     }
+}
+
+fn serveIoUring(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    listen_fd: std.posix.fd_t,
+    registry: *Registry,
+    o: Options,
+    out: *std.Io.Writer,
+) !void {
+    var ring = try iouring.Ring.init();
+    defer ring.deinit();
+    while (true) {
+        const fd = ring.accept(listen_fd) catch |e| {
+            try out.print("io_uring accept error: {any}\n", .{e});
+            try out.flush();
+            continue;
+        };
+        iouring.enableTcpNoDelay(fd);
+        handleIoUringConn(&ring, fd, alloc, io, registry, o) catch {};
+        _ = std.os.linux.close(fd);
+    }
+}
+
+fn handleIoUringConn(
+    ring: *iouring.Ring,
+    fd: std.posix.fd_t,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    registry: *Registry,
+    o: Options,
+) !void {
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(alloc);
+    try store.resize(alloc, 1 << 16);
+    var n: usize = 0;
+    while (true) {
+        if (n == store.items.len) {
+            const cap = store.items.len;
+            if (cap >= 8 << 20) return error.RequestTooLarge;
+            try store.resize(alloc, cap * 2);
+        }
+        const got = try ring.recv(fd, store.items[n..]);
+        if (got == 0) break;
+        n += got;
+        if (iouring.completeHttpRequest(store.items[0..n]) != 0) break;
+    }
+    if (n == 0) return;
+    const raw = try iouring.parseHttpRequest(store.items[0..n]);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var res = Responder{ .raw_alloc = arena };
+    dispatch(arena, io, raw.method, raw.path, raw.body, registry, o, &res) catch {
+        res.raw_status = .internal_server_error;
+        res.raw_body = "{\"error\":\"internal\"}";
+    };
+    const status_n: u16 = @intFromEnum(res.raw_status);
+    const phrase = res.raw_status.phrase() orelse "OK";
+    const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body);
+    try ring.sendAll(fd, wire);
 }
 
 fn handleConnectionThread(
@@ -309,7 +395,8 @@ fn handleConnection(
         const arena = arena_state.allocator();
 
         handleRequest(arena, io, &req, registry, o) catch |e| {
-            respondJson(&req, .internal_server_error, "{\"error\":\"internal\"}") catch {};
+            var err_res = Responder{ .req = &req };
+            respondJson(&err_res, .internal_server_error, "{\"error\":\"internal\"}") catch {};
             return e;
         };
     }
@@ -531,13 +618,73 @@ fn snapshotNamespace(store: *persist_mod.Store, ns: *Namespace) !void {
     try store.putSnapshotBin(ns.name, body);
 }
 
-fn respondJson(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
-    try req.respond(body, .{
-        .status = status,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-        },
-    });
+const Responder = struct {
+    req: ?*std.http.Server.Request = null,
+    raw_alloc: ?std.mem.Allocator = null,
+    raw_status: std.http.Status = .ok,
+    raw_body: []const u8 = "",
+};
+
+fn respondJson(res: *Responder, status: std.http.Status, body: []const u8) !void {
+    if (res.req) |req| {
+        try req.respond(body, .{
+            .status = status,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        });
+        return;
+    }
+    res.raw_status = status;
+    if (res.raw_alloc) |a| {
+        res.raw_body = try a.dupe(u8, body);
+    } else {
+        res.raw_body = body;
+    }
+}
+
+/// Tight scanner for `{"rank_by":["vector","ANN",[f,f,...]],"top_k":N}`.
+/// Avoids building a 1536-node JSON AST on the query hot path.
+fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f32, top_k: usize } {
+    const ann = std.mem.indexOf(u8, body, "\"ANN\"") orelse return error.BadQuery;
+    var i: usize = ann + 5;
+    while (i < body.len and body[i] != '[') : (i += 1) {}
+    if (i >= body.len) return error.BadQuery;
+    i += 1;
+    var vec: std.ArrayList(f32) = .empty;
+    while (i < body.len) {
+        while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r' or body[i] == ',')) : (i += 1) {}
+        if (i >= body.len) return error.BadQuery;
+        if (body[i] == ']') break;
+        const start = i;
+        if (body[i] == '+' or body[i] == '-') i += 1;
+        var saw_digit = false;
+        while (i < body.len) {
+            const c = body[i];
+            if (c >= '0' and c <= '9') {
+                saw_digit = true;
+                i += 1;
+            } else if (c == '.' or c == 'e' or c == 'E') {
+                i += 1;
+            } else if ((c == '+' or c == '-') and i > start and (body[i - 1] == 'e' or body[i - 1] == 'E')) {
+                i += 1;
+            } else break;
+        }
+        if (!saw_digit) return error.BadQuery;
+        try vec.append(alloc, try std.fmt.parseFloat(f32, body[start..i]));
+    }
+    var top_k: usize = 10;
+    const key = std.mem.indexOf(u8, body, "\"top_k\"") orelse std.mem.indexOf(u8, body, "\"limit\"");
+    if (key) |p| {
+        var j = p;
+        while (j < body.len and body[j] != ':') : (j += 1) {}
+        if (j < body.len) j += 1;
+        while (j < body.len and (body[j] == ' ' or body[j] == '\t')) : (j += 1) {}
+        const ns = j;
+        while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {}
+        if (j > ns) top_k = @max(1, std.fmt.parseInt(usize, body[ns..j], 10) catch 10);
+    }
+    return .{ .vec = try vec.toOwnedSlice(alloc), .top_k = top_k };
 }
 
 fn handleRequest(
@@ -553,19 +700,6 @@ fn handleRequest(
     const method = req.head.method;
     var body_read_buf: [1 << 16]u8 = undefined;
 
-    // route: /v2/namespaces[/{ns}[/query]]
-    const prefix = "/v2/namespaces/";
-    if (!std.mem.startsWith(u8, path, prefix)) {
-        var ebuf: [512]u8 = undefined;
-        const emsg = try std.fmt.bufPrint(&ebuf, "{{\"error\":\"unknown route\",\"target\":\"{s}\"}}", .{path});
-        return respondJson(req, .not_found, emsg);
-    }
-    const rest = path[prefix.len..];
-
-    // Body handling: std 0.17-dev's discardBody asserts when responding to a
-    // POST whose head has neither transfer_encoding nor content_length (curl
-    // sends exactly that for `-X POST` with no body). Mark those consumed up
-    // front; drain real bodies through a properly-sized reader buffer.
     var body: []const u8 = "";
     if (method == .POST) {
         if (req.head.transfer_encoding == .none and req.head.content_length == null) {
@@ -577,10 +711,38 @@ fn handleRequest(
             body = body_writer.written();
         }
     }
-    if (std.mem.endsWith(u8, rest, "/snapshot") and method == .POST) {
+    const method_s: []const u8 = switch (method) {
+        .GET => "GET",
+        .POST => "POST",
+        .DELETE => "DELETE",
+        else => "OTHER",
+    };
+    var res = Responder{ .req = req };
+    return dispatch(alloc, io, method_s, path, body, registry, o, &res);
+}
+
+fn dispatch(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    registry: *Registry,
+    o: Options,
+    res: *Responder,
+) !void {
+    const prefix = "/v2/namespaces/";
+    if (!std.mem.startsWith(u8, path, prefix)) {
+        var ebuf: [512]u8 = undefined;
+        const emsg = try std.fmt.bufPrint(&ebuf, "{{\"error\":\"unknown route\",\"target\":\"{s}\"}}", .{path});
+        return respondJson(res, .not_found, emsg);
+    }
+    const rest = path[prefix.len..];
+
+    if (std.mem.endsWith(u8, rest, "/snapshot") and std.mem.eql(u8, method, "POST")) {
         const ns_name = rest[0 .. rest.len - "/snapshot".len];
         const ns = registry.get(ns_name) orelse
-            return respondJson(req, .not_found, "{\"error\":\"namespace not found\"}");
+            return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         if (registry.store) |store| {
             var t = Sw.start(io);
             if (registry.persist) |pw| pw.s3_mu.lockUncancelable(pw.io);
@@ -589,34 +751,34 @@ fn handleRequest(
             store.deleteWalUpTo(ns.name, ns.wal_seq);
             var buf: [128]u8 = undefined;
             const msg = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"snapshot_ms\":{d:.2}}}", .{@as(f64, @floatFromInt(t.readNs(io))) / 1e6});
-            return respondJson(req, .ok, msg);
+            return respondJson(res, .ok, msg);
         }
-        return respondJson(req, .bad_request, "{\"error\":\"persistence not configured\"}");
+        return respondJson(res, .bad_request, "{\"error\":\"persistence not configured\"}");
     }
 
-    if (std.mem.endsWith(u8, rest, "/query") and method == .POST) {
+    if (std.mem.endsWith(u8, rest, "/query") and std.mem.eql(u8, method, "POST")) {
         const ns_name = rest[0 .. rest.len - "/query".len];
         const ns = registry.get(ns_name) orelse
-            return respondJson(req, .not_found, "{\"error\":\"namespace not found\"}");
-        return handleQuery(alloc, req, ns, o, body);
+            return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
+        return handleQuery(alloc, res, ns, o, body);
     }
 
-    if (method == .POST) {
+    if (std.mem.eql(u8, method, "POST")) {
         const ns = try registry.getOrCreate(rest);
-        return handleWrite(alloc, registry.alloc, req, ns, body, registry);
+        return handleWrite(alloc, registry.alloc, res, ns, body, registry);
     }
 
-    if (method == .GET) {
+    if (std.mem.eql(u8, method, "GET")) {
         const ns = registry.get(rest) orelse
-            return respondJson(req, .not_found, "{\"error\":\"namespace not found\"}");
+            return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         ns.lock.lockSharedUncancelable(ns.io);
         defer ns.lock.unlockShared(ns.io);
         var buf: [256]u8 = undefined;
         const s = try std.fmt.bufPrint(&buf, "{{\"namespace\":\"{s}\",\"dim\":{d},\"count\":{d}}}", .{ ns.name, ns.dim, ns.index.len() });
-        return respondJson(req, .ok, s);
+        return respondJson(res, .ok, s);
     }
 
-    if (method == .DELETE) {
+    if (std.mem.eql(u8, method, "DELETE")) {
         registry.mutex.lockUncancelable(registry.io);
         const removed = registry.namespaces.fetchRemove(rest);
         registry.mutex.unlock(registry.io);
@@ -627,10 +789,10 @@ fn handleRequest(
             kv.value.lock.unlock(kv.value.io);
             registry.alloc.destroy(kv.value);
         }
-        return respondJson(req, .ok, "{\"ok\":true}");
+        return respondJson(res, .ok, "{\"ok\":true}");
     }
 
-    return respondJson(req, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+    return respondJson(res, .method_not_allowed, "{\"error\":\"method not allowed\"}");
 }
 
 fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f32) !void {
@@ -682,7 +844,7 @@ fn vecFromJson(arr: std.json.Array, alloc: std.mem.Allocator) ![]f32 {
 fn handleWrite(
     arena: std.mem.Allocator,
     persist: std.mem.Allocator,
-    req: *std.http.Server.Request,
+    res: *Responder,
     ns: *Namespace,
     body: []const u8,
     registry: *Registry,
@@ -690,14 +852,14 @@ fn handleWrite(
     // NOTE: body already consumed by caller
     const alloc = arena;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return respondJson(req, .bad_request, "{\"error\":\"invalid json\"}");
+        return respondJson(res, .bad_request, "{\"error\":\"invalid json\"}");
     defer parsed.deinit();
-    if (parsed.value != .object) return respondJson(req, .bad_request, "{\"error\":\"expected object\"}");
+    if (parsed.value != .object) return respondJson(res, .bad_request, "{\"error\":\"expected object\"}");
     const root = parsed.value.object;
 
     if (root.get("distance_metric")) |dm| {
         if (dm != .string or !std.mem.eql(u8, dm.string, "cosine_distance")) {
-            return respondJson(req, .bad_request, "{\"error\":\"only cosine_distance supported\"}");
+            return respondJson(res, .bad_request, "{\"error\":\"only cosine_distance supported\"}");
         }
     }
 
@@ -705,38 +867,38 @@ fn handleWrite(
     var batch: std.ArrayList(IdVec) = .empty;
 
     if (root.get("upsert_columns")) |cols_v| {
-        if (cols_v != .object) return respondJson(req, .bad_request, "{\"error\":\"upsert_columns must be object\"}");
+        if (cols_v != .object) return respondJson(res, .bad_request, "{\"error\":\"upsert_columns must be object\"}");
         const cols = cols_v.object;
-        const ids_v = cols.get("id") orelse return respondJson(req, .bad_request, "{\"error\":\"id column required\"}");
-        const vecs_v = cols.get("vector") orelse return respondJson(req, .bad_request, "{\"error\":\"vector column required\"}");
-        if (ids_v != .array or vecs_v != .array) return respondJson(req, .bad_request, "{\"error\":\"columns must be arrays\"}");
+        const ids_v = cols.get("id") orelse return respondJson(res, .bad_request, "{\"error\":\"id column required\"}");
+        const vecs_v = cols.get("vector") orelse return respondJson(res, .bad_request, "{\"error\":\"vector column required\"}");
+        if (ids_v != .array or vecs_v != .array) return respondJson(res, .bad_request, "{\"error\":\"columns must be arrays\"}");
         for (ids_v.array.items, vecs_v.array.items) |id_v, vec_v| {
-            if (vec_v != .array) return respondJson(req, .bad_request, "{\"error\":\"vector rows must be arrays\"}");
+            if (vec_v != .array) return respondJson(res, .bad_request, "{\"error\":\"vector rows must be arrays\"}");
             const id: u64 = switch (id_v) {
                 .integer => |n| @intCast(n),
-                else => return respondJson(req, .bad_request, "{\"error\":\"ids must be integers\"}"),
+                else => return respondJson(res, .bad_request, "{\"error\":\"ids must be integers\"}"),
             };
             try batch.append(alloc, .{ .id = id, .vec = try vecFromJson(vec_v.array, alloc) });
         }
     } else if (root.get("upsert_rows")) |rows_v| {
-        if (rows_v != .array) return respondJson(req, .bad_request, "{\"error\":\"upsert_rows must be array\"}");
+        if (rows_v != .array) return respondJson(res, .bad_request, "{\"error\":\"upsert_rows must be array\"}");
         for (rows_v.array.items) |row| {
-            if (row != .object) return respondJson(req, .bad_request, "{\"error\":\"rows must be objects\"}");
+            if (row != .object) return respondJson(res, .bad_request, "{\"error\":\"rows must be objects\"}");
             const robj = row.object;
-            const id_v = robj.get("id") orelse return respondJson(req, .bad_request, "{\"error\":\"row missing id\"}");
-            const vec_v = robj.get("vector") orelse return respondJson(req, .bad_request, "{\"error\":\"row missing vector\"}");
-            if (vec_v != .array) return respondJson(req, .bad_request, "{\"error\":\"vector must be array\"}");
+            const id_v = robj.get("id") orelse return respondJson(res, .bad_request, "{\"error\":\"row missing id\"}");
+            const vec_v = robj.get("vector") orelse return respondJson(res, .bad_request, "{\"error\":\"row missing vector\"}");
+            if (vec_v != .array) return respondJson(res, .bad_request, "{\"error\":\"vector must be array\"}");
             const id: u64 = switch (id_v) {
                 .integer => |n| @intCast(n),
-                else => return respondJson(req, .bad_request, "{\"error\":\"ids must be integers\"}"),
+                else => return respondJson(res, .bad_request, "{\"error\":\"ids must be integers\"}"),
             };
             try batch.append(alloc, .{ .id = id, .vec = try vecFromJson(vec_v.array, alloc) });
         }
     } else {
-        return respondJson(req, .bad_request, "{\"error\":\"missing upsert_columns/upsert_rows\"}");
+        return respondJson(res, .bad_request, "{\"error\":\"missing upsert_columns/upsert_rows\"}");
     }
 
-    if (batch.items.len == 0) return respondJson(req, .ok, "{\"ok\":true}");
+    if (batch.items.len == 0) return respondJson(res, .ok, "{\"ok\":true}");
 
     {
         ns.lock.lockUncancelable(ns.io);
@@ -746,7 +908,7 @@ fn handleWrite(
             ns.index.dim = ns.dim;
         }
         for (batch.items) |iv| {
-            if (iv.vec.len != ns.dim) return respondJson(req, .bad_request, "{\"error\":\"dimension mismatch\"}");
+            if (iv.vec.len != ns.dim) return respondJson(res, .bad_request, "{\"error\":\"dimension mismatch\"}");
             try upsertDoc(ns, persist, iv.id, iv.vec);
         }
     }
@@ -783,46 +945,28 @@ fn handleWrite(
         }
     }
 
-    return respondJson(req, .ok, "{\"ok\":true}");
+    return respondJson(res, .ok, "{\"ok\":true}");
 }
 
 fn handleQuery(
     alloc: std.mem.Allocator,
-    req: *std.http.Server.Request,
+    res: *Responder,
     ns: *Namespace,
     o: Options,
     body: []const u8,
 ) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return respondJson(req, .bad_request, "{\"error\":\"invalid json\"}");
-    defer parsed.deinit();
-    if (parsed.value != .object) return respondJson(req, .bad_request, "{\"error\":\"expected object\"}");
-    const qobj = parsed.value.object;
-
-    const rb = qobj.get("rank_by") orelse return respondJson(req, .bad_request, "{\"error\":\"rank_by required\"}");
-    if (rb != .array or rb.array.items.len < 3) return respondJson(req, .bad_request, "{\"error\":\"rank_by must be [field,'ANN',vector]\"}");
-    const field = rb.array.items[0];
-    const fnv = rb.array.items[1];
-    if (field != .string or !std.mem.eql(u8, field.string, "vector")) return respondJson(req, .bad_request, "{\"error\":\"only vector ANN ranking supported\"}");
-    if (fnv != .string or !std.mem.eql(u8, fnv.string, "ANN")) return respondJson(req, .bad_request, "{\"error\":\"only ANN function supported\"}");
-    const vec_v = rb.array.items[2];
-    if (vec_v != .array) return respondJson(req, .bad_request, "{\"error\":\"ANN vector must be array\"}");
-    const query_vec = try vecFromJson(vec_v.array, alloc);
-
-    var top_k: usize = 10;
-    if (qobj.get("top_k")) |t| {
-        if (t == .integer) top_k = @intCast(@max(1, t.integer));
-    } else if (qobj.get("limit")) |l| {
-        if (l == .integer) top_k = @intCast(@max(1, l.integer));
-    }
+    const spec = parseAnnQuery(body, alloc) catch
+        return respondJson(res, .bad_request, "{\"error\":\"rank_by must be [field,'ANN',vector]\"}");
+    const query_vec = spec.vec;
+    const top_k = spec.top_k;
 
     ns.lock.lockSharedUncancelable(ns.io);
     defer ns.lock.unlockShared(ns.io);
-    if (ns.index.entry_point == null) return respondJson(req, .ok, "{\"rows\":[]}");
+    if (ns.index.entry_point == null) return respondJson(res, .ok, "{\"rows\":[]}");
     if (query_vec.len != ns.dim) {
         var dbuf: [128]u8 = undefined;
         const dmsg = try std.fmt.bufPrint(&dbuf, "{{\"error\":\"dimension mismatch\",\"expected\":{d},\"got\":{d}}}", .{ ns.dim, query_vec.len });
-        return respondJson(req, .bad_request, dmsg);
+        return respondJson(res, .bad_request, dmsg);
     }
 
     const results = try ns.index.search(query_vec, top_k, o.ef, alloc);
@@ -836,5 +980,16 @@ fn handleQuery(
         try w.print("{{\"id\":{d},\"$distance\":{d}}}", .{ doc_id, r.distance });
     }
     try w.writeAll("],\"usage\":{}}");
-    return respondJson(req, .ok, out.written());
+    return respondJson(res, .ok, out.written());
+}
+
+test "parseAnnQuery reads vector and top_k" {
+    const body = "{\"rank_by\":[\"vector\",\"ANN\",[1.5,-2,3e-1]],\"top_k\":7}";
+    const spec = try parseAnnQuery(body, std.testing.allocator);
+    defer std.testing.allocator.free(spec.vec);
+    try std.testing.expectEqual(@as(usize, 3), spec.vec.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), spec.vec[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), spec.vec[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), spec.vec[2], 1e-6);
+    try std.testing.expectEqual(@as(usize, 7), spec.top_k);
 }
