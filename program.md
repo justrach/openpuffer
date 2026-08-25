@@ -91,9 +91,11 @@ Check for `.git` in the repo root:
 
 ## THE GATE
 
-Before any run counts, `zig build test` must pass. If tests fail, fix within
-the current experiment (a test failure caused by your edit is not a crash to
-log separately unless you give up on the hypothesis).
+Before any run counts, `zig build test` must pass. That step now runs the
+HNSW tests in `src/hnsw.zig` (imported-file tests are otherwise skipped).
+If tests fail, fix within the current experiment (a test failure caused by
+your edit is not a crash to log separately unless you give up on the
+hypothesis).
 
 ## One experiment cycle
 
@@ -136,13 +138,15 @@ A new idea requires the previous idea's ledger entry to be complete first.
 
 One markdown table row per experiment:
 
-| id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | notes |
+| id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | track | notes |
 
 - `id`: zero-padded sequence `E001`, `E002`, …
 - `gate`: `pass` / `fail`.
-- `delta p50 vs best`: signed % vs best-so-far entering the experiment.
+- `delta p50 vs best`: signed % vs best-so-far **on the same track**.
 - `verdict`: `running` (row opened, no result yet) / `keep` (new best,
   committed) / `discard` (reverted) / `crash`.
+- `track`: `engine` | `serve` | `memory` | `knobs` | `scale`. Only
+  `engine` numeric p50s go into `results.svg` and the 4% keep bar.
 - Baseline row `E000` is seeded by the human; never edit it.
 
 ## Guardrails (adapted from autoresearch)
@@ -152,8 +156,9 @@ One markdown table row per experiment:
   `src/main.zig` to flatter results. Disabling/bypassing rerank for raw speed
   is allowed ONLY if the resulting recall@10 is logged honestly and still
   clears the 0.30 floor.
-- **Don't touch peer-owned files**: anything outside `src/hnsw.zig`,
-  `src/vector.zig`, `experiments/log.md` is off-limits.
+- **Don't touch peer-owned files**: stay inside the files listed for your
+  **track** (see 2026-08-25 amendment). `experiments/log.md` is always
+  writable. Do not change the scored bench command.
 - **Commit discipline**: EVERY kept improvement is committed, including the
   very first one — the first keep IS the lineage point. Discards are reverted,
   not committed (except the ledger row itself).
@@ -185,3 +190,47 @@ One markdown table row per experiment:
    remaining engine-side effect (E010/E011 confirmed the traversal loop is
    at a plateau: prefetch-fed dot products dominate, everything else is
    below this machine's noise floor).
+
+### 2026-08-25 — tracks, real gate, loop driver (human-authorized)
+
+The original one-file / one-metric loop plateaued and then drifted: HTTP
+p50s, flatten RSS, and knob rows were logged as if they were 20k engine
+p50. `zig build test` compiled `src/main.zig` (no tests) and never ran
+`src/hnsw.zig`. Agents also edited `src/main.zig` / `src/server.zig`
+despite the freeze.
+
+1. **Tracks.** Every ledger row has a `track` cell. `tools/plot_results.py`
+   plots **engine only**. A `keep` on `serve` / `memory` / `knobs` / `scale`
+   does **not** move the engine best or the 4% bar. Put HTTP / 1M / RSS
+   numbers in notes or the Scale/Pareto sections, never in an engine p50
+   cell.
+2. **Gate.** `zig build test` now runs `src/hnsw.zig` tests. Confirm with
+   `zig test src/hnsw.zig -OReleaseFast` if you want the ReleaseFast suite.
+3. **Driver.** After an edit, run `python3 tools/loop_once.py`. It executes
+   the exact scored command, parses p50 + recall@10, and prints keep/discard
+   vs the best **engine** keep. It does not pick a hypothesis.
+4. **Editable files by track** (still one hypothesis per cycle):
+   - `engine`: `src/hnsw.zig`, `src/vector.zig`
+   - `serve`: `src/server.zig`, `src/iouring_sock.zig` (tree must be clean)
+   - `memory` / `scale`: `src/hnsw.zig` plus harness flags already on main
+   - `knobs`: `src/main.zig` / `src/server.zig` only to *expose* an existing
+     engine knob — not to change the scored command
+5. **Do not re-run E002–E022.** Those inner-loop ideas are spent. Engine
+   work now needs a new mechanism (e.g. AMX/VNNI `dotI8`), not another
+   prefetch width.
+6. **Backlog (pick one, in this order, unless a human redirects):**
+   1. `memory`: drop the hot-path f32 copy (int8-only / optional rerank) so
+      2M can fit on 16 GiB after flatten (1M is 7.3 GiB).
+   2. `memory`: mmap the flat slabs.
+   3. `serve`: RCU / finer lock — mixed writers still stall readers after
+      fair-rotate (exclusive splice).
+   4. `serve`: Zig/io_uring shard router with keep-alive to children
+      (Python hop is ~0.46 ms; same-box N shards lose QPS).
+   5. `scale`: clustered 1M recall@10 at ef=64/128 (`--clustered --no-exact`
+      is latency-only today).
+   6. `engine`: AMX or AVX-512 VNNI `dotI8` only if it can clear 4% vs
+      **E022 0.575 ms** on this host after a fresh control pair.
+
+Clustered (not uniform random) is the product quality axis. Serve default
+ef=128 stays. Random 1536-d cannot hold recall@10 ≥ 0.30 at n=200k even at
+ef=1024 — do not spend engine budget chasing that cliff.
