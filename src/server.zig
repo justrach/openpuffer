@@ -223,7 +223,7 @@ const Registry = struct {
 
 pub const Options = struct {
     port: u16 = 8080,
-    ef: u32 = 256,
+    ef: u32 = 128,
     /// null = ncpu. Override with --workers / OPENPUFFER_WORKERS.
     workers: ?usize = null,
     s3_cfg: ?s3_mod.Config = null,

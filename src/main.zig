@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "bench-synthetic")) {
         try benchSynthetic(gpa, io, &w.interface, optsFromArgs(args.items[1..], .{
             .n = 20_000, .q = 100, .dim = 1536, .k = 10, .ef = 200,
-        }));
+        }), hasFlag(args.items[1..], "--no-exact"));
     } else if (std.mem.eql(u8, cmd, "bench-live")) {
         const tpuf_key = init.environ_map.get("TURBOPUFFER_API_KEY") orelse {
             try w.interface.print("missing TURBOPUFFER_API_KEY\n", .{});
@@ -83,13 +83,13 @@ pub fn main(init: std.process.Init) !void {
         }));
     } else if (std.mem.eql(u8, cmd, "serve")) {
         var port: u16 = 8080;
-        var ef: u32 = 256;
+        var ef: u32 = 128;
         var workers: ?usize = null;
         var s3_cfg: ?s3_mod.Config = null;
         {
             const a = args.items[1..];
             if (optOf(a, "--port")) |v| port = std.fmt.parseInt(u16, v, 10) catch 8080;
-            if (optOf(a, "--ef")) |v| ef = std.fmt.parseInt(u32, v, 10) catch 256;
+            if (optOf(a, "--ef")) |v| ef = std.fmt.parseInt(u32, v, 10) catch 128;
             if (optOf(a, "--workers")) |v| workers = std.fmt.parseInt(usize, v, 10) catch null;
             if (init.environ_map.get("OPENPUFFER_WORKERS")) |s| {
                 workers = std.fmt.parseInt(usize, s, 10) catch workers;
@@ -115,8 +115,8 @@ pub fn main(init: std.process.Init) !void {
             \\
             \\usage:
             \\  openpuffer selftest
-            \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
-            \\  openpuffer serve [--port 8080] [--ef 256] [--workers N]
+            \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200] [--no-exact]
+            \\  openpuffer serve [--port 8080] [--ef 128] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
             \\  openpuffer bench-live [--namespace openpuffer-bench-1] [--n 512] [--queries 30] [--dim 768]
@@ -133,6 +133,38 @@ fn optOf(args: []const []const u8, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, args[i], name) and i + 1 < args.len) return args[i + 1];
     }
     return null;
+}
+
+fn hasFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}
+
+/// Linux RSS in MiB. Null on non-Linux or if /proc is unreadable.
+fn rssMiB(io: std.Io) ?u64 {
+    const file = std.Io.Dir.openFileAbsolute(io, "/proc/self/status", .{}) catch return null;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var iov = [_][]u8{buf[0..]};
+    const n = file.readStreaming(io, &iov) catch return null;
+    const key = "VmRSS:";
+    const idx = std.mem.indexOf(u8, buf[0..n], key) orelse return null;
+    var rest = buf[idx + key.len .. n];
+    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    const kb = std.fmt.parseInt(u64, rest[0..end], 10) catch return null;
+    return kb / 1024;
+}
+
+fn printRss(io: std.Io, out: *std.Io.Writer, label: []const u8) !void {
+    if (rssMiB(io)) |m| {
+        try out.print("{s} rss: {d} MiB\n", .{ label, m });
+    } else {
+        try out.print("{s} rss: unavailable\n", .{label});
+    }
 }
 
 fn optsFromArgs(args: []const []const u8, base: BenchOpts) BenchOpts {
@@ -222,7 +254,7 @@ fn recallAtK(gt: []const u32, got: []const u32) f64 {
 
 // ---------------------------------------------------------------------------
 
-fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOpts) !void {
+fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: BenchOpts, no_exact: bool) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -230,23 +262,57 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
     var rng = std.Random.DefaultPrng.init(7);
     const rand = rng.random();
 
-    try out.print("generating {d} random {d}-dim vectors...\n", .{ o.n, o.dim });
-    const data: [][]f32 = try alloc.alloc([]f32, o.n);
-    for (data) |*row| {
-        row.* = try alloc.alloc(f32, o.dim);
-        for (row.*) |*x| x.* = rand.floatNorm(f32);
-        vecmath.normalize(row.*);
-    }
+    const bytes_f32 = o.n * o.dim * @sizeOf(f32);
+    const bytes_i8 = o.n * o.dim;
+    try out.print(
+        "memory estimate: n={d} dim={d}  f32={d:.1}GiB  int8={d:.1}GiB  (plus HNSW graph; --no-exact={})\n",
+        .{
+            o.n,
+            o.dim,
+            @as(f64, @floatFromInt(bytes_f32)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(bytes_i8)) / (1024.0 * 1024.0 * 1024.0),
+            no_exact,
+        },
+    );
 
     var index = Hnsw.init(gpa, o.dim, .{});
     defer index.deinit();
 
+    // --no-exact: insert from a reused row so the corpus is not retained.
+    // Needed at 1M×1536 (f32+int8 ≈ 7.7GiB) on 16GiB hosts; full path doubles f32.
+    var data: [][]f32 = &.{};
     var build_timer = Sw.start(io);
-    for (data) |v| _ = try index.insert(v);
+    if (no_exact) {
+        try out.print("generating+inserting {d} random {d}-dim vectors (no corpus retain)...\n", .{ o.n, o.dim });
+        try out.flush();
+        const row = try alloc.alloc(f32, o.dim);
+        var i: usize = 0;
+        while (i < o.n) : (i += 1) {
+            for (row) |*x| x.* = rand.floatNorm(f32);
+            vecmath.normalize(row);
+            _ = try index.insert(row);
+            if (i > 0 and i % 100_000 == 0) {
+                try out.print("  inserted {d}/{d}\n", .{ i, o.n });
+                try printRss(io, out, "  build");
+                try out.flush();
+            }
+        }
+    } else {
+        try out.print("generating {d} random {d}-dim vectors...\n", .{ o.n, o.dim });
+        data = try alloc.alloc([]f32, o.n);
+        for (data) |*row| {
+            row.* = try alloc.alloc(f32, o.dim);
+            for (row.*) |*x| x.* = rand.floatNorm(f32);
+            vecmath.normalize(row.*);
+        }
+        for (data) |v| _ = try index.insert(v);
+    }
     const build_ms = @as(f64, @floatFromInt(build_timer.readNs())) / 1e6;
     try out.print("index built: {d} vectors in {d:.1}ms ({d:.0} vec/s)\n", .{
         o.n, build_ms, @as(f64, @floatFromInt(o.n)) / (build_ms / 1000.0),
     });
+    try printRss(io, out, "post-build");
+    try out.flush();
 
     const queries: [][]f32 = try alloc.alloc([]f32, o.q);
     for (queries) |*row| {
@@ -262,14 +328,23 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
         var t = Sw.start(io);
         const res = try index.search(q, o.k, @intCast(o.ef), alloc);
         lat_local.push(t.readNs());
-        var got: [64]u32 = undefined;
-        for (res, 0..) |r, i| got[i] = r.id;
-        const gt = try bruteForce(alloc, data, q, o.k);
-        recall_sum += recallAtK(gt, got[0..res.len]);
+        if (!no_exact) {
+            var got: [64]u32 = undefined;
+            for (res, 0..) |r, i| got[i] = r.id;
+            const gt = try bruteForce(alloc, data, q, o.k);
+            recall_sum += recallAtK(gt, got[0..res.len]);
+        }
     }
     const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
     try report(out, "openpuffer (ANN)", &lat_local, qps_local);
-    try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
+    if (no_exact) {
+        try out.print("openpuffer recall@{d} vs exact: skipped (--no-exact)\n", .{o.k});
+    } else {
+        try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
+    }
+    try printRss(io, out, "post-query");
+
+    if (no_exact) return;
 
     // brute force baseline
     var lat_bf = try Lat.init(alloc, o.q);

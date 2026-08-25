@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--queries", type=int, default=200)
     ap.add_argument("--dim", type=int, default=1536)
     ap.add_argument("--k", type=int, default=10)
-    ap.add_argument("--ef", type=int, default=256)
+    ap.add_argument("--ef", type=int, default=128)
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--keepalive", action="store_true")
