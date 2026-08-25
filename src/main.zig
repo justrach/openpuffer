@@ -44,6 +44,8 @@ const BenchOpts = struct {
     skip_scan: bool = false,
     /// Default true: scored 20k p50 stays comparable. `--no-f32` drops the slab.
     store_f32: bool = true,
+    /// Recall against the index f32 slab (no second corpus). Implies no-retain insert.
+    index_exact: bool = false,
     namespace: []const u8 = "openpuffer-bench-1",
     model: []const u8 = "gemini-embedding-2",
     tpuf_key: []const u8 = "",
@@ -127,8 +129,8 @@ pub fn main(init: std.process.Init) !void {
             \\  openpuffer selftest
             \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
             \\                  [--rerank-mult 4] [--ef-sweep 64,128,256,512] [--clustered]
-            \\                  [--clusters N] [--cluster-noise 0.35] [--no-exact] [--skip-scan]
-            \\                  [--no-f32]
+            \\                  [--clusters N] [--cluster-noise 0.35] [--no-exact] [--index-exact]
+            \\                  [--skip-scan] [--no-f32]
             \\  openpuffer serve [--port 8080] [--ef 128] [--rerank-mult 4] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
@@ -194,6 +196,7 @@ fn optsFromArgs(args: []const []const u8, base: BenchOpts) BenchOpts {
     o.clustered = hasFlag(args, "--clustered");
     o.skip_scan = hasFlag(args, "--skip-scan");
     o.store_f32 = !hasFlag(args, "--no-f32");
+    o.index_exact = hasFlag(args, "--index-exact");
     if (optOf(args, "--namespace")) |v| o.namespace = v;
     if (optOf(args, "--model")) |v| o.model = v;
     if (optOf(args, "--local-endpoint")) |v| o.local_endpoint = v;
@@ -268,9 +271,21 @@ fn report(out: *std.Io.Writer, label: []const u8, lat: *Lat, qps: f64) !void {
     );
 }
 
+const Dist = struct { id: u32, d: f32 };
+
+fn distLessThan(_: void, a: Dist, b: Dist) bool {
+    return a.d < b.d;
+}
+
+fn topKIds(alloc: std.mem.Allocator, all: []Dist, k: usize) ![]u32 {
+    std.mem.sort(Dist, all, {}, distLessThan);
+    const out = try alloc.alloc(u32, @min(k, all.len));
+    for (out, 0..) |*o, i| o.* = all[i].id;
+    return out;
+}
+
 /// Exact top-k by cosine distance (ground truth / brute force baseline).
 fn bruteForce(alloc: std.mem.Allocator, data: []const []const f32, q: []const f32, k: usize) ![]u32 {
-    const Dist = struct { id: u32, d: f32 };
     var all: std.ArrayList(Dist) = .empty;
     defer all.deinit(alloc);
     try all.ensureTotalCapacity(alloc, data.len);
@@ -280,14 +295,25 @@ fn bruteForce(alloc: std.mem.Allocator, data: []const []const f32, q: []const f3
     for (data, 0..) |v, i| {
         all.appendAssumeCapacity(.{ .id = @intCast(i), .d = vecmath.cosineDistance(nq, v) });
     }
-    std.mem.sort(Dist, all.items, {}, struct {
-        fn lt(_: void, a: Dist, b: Dist) bool {
-            return a.d < b.d;
-        }
-    }.lt);
-    const out = try alloc.alloc(u32, @min(k, all.items.len));
-    for (out, 0..) |*o, i| o.* = all.items[i].id;
-    return out;
+    return topKIds(alloc, all.items, k);
+}
+
+/// Exact top-k against the index's stored f32 slab. Same ranking as `bruteForce`
+/// so recall matches the retained-corpus path without a second n×dim copy.
+fn bruteForceIndex(alloc: std.mem.Allocator, index: *const Hnsw, q: []const f32, k: usize, scratch: []Dist) ![]u32 {
+    const nq = try alloc.dupe(f32, q);
+    defer alloc.free(nq);
+    vecmath.normalize(nq);
+    const n = index.len();
+    if (scratch.len < n) return error.ScratchTooSmall;
+    for (0..n) |i| {
+        scratch[i] = .{ .id = @intCast(i), .d = vecmath.cosineDistance(nq, index.vectorConst(@intCast(i))) };
+    }
+    return topKIds(alloc, scratch[0..n], k);
+}
+
+fn reserveIndexSlabs(index: *Hnsw, n: usize) !void {
+    try index.ensureInsertRoom(n);
 }
 
 fn recallAtK(gt: []const u32, got: []const u32) f64 {
@@ -316,17 +342,35 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
 
     const bytes_f32 = if (o.store_f32) o.n * o.dim * @sizeOf(f32) else 0;
     const bytes_i8 = o.n * o.dim;
+    const index_exact = o.index_exact;
+    if (index_exact and !o.store_f32) return error.IndexExactNeedsF32;
+    const retain_corpus = !no_exact and !index_exact;
+    const want_recall = index_exact or !no_exact;
     try out.print(
-        "memory estimate: n={d} dim={d}  f32={d:.1}GiB  int8={d:.1}GiB  (plus HNSW graph; --no-exact={} store_f32={})\n",
+        "memory estimate: n={d} dim={d}  f32={d:.1}GiB  int8={d:.1}GiB  (plus HNSW graph; --no-exact={} --index-exact={} store_f32={})\n",
         .{
             o.n,
             o.dim,
             @as(f64, @floatFromInt(bytes_f32)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(bytes_i8)) / (1024.0 * 1024.0 * 1024.0),
             no_exact,
+            index_exact,
             o.store_f32,
         },
     );
+    if (index_exact) {
+        try out.print(
+            "index-exact: recall vs stored f32 slab (no second corpus). extra GT scratch ≈ {d:.1} MiB\n",
+            .{@as(f64, @floatFromInt(o.n * @sizeOf(Dist))) / (1024.0 * 1024.0)},
+        );
+    } else if (!retain_corpus) {
+        try out.print("no-exact: corpus not retained; recall skipped (pass --index-exact for slab GT)\n", .{});
+    } else {
+        try out.print(
+            "retained-corpus GT would add another {d:.1}GiB f32 on top of the index\n",
+            .{@as(f64, @floatFromInt(bytes_f32)) / (1024.0 * 1024.0 * 1024.0)},
+        );
+    }
 
     var centers: [][]f32 = &.{};
     if (o.clustered) {
@@ -343,12 +387,14 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
 
     var index = Hnsw.init(gpa, o.dim, .{ .store_f32 = o.store_f32 });
     defer index.deinit();
+    try reserveIndexSlabs(&index, o.n);
 
-    // --no-exact: insert from a reused row so the corpus is not retained.
-    // Needed at 1M×1536 (f32+int8 ≈ 7.7GiB) on 16GiB hosts; full path doubles f32.
+    // --no-exact / --index-exact: insert from a reused row so the corpus is
+    // not retained. Needed at 1M×1536 (f32+int8 ≈ 7.7GiB) on 16GiB hosts;
+    // the retained-corpus path doubles f32 and does not fit next to the index.
     var data: [][]f32 = &.{};
     var build_timer = Sw.start(io);
-    if (no_exact) {
+    if (!retain_corpus) {
         try out.print("generating+inserting {d} {s} {d}-dim vectors (no corpus retain)...\n", .{
             o.n, if (o.clustered) "clustered" else "random", o.dim,
         });
@@ -406,6 +452,69 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
         try out.flush();
     }
 
+    if (index_exact) {
+        // Time ANN first (store ids). Exact GT against the stored slab runs
+        // after so a 1M walk does not pollute p50. One GT per query is reused
+        // across the ef sweep. The retained-corpus path below is unchanged so
+        // the scored 20k metric stays interleaved ANN+exact.
+        const stored = try alloc.alloc([]u32, sweep.len * o.q);
+        for (sweep, 0..) |ef, ei| {
+            var lat_local = try Lat.init(alloc, o.q);
+            for (queries, 0..) |q, qi| {
+                var t = Sw.start(io);
+                const res = try index.searchAdvanced(q, o.k, ef, o.rerank_mult, alloc);
+                lat_local.push(t.readNs());
+                const ids = try alloc.alloc(u32, res.len);
+                for (res, 0..) |r, i| ids[i] = r.id;
+                stored[ei * o.q + qi] = ids;
+            }
+            const qps_local = @as(f64, @floatFromInt(o.q)) / (lat_local.mean() / 1000.0);
+            if (multi) {
+                var label_buf: [32]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "ANN ef={d}", .{ef}) catch "ANN";
+                try report(out, label, &lat_local, qps_local);
+            } else {
+                try report(out, "openpuffer (ANN)", &lat_local, qps_local);
+            }
+            try printRss(io, out, "post-query");
+            try out.flush();
+        }
+
+        const gts = try alloc.alloc([]u32, o.q);
+        const scratch = try alloc.alloc(Dist, index.len());
+        try out.print("computing exact GT (index slab) for {d} queries...\n", .{o.q});
+        try out.flush();
+        var gt_timer = Sw.start(io);
+        for (queries, 0..) |q, qi| {
+            gts[qi] = try bruteForceIndex(alloc, &index, q, o.k, scratch);
+            if (qi > 0 and qi % 10 == 0) {
+                try out.print("  exact {d}/{d}\n", .{ qi, o.q });
+                try out.flush();
+            }
+        }
+        const gt_ms = @as(f64, @floatFromInt(gt_timer.readNs())) / 1e6;
+        try out.print("exact GT done: {d:.1}ms ({d:.1}ms/q)\n", .{
+            gt_ms, gt_ms / @as(f64, @floatFromInt(o.q)),
+        });
+        try printRss(io, out, "post-exact");
+        try out.flush();
+
+        for (sweep, 0..) |ef, ei| {
+            var recall_sum: f64 = 0;
+            for (0..o.q) |qi| {
+                recall_sum += recallAtK(gts[qi], stored[ei * o.q + qi]);
+            }
+            const rec = recall_sum / @as(f64, @floatFromInt(o.q));
+            if (multi) {
+                try out.print("recall@{d} ef={d}: {d:.4} (index-exact)\n", .{ o.k, ef, rec });
+            } else {
+                try out.print("openpuffer recall@{d} vs exact: {d:.4} (index-exact)\n", .{ o.k, rec });
+            }
+        }
+        try out.flush();
+        return;
+    }
+
     for (sweep) |ef| {
         var lat_local = try Lat.init(alloc, o.q);
         var recall_sum: f64 = 0;
@@ -413,7 +522,7 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
             var t = Sw.start(io);
             const res = try index.searchAdvanced(q, o.k, ef, o.rerank_mult, alloc);
             lat_local.push(t.readNs());
-            if (!no_exact) {
+            if (want_recall) {
                 var got: [64]u32 = undefined;
                 for (res, 0..) |r, i| got[i] = r.id;
                 const gt = try bruteForce(alloc, data, q, o.k);
@@ -425,14 +534,14 @@ fn benchSynthetic(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, o: Be
             var label_buf: [32]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buf, "ANN ef={d}", .{ef}) catch "ANN";
             try report(out, label, &lat_local, qps_local);
-            if (no_exact) {
+            if (!want_recall) {
                 try out.print("recall@{d} ef={d}: skipped (--no-exact)\n", .{ o.k, ef });
             } else {
                 try out.print("recall@{d} ef={d}: {d:.4}\n", .{ o.k, ef, recall_sum / @as(f64, @floatFromInt(o.q)) });
             }
         } else {
             try report(out, "openpuffer (ANN)", &lat_local, qps_local);
-            if (no_exact) {
+            if (!want_recall) {
                 try out.print("openpuffer recall@{d} vs exact: skipped (--no-exact)\n", .{o.k});
             } else {
                 try out.print("openpuffer recall@{d} vs exact: {d:.4}\n", .{ o.k, recall_sum / @as(f64, @floatFromInt(o.q)) });
