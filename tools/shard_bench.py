@@ -173,7 +173,7 @@ class DirectServe:
         cmd = [self.binary, "serve", "--port", str(self.port), "--ef", str(self.ef)]
         if self.workers is not None:
             cmd.extend(["--workers", str(self.workers)])
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         wait_port(self.port, self.proc)
 
     def stop(self):

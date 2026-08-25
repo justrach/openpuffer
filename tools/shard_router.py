@@ -174,51 +174,36 @@ def _nodelay(sock: socket.socket) -> None:
 
 
 class ShardClient:
-    """Pooled keep-alive connections to child serve processes.
+    """Fresh TCP_NODELAY connection per child request.
 
-    A new ThreadPoolExecutor per fan-out used to spawn throwaway threads,
-    each opening a connection and resetting it on pool shutdown. That
-    produced ConnectionResetError under concurrent queries. Connections
-    now live in a per-shard queue and have TCP_NODELAY set (a 40ms
-    delayed-ACK hop showed up as ~43ms p50 on the first router bench).
+    Keep-alive reuse against ``openpuffer serve`` raced under scatter-gather
+    (broken pipe / accept-thread pin). A new localhost connection is the
+    honest first-experiment hop; pooling is a follow-up.
     """
 
     def __init__(self, ports: list[int], timeout: float = 60.0):
         self.ports = ports
         self.timeout = timeout
-        self._pools = [queue.Queue() for _ in ports]
-
-    def _checkout(self, idx: int) -> HTTPConnection:
-        try:
-            return self._pools[idx].get_nowait()
-        except queue.Empty:
-            conn = HTTPConnection("127.0.0.1", self.ports[idx], timeout=self.timeout)
-            conn.connect()
-            if conn.sock is not None:
-                _nodelay(conn.sock)
-            return conn
-
-    def _checkin(self, idx: int, conn: HTTPConnection) -> None:
-        self._pools[idx].put(conn)
 
     def request(self, idx: int, method: str, path: str, body: bytes | None = None):
-        headers = {"connection": "keep-alive"}
+        headers = {"connection": "close"}
         if body is not None:
             headers["content-type"] = "application/json"
             headers["content-length"] = str(len(body))
         last_err = None
         for _attempt in range(3):
-            conn = self._checkout(idx)
+            conn = HTTPConnection("127.0.0.1", self.ports[idx], timeout=self.timeout)
             try:
+                conn.connect()
                 if conn.sock is not None:
                     _nodelay(conn.sock)
                 conn.request(method, path, body=body, headers=headers)
                 resp = conn.getresponse()
                 data = resp.read()
-                self._checkin(idx, conn)
                 return resp.status, data
             except (HTTPException, OSError, ConnectionError) as e:
                 last_err = e
+            finally:
                 try:
                     conn.close()
                 except Exception:
@@ -258,9 +243,10 @@ class ShardCluster:
             cmd = [self.binary, "serve", "--port", str(port), "--ef", str(self.ef)]
             if self.workers is not None:
                 cmd.extend(["--workers", str(self.workers)])
+            logf = open(os.devnull, "wb")
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdout=logf,
                 stderr=subprocess.STDOUT,
             )
             self.procs.append(proc)
@@ -489,9 +475,14 @@ class make_handler(BaseHTTPRequestHandler):
             body = self._read_body()
             status, out = handle_route(self.state, method, self.path, body)
             self._send(status, out)
+        except BrokenPipeError:
+            return
         except Exception:
             traceback.print_exc()
-            self._send(500, b'{"error":"internal"}')
+            try:
+                self._send(500, b'{"error":"internal"}')
+            except (BrokenPipeError, OSError):
+                return
 
     def do_GET(self):
         self._dispatch("GET")
