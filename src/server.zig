@@ -31,6 +31,11 @@ const Namespace = struct {
     pending_wal: u64 = 0,
     io: std.Io,
     lock: std.Io.RwLock = .init,
+    /// Serializes back-edge splices among writers. Readers never take this.
+    splice_mu: std.Io.Mutex = .init,
+    /// Publishes that have not finished `spliceBackEdges`. Snapshot waits
+    /// for zero so WAL/snapshot never persist a half-spliced node.
+    unspliced: u32 = 0,
     /// external document id -> local hnsw id (upserts)
     id_map: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
@@ -757,9 +762,21 @@ fn recoverOneNsInner(job: *RecoverJob) !void {
     }
 }
 
+fn waitNoUnspliced(ns: *Namespace) void {
+    while (@atomicLoad(u32, &ns.unspliced, .acquire) != 0) {
+        std.Thread.yield() catch {};
+    }
+}
+
 /// Write a full binary snapshot of `ns` (graph + vectors) and reset pending-WAL.
+/// Exclusive + unspliced==0 so the cut is after every publish's back-edges.
 fn snapshotNamespace(store: *persist_mod.Store, ns: *Namespace) !void {
-    ns.lock.lockUncancelable(ns.io);
+    while (true) {
+        waitNoUnspliced(ns);
+        ns.lock.lockUncancelable(ns.io);
+        if (@atomicLoad(u32, &ns.unspliced, .acquire) == 0) break;
+        ns.lock.unlock(ns.io);
+    }
     const body = persist_mod.Store.buildBinarySnapshot(
         store.alloc,
         ns.wal_seq,
@@ -991,22 +1008,48 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
     ns.lock.unlock(ns.io);
 
     ns.lock.lockSharedUncancelable(ns.io);
-    const plan = ns.index.planInsert(vec, level, scratch) catch |e| {
+    var plan = ns.index.planInsert(vec, level, scratch) catch |e| {
         ns.lock.unlockShared(ns.io);
         return e;
     };
     ns.lock.unlockShared(ns.io);
 
     ns.lock.lockUncancelable(ns.io);
-    defer ns.lock.unlock(ns.io);
     if (ns.id_map.get(id)) |local| {
+        ns.lock.unlock(ns.io);
         plan.discard(ns.index.allocator);
+        ns.lock.lockUncancelable(ns.io);
+        defer ns.lock.unlock(ns.io);
         try ns.index.update(local, vec);
         return;
     }
-    const local = try ns.index.commitInsert(plan);
-    try ns.doc_ids.append(persist, id);
-    try ns.id_map.put(persist, id, local);
+    const local = ns.index.publishInsert(&plan) catch |e| {
+        ns.lock.unlock(ns.io);
+        plan.discard(ns.index.allocator);
+        return e;
+    };
+    ns.doc_ids.append(persist, id) catch |e| {
+        ns.lock.unlock(ns.io);
+        plan.discard(ns.index.allocator);
+        return e;
+    };
+    ns.id_map.put(persist, id, local) catch |e| {
+        ns.lock.unlock(ns.io);
+        plan.discard(ns.index.allocator);
+        return e;
+    };
+    _ = @atomicRmw(u32, &ns.unspliced, .Add, 1, .acq_rel);
+    ns.lock.unlock(ns.io);
+
+    // Back-edge splice + prune is the slow exclusive leftover. Hold shared
+    // so lockShared queries keep walking; splice_mu serializes writers so
+    // two pushes cannot overflow the +1 neighbor slack.
+    ns.lock.lockSharedUncancelable(ns.io);
+    defer ns.lock.unlockShared(ns.io);
+    ns.splice_mu.lockUncancelable(ns.io);
+    defer ns.splice_mu.unlock(ns.io);
+    defer _ = @atomicRmw(u32, &ns.unspliced, .Sub, 1, .acq_rel);
+    try ns.index.spliceBackEdges(&plan, local);
 }
 
 fn replayWalBody(ns: *Namespace, persist: std.mem.Allocator, alloc: std.mem.Allocator, body: []const u8) !usize {
@@ -1116,9 +1159,9 @@ fn handleWrite(
         }
     }
 
-    // Updates memcpy in place (brief exclusive). Inserts search neighbors
-    // under a shared lock so ANN queries keep running, then splice under
-    // exclusive only for the pointer publishes / back-edges.
+    // Updates memcpy in place (brief exclusive). Inserts: shared neighbor
+    // search, exclusive publish (append + outgoing + entry), then shared
+    // back-edge splice so lockShared queries do not wait on prune.
     for (batch.items) |iv| {
         try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
     }

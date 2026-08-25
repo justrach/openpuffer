@@ -73,6 +73,12 @@ pub fn Hnsw(comptime D: type) type {
         /// post-mmap append buffer (empty until the first insert after load).
         slab_map: ?SlabMap = null,
 
+        /// Per-node generation for RCU-style neighbor snapshots.
+        /// Even = stable; odd = a writer is replacing that node's adjacency.
+        /// `pushNeighbor` does not bump this (write-then-release-degree is enough).
+        /// Heap-sized to `len()` including mmap-backed ids (zeros on load).
+        nbr_gen: std.ArrayList(u32) = .empty,
+
         entry_point: ?u32 = null,
         max_level: u32 = 0,
 
@@ -117,6 +123,7 @@ pub fn Hnsw(comptime D: type) type {
             self.hi_start.deinit(self.allocator);
             self.hi_deg.deinit(self.allocator);
             self.hi_nbrs.deinit(self.allocator);
+            self.nbr_gen.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -252,24 +259,28 @@ pub fn Hnsw(comptime D: type) type {
             return self.neighborSlotsConst(id, layer)[0..deg];
         }
 
-        fn degree(self: *const Self, id: u32, layer: u32) usize {
+        fn degPtr(self: *const Self, id: u32, layer: u32) *u16 {
             if (layer == 0) {
                 if (self.slab_map) |m| {
-                    if (id < m.n) return m.l0_deg[id];
-                    return self.l0_deg.items[self.heapId(id)];
+                    if (id < m.n) return &m.l0_deg[id];
+                    return @constCast(&self.l0_deg.items[self.heapId(id)]);
                 }
-                return self.l0_deg.items[id];
+                return @constCast(&self.l0_deg.items[id]);
             }
             if (self.slab_map) |m| {
                 if (id < m.n) {
                     const slot = m.hi_start[id] + (layer - 1);
-                    return m.hi_deg[slot];
+                    return &m.hi_deg[slot];
                 }
                 const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
-                return self.hi_deg.items[slot];
+                return @constCast(&self.hi_deg.items[slot]);
             }
             const slot = self.hi_start.items[id] + (layer - 1);
-            return self.hi_deg.items[slot];
+            return @constCast(&self.hi_deg.items[slot]);
+        }
+
+        fn degree(self: *const Self, id: u32, layer: u32) usize {
+            return @atomicLoad(u16, self.degPtr(id, layer), .acquire);
         }
 
         fn neighborSlotsConst(self: *const Self, id: u32, layer: u32) []const u32 {
@@ -333,27 +344,27 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn setDegree(self: *Self, id: u32, layer: u32, deg: u16) void {
-            if (layer == 0) {
-                if (self.slab_map) |m| {
-                    if (id < m.n) {
-                        m.l0_deg[id] = deg;
-                        return;
-                    }
-                    self.l0_deg.items[self.heapId(id)] = deg;
-                    return;
+            @atomicStore(u16, self.degPtr(id, layer), deg, .release);
+        }
+
+        /// Copy a stable neighbor list. Retries if a writer is mid-replace
+        /// (`nbr_gen` odd or changed). `pushNeighbor` is wait-free for readers:
+        /// it writes the slack slot first, then publishes degree.
+        fn snapshotNeighbors(self: *const Self, id: u32, layer: u32, buf: []u32) []const u32 {
+            var spins: u32 = 0;
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.nbr_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    spins +%= 1;
+                    if (spins > 8) std.atomic.spinLoopHint();
+                    continue;
                 }
-                self.l0_deg.items[id] = deg;
-            } else if (self.slab_map) |m| {
-                if (id < m.n) {
-                    const slot = m.hi_start[id] + (layer - 1);
-                    m.hi_deg[slot] = deg;
-                } else {
-                    const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
-                    self.hi_deg.items[slot] = deg;
-                }
-            } else {
-                const slot = self.hi_start.items[id] + (layer - 1);
-                self.hi_deg.items[slot] = deg;
+                const deg = self.degree(id, layer);
+                const slots = self.neighborSlotsConst(id, layer);
+                const n = @min(deg, @min(buf.len, slots.len));
+                if (n > 0) @memcpy(buf[0..n], slots[0..n]);
+                const g2 = @atomicLoad(u32, &self.nbr_gen.items[id], .acquire);
+                if (g1 == g2) return buf[0..n];
             }
         }
 
@@ -364,9 +375,12 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn replaceNeighbors(self: *Self, id: u32, layer: u32, ids: []const u32) void {
+            const g = @atomicLoad(u32, &self.nbr_gen.items[id], .monotonic);
+            @atomicStore(u32, &self.nbr_gen.items[id], g +% 1, .release);
             const slots = self.neighborSlots(id, layer);
             @memcpy(slots[0..ids.len], ids);
             self.setDegree(id, layer, @intCast(ids.len));
+            @atomicStore(u32, &self.nbr_gen.items[id], g +% 2, .release);
         }
 
         fn randomLevel(self: *Self) u32 {
@@ -463,7 +477,8 @@ pub fn Hnsw(comptime D: type) type {
                     std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.layerCount(c.id), layer, self.max_level, self.entry_point, if (self.entry_point) |e| self.layerCount(e) else 0 });
                     @panic("hnsw invariant broken");
                 }
-                const nbrs = self.neighbors(c.id, layer);
+                var nbr_buf: [64]u32 = undefined;
+                const nbrs = self.snapshotNeighbors(c.id, layer, &nbr_buf);
                 for (nbrs, 0..) |nid, ni| {
                     // one-ahead software prefetch: the next neighbor's int8
                     // vector starts its memory fetch while we dot this one.
@@ -572,10 +587,10 @@ pub fn Hnsw(comptime D: type) type {
             scratch: std.mem.Allocator,
 
             pub fn discard(self: InsertPlan, index_alloc: std.mem.Allocator) void {
-                index_alloc.free(self.copy);
-                index_alloc.free(self.q8);
+                if (self.copy.len != 0) index_alloc.free(self.copy);
+                if (self.q8.len != 0) index_alloc.free(self.q8);
                 for (self.layers) |ids| self.scratch.free(ids);
-                self.scratch.free(self.layers);
+                if (self.layers.len != 0) self.scratch.free(self.layers);
             }
         };
 
@@ -611,6 +626,7 @@ pub fn Hnsw(comptime D: type) type {
             const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
             @memset(l0_pad, 0);
             try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
+            try self.nbr_gen.append(alloc, 0);
             if (level > 0) {
                 const slots: usize = level;
                 const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
@@ -670,14 +686,45 @@ pub fn Hnsw(comptime D: type) type {
             return .{ .copy = q.copy, .q8 = q.q8, .scale = q.scale, .level = level, .layers = layers, .scratch = scratch };
         }
 
-        /// Splice a planned node into the graph. Caller must hold exclusive lock.
-        /// Copies `plan.copy` / `plan.q8` into the flat pools and frees them.
-        pub fn commitInsert(self: *Self, plan: InsertPlan) !u32 {
+        /// Publish a planned node: append the payload row, write outgoing
+        /// edges, and (if needed) swing `entry_point`. Does not splice
+        /// back-edges. Caller must hold exclusive lock so ArrayList growth
+        /// cannot race readers. Frees `plan.copy` / `plan.q8`; leaves
+        /// `plan.layers` for `spliceBackEdges`.
+        pub fn publishInsert(self: *Self, plan: *InsertPlan) !u32 {
             const alloc = self.allocator;
             const id = try self.appendRecord(plan.copy, plan.q8, plan.scale, plan.level);
             alloc.free(plan.copy);
             alloc.free(plan.q8);
+            plan.copy = &.{};
+            plan.q8 = &.{};
 
+            const connect_n = @min(plan.layers.len, self.layerCount(id));
+            var layer: u32 = 0;
+            while (layer < connect_n) : (layer += 1) {
+                for (plan.layers[layer]) |nid| {
+                    if (nid >= self.len() or layer >= self.layerCount(nid)) continue;
+                    self.pushNeighbor(id, layer, nid);
+                }
+            }
+            if (self.entry_point == null or plan.level > self.max_level) {
+                self.max_level = plan.level;
+                self.entry_point = id;
+            }
+            return id;
+        }
+
+        /// Splice back-edges + prune. Safe under a shared lock: adjacency
+        /// writes are generation-published so `snapshotNeighbors` retries
+        /// instead of walking a torn list. Does not grow the packed arrays.
+        /// Always frees `plan.layers`.
+        pub fn spliceBackEdges(self: *Self, plan: *InsertPlan, id: u32) !void {
+            defer {
+                for (plan.layers) |ids| plan.scratch.free(ids);
+                if (plan.layers.len != 0) plan.scratch.free(plan.layers);
+                plan.layers = &.{};
+            }
+            const alloc = self.allocator;
             const max_m0: u32 = @intCast(self.m0());
             const connect_n = @min(plan.layers.len, self.layerCount(id));
             var layer: u32 = 0;
@@ -685,12 +732,12 @@ pub fn Hnsw(comptime D: type) type {
                 const max_m: u32 = if (layer == 0) max_m0 else self.opts.m;
                 for (plan.layers[layer]) |nid| {
                     if (nid >= self.len() or layer >= self.layerCount(nid)) continue;
-                    self.pushNeighbor(id, layer, nid);
                     self.pushNeighbor(nid, layer, id);
                     if (self.degree(nid, layer) > max_m) {
                         var cands: std.ArrayList(Candidate) = .empty;
                         defer cands.deinit(alloc);
-                        const back = self.neighbors(nid, layer);
+                        var back_buf: [64]u32 = undefined;
+                        const back = self.snapshotNeighbors(nid, layer, &back_buf);
                         try cands.ensureTotalCapacity(alloc, back.len);
                         for (back) |n| {
                             cands.appendAssumeCapacity(.{ .id = n, .d = self.distPair(nid, n) });
@@ -710,13 +757,14 @@ pub fn Hnsw(comptime D: type) type {
                     }
                 }
             }
-            for (plan.layers) |ids| plan.scratch.free(ids);
-            plan.scratch.free(plan.layers);
+        }
 
-            if (self.entry_point == null or plan.level > self.max_level) {
-                self.max_level = plan.level;
-                self.entry_point = id;
-            }
+        /// Splice a planned node into the graph (publish + back-edges).
+        /// Single-threaded / exclusive-lock callers (tests, `insert`).
+        pub fn commitInsert(self: *Self, plan: InsertPlan) !u32 {
+            var p = plan;
+            const id = try self.publishInsert(&p);
+            try self.spliceBackEdges(&p, id);
             return id;
         }
 
@@ -981,6 +1029,7 @@ pub fn Hnsw(comptime D: type) type {
             try self.l0_deg.ensureTotalCapacity(alloc, n);
             try self.l0_nbrs.ensureTotalCapacity(alloc, n * self.l0Stride());
             try self.hi_start.ensureTotalCapacity(alloc, n);
+            try self.nbr_gen.ensureTotalCapacity(alloc, n);
 
             for (0..n) |_| self.levels.appendAssumeCapacity(try rd.u32le(bytes, &i));
             for (0..n) |_| {
@@ -1007,6 +1056,7 @@ pub fn Hnsw(comptime D: type) type {
                 if (id >= self.levels.items.len) return error.Truncated;
                 self.levels.items[id] = level;
                 self.l0_deg.appendAssumeCapacity(0);
+                self.nbr_gen.appendAssumeCapacity(0);
                 const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
                 @memset(l0_pad, 0);
                 try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
@@ -1424,6 +1474,10 @@ pub fn Hnsw(comptime D: type) type {
             errdefer posix.munmap(mapped);
             const off = try hmlsOffsetIn(mapped);
             try self.attachMapped(mapped, off);
+            const n = self.mappedCount();
+            try self.nbr_gen.ensureTotalCapacity(self.allocator, n);
+            var gi: usize = 0;
+            while (gi < n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
         }
 
         fn copySlabInto(comptime T: type, list: *std.ArrayList(T), alloc: std.mem.Allocator, src: []const T) !void {
@@ -1469,6 +1523,9 @@ pub fn Hnsw(comptime D: type) type {
             try copySlabInto(u32, &self.hi_start, alloc, try take.sl(u32, base, L.hi_start_off, L.n));
             try copySlabInto(u16, &self.hi_deg, alloc, try take.sl(u16, base, L.hi_deg_off, L.hi_slots));
             try copySlabInto(u32, &self.hi_nbrs, alloc, try take.sl(u32, base, L.hi_nbrs_off, L.hi_slots * hi_stride));
+            try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            var gi: usize = 0;
+            while (gi < L.n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
         }
 
         /// Read an HMLS (or persist v2) file into heap ArrayLists. No mmap.
@@ -1511,6 +1568,9 @@ pub fn Hnsw(comptime D: type) type {
             try readInto.go(u32, &self.hi_start, alloc, fd, off + L.hi_start_off, L.n);
             try readInto.go(u16, &self.hi_deg, alloc, fd, off + L.hi_deg_off, L.hi_slots);
             try readInto.go(u32, &self.hi_nbrs, alloc, fd, off + L.hi_nbrs_off, L.hi_slots * hi_stride);
+            try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            var gi: usize = 0;
+            while (gi < L.n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
         }
     };
 }
@@ -1880,5 +1940,51 @@ test "slab mmap vs alloc RSS (blank slabs)" {
             try std.testing.expect(mmap_delta * 4 < alloc_delta);
             try std.testing.expect(alloc_delta + 1024 >= (c.n * c.dim * 5) / 1024 / 2);
         }
+    }
+}
+
+test "publishInsert then spliceBackEdges matches commitInsert" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const dim = 8;
+    var rng = std.Random.DefaultPrng.init(3);
+
+    var via_commit = Hnsw(void).init(alloc, dim, .{ .seed = 99 });
+    defer via_commit.deinit();
+    var via_split = Hnsw(void).init(alloc, dim, .{ .seed = 99 });
+    defer via_split.deinit();
+
+    var v: [dim]f32 = undefined;
+    for (0..40) |_| {
+        for (&v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try via_commit.insert(&v);
+        _ = try via_split.insert(&v);
+    }
+    for (&v) |*x| x.* = rng.random().floatNorm(f32);
+    const level = via_split.nextLevel();
+    _ = via_commit.nextLevel();
+    var plan_split = try via_split.planInsert(&v, level, alloc);
+    const plan_commit = try via_commit.planInsert(&v, level, alloc);
+    const id = try via_split.publishInsert(&plan_split);
+    try via_split.spliceBackEdges(&plan_split, id);
+    _ = try via_commit.commitInsert(plan_commit);
+
+    try std.testing.expectEqual(via_commit.len(), via_split.len());
+    try std.testing.expectEqual(via_commit.entry_point, via_split.entry_point);
+    var nid: u32 = 0;
+    while (nid < via_commit.len()) : (nid += 1) {
+        var layer: u32 = 0;
+        while (layer < via_commit.layerCount(nid)) : (layer += 1) {
+            try std.testing.expectEqualSlices(u32, via_commit.neighbors(nid, layer), via_split.neighbors(nid, layer));
+        }
+    }
+    const q = via_split.vectorConst(id);
+    const a = try via_commit.search(q, 5, 32, alloc);
+    const b = try via_split.search(q, 5, 32, alloc);
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try std.testing.expectEqual(x.id, y.id);
+        try std.testing.expectApproxEqAbs(x.distance, y.distance, 1e-6);
     }
 }

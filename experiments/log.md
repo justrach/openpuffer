@@ -316,3 +316,18 @@ free latency win on one 4-core box at modest n.
 Verdict: the path works. Use it when one process cannot hold the
 vectors (2M, or 1M + room for other things). Do not turn it on at 8k
 expecting a p50 win.
+
+## Mixed live (serve track) — 2026-08-25
+
+Not an E-row p50. Do not copy these HTTP numbers into the ledger table
+or `results.svg` engine cells.
+
+PR #3 (lock-split still exclusive for the whole splice), n=8000 dim=1536
+ef=128, batch=1, 4-core Xeon:
+
+| phase | query p50 | query p95 | QPS | write p50 | errors |
+|---|---|---|---|---|---|
+| query-only | 2.31 ms | 5.65 ms | 1238 | — | 0 |
+| mixed | 5.17 ms (2.24×) | 11.65 ms | 635 | 5.56 ms | 0 |
+
+E027 (this branch) — `python3 tools/mixed_bench.py --n 8000 --dim 1536 --seconds 8` — pending.
