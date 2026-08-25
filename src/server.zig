@@ -306,6 +306,17 @@ const FdQueue = struct {
         self.mu.unlock(self.io);
     }
 
+    fn tryPush(self: *FdQueue, fd: std.posix.fd_t) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.count == self.slots.len) return false;
+        self.slots[self.tail] = fd;
+        self.tail = (self.tail + 1) % self.slots.len;
+        self.count += 1;
+        self.cv.signal(self.io);
+        return true;
+    }
+
     fn pop(self: *FdQueue) std.posix.fd_t {
         self.mu.lockUncancelable(self.io);
         while (self.count == 0) {
@@ -352,13 +363,14 @@ const PoolCtx = struct {
     registry: *Registry,
     o: Options,
     queue: *FdQueue,
+    listen_fd: std.posix.fd_t,
 };
 
-fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options) !*FdQueue {
+fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options, listen_fd: std.posix.fd_t) !*FdQueue {
     const queue = try alloc.create(FdQueue);
     queue.* = .{ .io = io };
     const ctx = try alloc.create(PoolCtx);
-    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue };
+    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue, .listen_fd = listen_fd };
     const n = workerCount(ctx.o);
     for (0..n) |_| {
         const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
@@ -376,8 +388,8 @@ fn poolWorker(ctx: *PoolCtx) void {
     var xfer = ConnXfer{};
     while (true) {
         const fd = ctx.queue.pop();
-        handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state) catch {};
-        _ = std.os.linux.close(fd);
+        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.queue, ctx.listen_fd) catch .close;
+        if (end == .close) _ = std.os.linux.close(fd);
     }
 }
 
@@ -415,17 +427,11 @@ fn serveIoUring(
     out: *std.Io.Writer,
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
-    const queue = try startWorkerPool(alloc, io, registry, o);
-    try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
+    const queue = try startWorkerPool(alloc, io, registry, o, listen_fd);
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers (fair rotate), ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
-    var store: std.ArrayList(u8) = .empty;
-    defer store.deinit(alloc);
-    try store.resize(alloc, 1 << 16);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var xfer = ConnXfer{};
     while (true) {
         const fd = ring.accept(listen_fd) catch |e| {
             try out.print("io_uring accept error: {any}\n", .{e});
@@ -433,16 +439,11 @@ fn serveIoUring(
             continue;
         };
         iouring.enableTcpNoDelay(fd);
-        // If more clients are already in the listen backlog, hand everyone
-        // (including this fd) to the pool so ANN work runs on all cores.
-        // A lone connection is handled inline to avoid a futex wake (~0.3ms).
+        // Never handle on the accept thread: a keep-alive query would pin
+        // accept and leave upserts sitting in the listen backlog until they
+        // time out (~3s). Always queue; workers rotate after each request.
         drainListenBacklog(listen_fd, queue);
-        if (queue.isEmpty()) {
-            handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state) catch {};
-            _ = std.os.linux.close(fd);
-        } else {
-            queue.push(fd);
-        }
+        queue.push(fd);
     }
 }
 
@@ -460,6 +461,8 @@ const ConnXfer = struct {
     }
 };
 
+const ConnEnd = enum { close, requeued };
+
 fn handleIoUringConn(
     xfer: *ConnXfer,
     fd: std.posix.fd_t,
@@ -469,7 +472,9 @@ fn handleIoUringConn(
     o: Options,
     store: *std.ArrayList(u8),
     arena_state: *std.heap.ArenaAllocator,
-) !void {
+    queue: ?*FdQueue,
+    listen_fd: ?std.posix.fd_t,
+) !ConnEnd {
     var n: usize = 0;
     while (true) {
         while (iouring.completeHttpRequest(store.items[0..n]) == 0) {
@@ -479,7 +484,7 @@ fn handleIoUringConn(
                 try store.resize(alloc, cap * 2);
             }
             const got = try xfer.recv(fd, store.items[n..]);
-            if (got == 0) return;
+            if (got == 0) return .close;
             n += got;
         }
         const used = iouring.completeHttpRequest(store.items[0..n]);
@@ -498,14 +503,20 @@ fn handleIoUringConn(
         const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
         try xfer.sendAll(fd, wire);
 
-        if (!keepalive) return;
+        if (!keepalive) return .close;
+        // One request per pop. Requeue the keep-alive fd so a waiting
+        // insert/update is not stuck behind this client's next recv.
+        if (queue) |q| {
+            if (listen_fd) |lfd| drainListenBacklog(lfd, q);
+            if (q.tryPush(fd)) return .requeued;
+        }
         if (used < n) {
             const rest = n - used;
             std.mem.copyForwards(u8, store.items[0..rest], store.items[used..n]);
             n = rest;
-        } else {
-            n = 0;
+            continue;
         }
+        n = 0;
     }
 }
 
@@ -964,6 +975,40 @@ fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f
     try ns.id_map.put(persist, id, local);
 }
 
+fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32) !void {
+    ns.lock.lockUncancelable(ns.io);
+    if (ns.id_map.get(id)) |local| {
+        defer ns.lock.unlock(ns.io);
+        try ns.index.update(local, vec);
+        return;
+    }
+    if (ns.index.entry_point == null) {
+        defer ns.lock.unlock(ns.io);
+        try upsertDoc(ns, persist, id, vec);
+        return;
+    }
+    const level = ns.index.nextLevel();
+    ns.lock.unlock(ns.io);
+
+    ns.lock.lockSharedUncancelable(ns.io);
+    const plan = ns.index.planInsert(vec, level, scratch) catch |e| {
+        ns.lock.unlockShared(ns.io);
+        return e;
+    };
+    ns.lock.unlockShared(ns.io);
+
+    ns.lock.lockUncancelable(ns.io);
+    defer ns.lock.unlock(ns.io);
+    if (ns.id_map.get(id)) |local| {
+        plan.discard(ns.index.allocator);
+        try ns.index.update(local, vec);
+        return;
+    }
+    const local = try ns.index.commitInsert(plan);
+    try ns.doc_ids.append(persist, id);
+    try ns.id_map.put(persist, id, local);
+}
+
 fn replayWalBody(ns: *Namespace, persist: std.mem.Allocator, alloc: std.mem.Allocator, body: []const u8) !usize {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -1068,8 +1113,14 @@ fn handleWrite(
         }
         for (batch.items) |iv| {
             if (iv.vec.len != ns.dim) return respondJson(res, .bad_request, "{\"error\":\"dimension mismatch\"}");
-            try upsertDoc(ns, persist, iv.id, iv.vec);
         }
+    }
+
+    // Updates memcpy in place (brief exclusive). Inserts search neighbors
+    // under a shared lock so ANN queries keep running, then splice under
+    // exclusive only for the pointer publishes / back-edges.
+    for (batch.items) |iv| {
+        try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
     }
 
     // durable WAL: group-commit via persist worker when configured
