@@ -224,6 +224,8 @@ const Registry = struct {
 pub const Options = struct {
     port: u16 = 8080,
     ef: u32 = 256,
+    /// null = ncpu. Override with --workers / OPENPUFFER_WORKERS.
+    workers: ?usize = null,
     s3_cfg: ?s3_mod.Config = null,
 };
 
@@ -258,7 +260,7 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", o.port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    try out.print("openpuffer serving turbopuffer-compatible API on http://127.0.0.1:{d}\n", .{o.port});
+    try out.print("openpuffer serving turbopuffer-compatible API on http://127.0.0.1:{d} (ef={d})\n", .{ o.port, o.ef });
     if (registry.store != null) try out.print("persistence: s3 bucket '{s}' (group-commit WAL)\n", .{o.s3_cfg.?.bucket});
     try out.flush();
 
@@ -273,9 +275,10 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
     }
 }
 
-fn workerCount() usize {
+fn workerCount(o: Options) usize {
     // One worker per core: extra threads oversubscribe a memory-bound ANN
     // walk and raise concurrent p50 without adding QPS.
+    if (o.workers) |n| return @min(64, @max(1, n));
     const n = std.Thread.getCpuCount() catch 4;
     return @min(16, @max(1, n));
 }
@@ -354,7 +357,7 @@ fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o:
     queue.* = .{ .io = io };
     const ctx = try alloc.create(PoolCtx);
     ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue };
-    const n = workerCount();
+    const n = workerCount(ctx.o);
     for (0..n) |_| {
         const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
         t.detach();
@@ -411,7 +414,7 @@ fn serveIoUring(
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
     const queue = try startWorkerPool(alloc, io, registry, o);
-    try out.print("linux serve: io_uring accept + {d} keep-alive workers, TCP_NODELAY\n", .{workerCount()});
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers, ef={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef });
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
@@ -787,7 +790,19 @@ fn respondJson(res: *Responder, status: std.http.Status, body: []const u8) !void
 
 /// Tight scanner for `{"rank_by":["vector","ANN",[f,f,...]],"top_k":N}`.
 /// Avoids building a 1536-node JSON AST on the query hot path.
-fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f32, top_k: usize } {
+fn parseU32Field(body: []const u8, key: []const u8) ?u32 {
+    const p = std.mem.indexOf(u8, body, key) orelse return null;
+    var j = p + key.len;
+    while (j < body.len and body[j] != ':') : (j += 1) {}
+    if (j < body.len) j += 1;
+    while (j < body.len and (body[j] == ' ' or body[j] == '\t')) : (j += 1) {}
+    const ns = j;
+    while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {}
+    if (j == ns) return null;
+    return std.fmt.parseInt(u32, body[ns..j], 10) catch null;
+}
+
+fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f32, top_k: usize, ef: ?u32 } {
     const ann = std.mem.indexOf(u8, body, "\"ANN\"") orelse return error.BadQuery;
     var i: usize = ann + 5;
     while (i < body.len and body[i] != '[') : (i += 1) {}
@@ -816,17 +831,11 @@ fn parseAnnQuery(body: []const u8, alloc: std.mem.Allocator) !struct { vec: []f3
         try vec.append(alloc, try std.fmt.parseFloat(f32, body[start..i]));
     }
     var top_k: usize = 10;
-    const key = std.mem.indexOf(u8, body, "\"top_k\"") orelse std.mem.indexOf(u8, body, "\"limit\"");
-    if (key) |p| {
-        var j = p;
-        while (j < body.len and body[j] != ':') : (j += 1) {}
-        if (j < body.len) j += 1;
-        while (j < body.len and (body[j] == ' ' or body[j] == '\t')) : (j += 1) {}
-        const ns = j;
-        while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {}
-        if (j > ns) top_k = @max(1, std.fmt.parseInt(usize, body[ns..j], 10) catch 10);
+    if (parseU32Field(body, "\"top_k\"") orelse parseU32Field(body, "\"limit\"")) |n| {
+        top_k = @max(1, n);
     }
-    return .{ .vec = try vec.toOwnedSlice(alloc), .top_k = top_k };
+    const ef = parseU32Field(body, "\"ef_search\"") orelse parseU32Field(body, "\"ef\"");
+    return .{ .vec = try vec.toOwnedSlice(alloc), .top_k = top_k, .ef = ef };
 }
 
 fn handleRequest(
@@ -1111,7 +1120,8 @@ fn handleQuery(
         return respondJson(res, .bad_request, dmsg);
     }
 
-    const results = try ns.index.search(query_vec, top_k, o.ef, alloc);
+    const ef = spec.ef orelse o.ef;
+    const results = try ns.index.search(query_vec, top_k, ef, alloc);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     const w = &out.writer;
@@ -1134,4 +1144,13 @@ test "parseAnnQuery reads vector and top_k" {
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), spec.vec[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), spec.vec[2], 1e-6);
     try std.testing.expectEqual(@as(usize, 7), spec.top_k);
+    try std.testing.expectEqual(@as(?u32, null), spec.ef);
+}
+
+test "parseAnnQuery reads optional ef" {
+    const body = "{\"rank_by\":[\"vector\",\"ANN\",[1]],\"top_k\":3,\"ef\":64}";
+    const spec = try parseAnnQuery(body, std.testing.allocator);
+    defer std.testing.allocator.free(spec.vec);
+    try std.testing.expectEqual(@as(usize, 3), spec.top_k);
+    try std.testing.expectEqual(@as(?u32, 64), spec.ef);
 }

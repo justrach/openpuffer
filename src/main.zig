@@ -83,10 +83,17 @@ pub fn main(init: std.process.Init) !void {
         }));
     } else if (std.mem.eql(u8, cmd, "serve")) {
         var port: u16 = 8080;
+        var ef: u32 = 256;
+        var workers: ?usize = null;
         var s3_cfg: ?s3_mod.Config = null;
         {
             const a = args.items[1..];
             if (optOf(a, "--port")) |v| port = std.fmt.parseInt(u16, v, 10) catch 8080;
+            if (optOf(a, "--ef")) |v| ef = std.fmt.parseInt(u32, v, 10) catch 256;
+            if (optOf(a, "--workers")) |v| workers = std.fmt.parseInt(usize, v, 10) catch null;
+            if (init.environ_map.get("OPENPUFFER_WORKERS")) |s| {
+                workers = std.fmt.parseInt(usize, s, 10) catch workers;
+            }
             if (optOf(a, "--s3-bucket")) |bucket| {
                 const creds = s3_mod.resolveCredentials(gpa, io, init.environ_map) catch {
                     try w.interface.print("no AWS/R2 credentials found (env AWS_ACCESS_KEY_ID/SECRET or ~/.aws/credentials)\n", .{});
@@ -101,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
                 };
             }
         }
-        try server_mod.serve(gpa, io, .{ .port = port, .s3_cfg = s3_cfg }, &w.interface);
+        try server_mod.serve(gpa, io, .{ .port = port, .ef = ef, .workers = workers, .s3_cfg = s3_cfg }, &w.interface);
     } else {
         try w.interface.writeAll(
             \\openpuffer — fast vector search engine + turbopuffer benchmark
@@ -109,6 +116,9 @@ pub fn main(init: std.process.Init) !void {
             \\usage:
             \\  openpuffer selftest
             \\  openpuffer bench-synthetic [--n 20000] [--queries 100] [--dim 1536] [--k 10] [--ef 200]
+            \\  openpuffer serve [--port 8080] [--ef 256] [--workers N]
+            \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
+            \\                  (OPENPUFFER_WORKERS is an alias for --workers)
             \\  openpuffer bench-live [--namespace openpuffer-bench-1] [--n 512] [--queries 30] [--dim 768]
             \\                  [--model gemini-embedding-2] [--k 10] [--ef 200]
             \\                  (env: TURBOPUFFER_API_KEY, GEMINI_API_KEY)
