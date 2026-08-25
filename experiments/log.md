@@ -89,5 +89,59 @@ What is left at 1–2M:
 - **Memory layout**: E025 flatten is in this tree. Old 1M RSS was 11.2 GiB vs ~7.6 GiB payload; flatten estimates ~7.5 GiB at 1M.
 - **Drop the f32 copy** (int8-only / optional rerank): saves 5.7 GiB; that plus flatten is how 2M could fit on 16 GiB.
 - **mmap** the flat pools so RSS is demand-paged.
-- `rerank_mult` is still hardcoded 4.
+- `rerank_mult` is now `--rerank-mult` (default still 4). At 20k/ef=128, mult=1 and mult=8 both recall **0.3280** — rerank cannot recover neighbors that ef never found.
 - Do not HTTP-upsert 1–2M; in-process insert is the only sane load path.
+
+## Pareto (n × ef, dim=1536) — 2026-08-25, flatten tree, 50 queries
+
+Not an E-row. Do not copy these p50s into the ledger table or `results.svg`.
+
+Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, recall@10 **0.3130**, RSS 297 / 335 MiB. Neutral vs E025 (0.744 / 0.581); harness-only.
+
+`--clustered` is a mixture of `max(32, n/256)` unit centers + noise 0.35 (cosine to center ≈ 0.94). Live `qa_bench.py` was **not** run (no GEMINI/TPUF keys). Clustered is the product-relevant quality axis; uniform random 1536-d is the known cliff.
+
+### Random (uniform Gaussian) — recall cliff
+
+| n | ef | p50 (ms) | p95 (ms) | recall@10 | RSS post-build / post-query | holds ≥0.30? |
+|---|-----|----------|----------|-----------|-----------------------------|--------------|
+| 20k | 64 | 0.442 | 0.621 | 0.1900 | 297 / 306 MiB | no |
+| 20k | 128 | 0.618 | 0.703 | **0.3280** | 297 / 315 MiB | **yes** (smallest measured) |
+| 20k | 256 | 0.930 | 0.978 | 0.4960 | 297 / 325 MiB | yes |
+| 20k | 512 | 1.473 | 1.514 | 0.7160 | 297 / 335 MiB | yes |
+| 20k | 1024 | 2.244 | 2.289 | 0.9140 | 297 / 346 MiB | yes |
+| 50k | 64 | 0.758 | 0.883 | 0.1220 | 731 / 752 MiB | no |
+| 50k | 128 | 1.273 | 1.454 | 0.1860 | 731 / 773 MiB | no |
+| 50k | 256 | 2.171 | 2.392 | 0.2940 | 731 / 794 MiB | no (just under) |
+| 50k | 512 | 3.446 | 3.923 | **0.4500** | 731 / 816 MiB | **yes** (smallest measured) |
+| 50k | 1024 | 4.814 | 5.210 | 0.6580 | 731 / 839 MiB | yes |
+| 200k | — | — | — | — | — | running |
+| 1M | — | — | — | — | — | one `--no-exact` run pending if RSS fits |
+
+20k rerank_mult at ef=128 (random, 50q): mult=1 p50 0.551 ms recall 0.3280; default 4 p50 0.618 ms recall 0.3280; mult=8 p50 0.591 ms recall 0.3280. Same recall — not a quality knob on this cliff.
+
+### Clustered (SQuAD-style mixture)
+
+| n | ef | p50 (ms) | p95 (ms) | recall@10 | RSS post-build / post-query | holds ≥0.30? |
+|---|-----|----------|----------|-----------|-----------------------------|--------------|
+| 20k | 64 | 0.160 | 0.174 | **1.0000** | 268 / 278 MiB | **yes** (smallest measured; 78 centers) |
+| 20k | 128 | 0.189 | 0.201 | 1.0000 | 268 / 287 MiB | yes |
+| 20k | 256 | 0.240 | 0.341 | 1.0000 | 268 / 296 MiB | yes |
+| 20k | 512 | 0.524 | 0.677 | 1.0000 | 268 / 305 MiB | yes |
+| 20k | 1024 | 0.804 | 0.983 | 1.0000 | 268 / 316 MiB | yes |
+| 50k | 64 | 0.204 | 0.218 | **1.0000** | 670 / 691 MiB | **yes** (195 centers) |
+| 50k | 128 | 0.249 | 0.262 | 1.0000 | 670 / 711 MiB | yes |
+| 50k | 256 | 0.327 | 0.398 | 1.0000 | 670 / 732 MiB | yes |
+| 50k | 512 | 0.782 | 1.086 | 1.0000 | 670 / 753 MiB | yes |
+| 50k | 1024 | 1.480 | 1.844 | 1.0000 | 670 / 775 MiB | yes |
+| 200k | — | — | — | — | — | running |
+
+### Recommended operating points (so far)
+
+| n | random (quality floor 0.30) | clustered (product) | notes |
+|---|----------------------------|---------------------|-------|
+| 20k | **ef=128** (0.33 @ 0.62 ms) | **ef=64** (1.00 @ 0.16 ms) | scored default is already the random floor |
+| 50k | **ef=512** (0.45 @ 3.45 ms); ef=256 is 0.294 | **ef=64** (1.00 @ 0.20 ms) | random cannot hold 0.30 at serve default 128 |
+| 200k | TBD | TBD | |
+| 1M | latency/RSS only (`--no-exact`) | — | |
+
+Serve default ef=128 is correct for 20k random and for clustered at all measured n. Raise `--ef` only when the workload is closer to uniform-random and n ≥ 50k.
