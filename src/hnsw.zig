@@ -367,10 +367,6 @@ pub fn Hnsw(comptime D: type) type {
             }
         };
 
-        pub fn nextLevel(self: *Self) u32 {
-            return self.randomLevel();
-        }
-
         fn quantizeOwned(self: *const Self, vector_in: []const f32) !struct { copy: []f32, q8: []i8, scale: f32 } {
             const alloc = self.allocator;
             const copy = try alloc.alloc(f32, self.dim);
@@ -431,11 +427,11 @@ pub fn Hnsw(comptime D: type) type {
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len());
             defer visited.deinit(scratch);
-            const fctx = F32Dist{ .s = self, .q = q.copy };
-            var ep: [1]Candidate = .{.{ .id = self.entry_point.?, .d = fctx.dist(self.entry_point.?) }};
+            const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale };
+            var ep: [1]Candidate = .{.{ .id = self.entry_point.?, .d = qctx.dist(self.entry_point.?) }};
             var cur = self.max_level;
             while (cur > level) : (cur -= 1) {
-                var res = try self.searchLayer(fctx, &ep, 1, cur, &visited, scratch);
+                var res = try self.searchLayer(qctx, &ep, 1, cur, &visited, scratch);
                 defer res.deinit(scratch);
                 ep[0] = res.items[0];
             }
@@ -447,7 +443,7 @@ pub fn Hnsw(comptime D: type) type {
             while (li >= 0) : (li -= 1) {
                 const layer: u32 = @intCast(li);
                 const max_m: u32 = if (layer == 0) max_m0 else self.opts.m;
-                var found = try self.searchLayer(fctx, eps.items, self.opts.ef_construction, layer, &visited, scratch);
+                var found = try self.searchLayer(qctx, eps.items, self.opts.ef_construction, layer, &visited, scratch);
                 defer found.deinit(scratch);
                 const selected = try self.selectNeighborsHeuristic(found.items, max_m, scratch);
                 defer scratch.free(selected);
