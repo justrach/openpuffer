@@ -78,6 +78,9 @@ pub fn Hnsw(comptime D: type) type {
         /// `pushNeighbor` does not bump this (write-then-release-degree is enough).
         /// Heap-sized to `len()` including mmap-backed ids (zeros on load).
         nbr_gen: std.ArrayList(u32) = .empty,
+        /// Per-node seqlock for in-place vector updates. Distances retry
+        /// when the generation is odd or changes mid-dot.
+        vec_gen: std.ArrayList(u32) = .empty,
 
         entry_point: ?u32 = null,
         max_level: u32 = 0,
@@ -124,6 +127,7 @@ pub fn Hnsw(comptime D: type) type {
             self.hi_deg.deinit(self.allocator);
             self.hi_nbrs.deinit(self.allocator);
             self.nbr_gen.deinit(self.allocator);
+            self.vec_gen.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -395,7 +399,16 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         inline fn distTo(self: *const Self, q: []const f32, id: u32) f32 {
-            return vecmath.cosineDistance(q, self.vectorConst(id));
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const d = vecmath.cosineDistance(q, self.vectorConst(id));
+                const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if (g1 == g2) return d;
+            }
         }
 
         /// Pairwise distance used while splicing the graph. Exact when f32
@@ -408,9 +421,17 @@ pub fn Hnsw(comptime D: type) type {
         inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
             // stored vectors are unit-norm; a ~= aq * scale, so
             // cos(a,b) ~= dot(aq,bq) * qs * scale_b
-            const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
-                qs * self.qscaleOf(id);
-            return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
+                    qs * self.qscaleOf(id);
+                const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if (g1 == g2) return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+            }
         }
 
         /// Distance contexts let searchLayer run on either exact or quantized math.
@@ -549,6 +570,7 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         /// Replace the vector at `id` in place (requantize; graph links stay).
+        /// Safe under a shared lock: seqlock so in-flight dots retry.
         pub fn update(self: *Self, id: u32, vector_in: []const f32) !void {
             if (id >= self.len()) return error.NotFound;
             if (vector_in.len != self.dim) return error.DimensionMismatch;
@@ -561,6 +583,8 @@ pub fn Hnsw(comptime D: type) type {
                 heap_tmp = try self.allocator.alloc(f32, self.dim);
                 break :blk heap_tmp.?;
             };
+            const g = @atomicLoad(u32, &self.vec_gen.items[id], .monotonic);
+            @atomicStore(u32, &self.vec_gen.items[id], g +% 1, .release);
             @memcpy(copy, vector_in);
             vecmath.normalize(copy);
             var amax: f32 = 0;
@@ -573,6 +597,7 @@ pub fn Hnsw(comptime D: type) type {
                 for (copy, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
             }
             self.setQscaleOf(id, scale);
+            @atomicStore(u32, &self.vec_gen.items[id], g +% 2, .release);
         }
 
         /// Neighbor picks for one insert. `copy`/`q8` are owned by the index
@@ -627,6 +652,7 @@ pub fn Hnsw(comptime D: type) type {
             @memset(l0_pad, 0);
             try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
             try self.nbr_gen.append(alloc, 0);
+            try self.vec_gen.append(alloc, 0);
             if (level > 0) {
                 const slots: usize = level;
                 const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
@@ -1030,6 +1056,7 @@ pub fn Hnsw(comptime D: type) type {
             try self.l0_nbrs.ensureTotalCapacity(alloc, n * self.l0Stride());
             try self.hi_start.ensureTotalCapacity(alloc, n);
             try self.nbr_gen.ensureTotalCapacity(alloc, n);
+            try self.vec_gen.ensureTotalCapacity(alloc, n);
 
             for (0..n) |_| self.levels.appendAssumeCapacity(try rd.u32le(bytes, &i));
             for (0..n) |_| {
@@ -1057,6 +1084,7 @@ pub fn Hnsw(comptime D: type) type {
                 self.levels.items[id] = level;
                 self.l0_deg.appendAssumeCapacity(0);
                 self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
                 const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
                 @memset(l0_pad, 0);
                 try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
@@ -1476,8 +1504,12 @@ pub fn Hnsw(comptime D: type) type {
             try self.attachMapped(mapped, off);
             const n = self.mappedCount();
             try self.nbr_gen.ensureTotalCapacity(self.allocator, n);
+            try self.vec_gen.ensureTotalCapacity(self.allocator, n);
             var gi: usize = 0;
-            while (gi < n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
+            while (gi < n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
 
         fn copySlabInto(comptime T: type, list: *std.ArrayList(T), alloc: std.mem.Allocator, src: []const T) !void {
@@ -1524,8 +1556,12 @@ pub fn Hnsw(comptime D: type) type {
             try copySlabInto(u16, &self.hi_deg, alloc, try take.sl(u16, base, L.hi_deg_off, L.hi_slots));
             try copySlabInto(u32, &self.hi_nbrs, alloc, try take.sl(u32, base, L.hi_nbrs_off, L.hi_slots * hi_stride));
             try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            try self.vec_gen.ensureTotalCapacity(alloc, L.n);
             var gi: usize = 0;
-            while (gi < L.n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
+            while (gi < L.n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
 
         /// Read an HMLS (or persist v2) file into heap ArrayLists. No mmap.
@@ -1569,8 +1605,12 @@ pub fn Hnsw(comptime D: type) type {
             try readInto.go(u16, &self.hi_deg, alloc, fd, off + L.hi_deg_off, L.hi_slots);
             try readInto.go(u32, &self.hi_nbrs, alloc, fd, off + L.hi_nbrs_off, L.hi_slots * hi_stride);
             try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            try self.vec_gen.ensureTotalCapacity(alloc, L.n);
             var gi: usize = 0;
-            while (gi < L.n) : (gi += 1) self.nbr_gen.appendAssumeCapacity(0);
+            while (gi < L.n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
     };
 }

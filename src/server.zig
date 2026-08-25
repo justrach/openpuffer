@@ -993,19 +993,24 @@ fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f
 }
 
 fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32) !void {
-    ns.lock.lockUncancelable(ns.io);
+    ns.lock.lockSharedUncancelable(ns.io);
     if (ns.id_map.get(id)) |local| {
-        defer ns.lock.unlock(ns.io);
+        defer ns.lock.unlockShared(ns.io);
         try ns.index.update(local, vec);
         return;
     }
-    if (ns.index.entry_point == null) {
+    const empty = ns.index.entry_point == null;
+    ns.lock.unlockShared(ns.io);
+    if (empty) {
+        ns.lock.lockUncancelable(ns.io);
         defer ns.lock.unlock(ns.io);
         try upsertDoc(ns, persist, id, vec);
         return;
     }
+
+    ns.splice_mu.lockUncancelable(ns.io);
     const level = ns.index.nextLevel();
-    ns.lock.unlock(ns.io);
+    ns.splice_mu.unlock(ns.io);
 
     ns.lock.lockSharedUncancelable(ns.io);
     var plan = ns.index.planInsert(vec, level, scratch) catch |e| {
@@ -1018,8 +1023,8 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
     if (ns.id_map.get(id)) |local| {
         ns.lock.unlock(ns.io);
         plan.discard(ns.index.allocator);
-        ns.lock.lockUncancelable(ns.io);
-        defer ns.lock.unlock(ns.io);
+        ns.lock.lockSharedUncancelable(ns.io);
+        defer ns.lock.unlockShared(ns.io);
         try ns.index.update(local, vec);
         return;
     }
@@ -1159,9 +1164,10 @@ fn handleWrite(
         }
     }
 
-    // Updates memcpy in place (brief exclusive). Inserts: shared neighbor
-    // search, exclusive publish (append + outgoing + entry), then shared
-    // back-edge splice so lockShared queries do not wait on prune.
+    // Updates: shared + vec_gen seqlock (no exclusive). Inserts: shared
+    // neighbor search, exclusive publish (append + outgoing + entry),
+    // then shared back-edge splice so lockShared queries do not wait
+    // on prune.
     for (batch.items) |iv| {
         try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
     }
