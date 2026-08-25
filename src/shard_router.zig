@@ -911,6 +911,17 @@ fn spawnChildren(cluster: *Cluster, out: *std.Io.Writer) !void {
         try out.print("shard[{d}] pid={?d} port={d} workers={d}\n", .{ i, ch.pid, ch.port, workers });
         try out.flush();
     }
+    cluster.io.sleep(.{ .nanoseconds = 80_000_000 }, .awake) catch {};
+    for (cluster.children, 0..) |ch, i| {
+        if (ch.pid) |pid| {
+            const r = std.os.linux.kill(pid, 0);
+            if (std.os.linux.errno(r) != .SUCCESS) {
+                try out.print("shard[{d}] pid={d} died immediately (port {d} busy?)\n", .{ i, pid, ch.port });
+                try out.flush();
+                return error.ChildDied;
+            }
+        }
+    }
 }
 
 fn waitReady(cluster: *Cluster, timeout_ns: i128) !void {

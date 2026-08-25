@@ -243,6 +243,14 @@ class ZigRoutedCluster:
             raise
 
     def stop(self):
+        child_pids = []
+        try:
+            info, _ = http_json(f"http://127.0.0.1:{self.router_port}/health", timeout=2)
+            for c in info.get("children") or []:
+                if c.get("pid"):
+                    child_pids.append(int(c["pid"]))
+        except Exception:
+            pass
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -251,6 +259,16 @@ class ZigRoutedCluster:
                 self.proc.kill()
                 self.proc.wait(timeout=2)
         self.proc = None
+        for pid in child_pids:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        for pid in child_pids:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
 
     def rss_total_mib(self):
         try:
