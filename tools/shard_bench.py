@@ -134,7 +134,8 @@ def upsert_docs(base, docs, batch=40):
     t0 = time.perf_counter()
     for i in range(0, len(docs), batch):
         chunk = docs[i : i + batch]
-        print(f"    upsert batch {i}-{i+len(chunk)-1} ...", flush=True)
+        if i == 0 or (i // batch) % 25 == 0 or i + batch >= len(docs):
+            print(f"    upsert batch {i}-{i+len(chunk)-1} ...", flush=True)
         http_json(
             base,
             {

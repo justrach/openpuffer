@@ -350,6 +350,7 @@ fn closeFd(fd: std.posix.fd_t) void {
 const ChildConn = struct {
     port: u16,
     fd: ?std.posix.fd_t = null,
+    mu: std.Thread.Mutex = .{},
 
     fn close(self: *ChildConn) void {
         if (self.fd) |fd| {
@@ -364,6 +365,12 @@ const ChildConn = struct {
     }
 
     fn request(self: *ChildConn, alloc: std.mem.Allocator, method: []const u8, path: []const u8, body: ?[]const u8) !struct { status: u16, body: []u8 } {
+        // One keep-alive socket per child, shared across router workers.
+        // Per-worker sockets pin child serve workers in recv() on idle
+        // keep-alives (serve requeues after one request), so a third
+        // connection is never read.
+        self.mu.lock();
+        defer self.mu.unlock();
         var last: ?anyerror = null;
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
@@ -814,6 +821,7 @@ const PoolCtx = struct {
     cluster: *Cluster,
     queue: *FdQueue,
     listen_fd: std.posix.fd_t,
+    conns: []ChildConn,
 };
 
 fn routerWorkerCount(o: Options) usize {
@@ -833,16 +841,10 @@ fn poolWorker(ctx: *PoolCtx) void {
     store.resize(ctx.alloc, 1 << 16) catch return;
     var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena_state.deinit();
-    const conns = ctx.alloc.alloc(ChildConn, ctx.cluster.ports.len) catch return;
-    defer {
-        for (conns) |*c| c.close();
-        ctx.alloc.free(conns);
-    }
-    for (conns, ctx.cluster.ports) |*c, p| c.* = .{ .port = p };
 
     while (true) {
         const fd = ctx.queue.pop();
-        const end = handleClient(fd, ctx, &store, &arena_state, conns) catch .close;
+        const end = handleClient(fd, ctx, &store, &arena_state, ctx.conns) catch .close;
         if (end == .close) closeFd(fd);
     }
 }
@@ -1022,8 +1024,10 @@ fn serveIoUring(alloc: std.mem.Allocator, io: std.Io, listen_fd: std.posix.fd_t,
     _ = std.os.linux.listen(listen_fd, 1024);
     const queue = try alloc.create(FdQueue);
     queue.* = .{ .io = io };
+    const conns = try alloc.alloc(ChildConn, cluster.ports.len);
+    for (conns, cluster.ports) |*c, p| c.* = .{ .port = p };
     const ctx = try alloc.create(PoolCtx);
-    ctx.* = .{ .alloc = alloc, .io = io, .cluster = cluster, .queue = queue, .listen_fd = listen_fd };
+    ctx.* = .{ .alloc = alloc, .io = io, .cluster = cluster, .queue = queue, .listen_fd = listen_fd, .conns = conns };
     const n = routerWorkerCount(cluster.o);
     for (0..n) |_| {
         const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
