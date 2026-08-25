@@ -61,7 +61,7 @@ pub fn dotI8(a: []const i8, b: []const i8) i32 {
     // Debug uses the self-hosted backend, which cannot move @Vector(16, i32)
     // (`TODO moveStrategy`). VNNI is the ReleaseFast path that the metric
     // actually runs.
-    if (comptime has_avx512_vnni and builtin.mode != .Debug) {
+    if (comptime has_avx512_vnni and builtin.mode != .debug) {
         const I = struct {
             extern fn @"llvm.x86.avx512.vpdpbusd.512"(
                 src1: @Vector(16, i32),
