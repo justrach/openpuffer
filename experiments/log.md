@@ -123,6 +123,8 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 
 20k rerank_mult at ef=128 (random, 50q): mult=1 p50 0.551 ms recall 0.3280; default 4 p50 0.618 ms recall 0.3280; mult=8 p50 0.591 ms recall 0.3280. Same recall — not a quality knob on this cliff.
 
+**Random cannot hold recall@10 ≥ 0.30 at n=200k** even at ef=1024 (0.264). Doubling ef roughly doubles recall on this cliff (0.022 → 0.040 → 0.076 → 0.142 → 0.264); 0.30 would need ~ef=1400 and is the wrong axis. Treat clustered as the quality number.
+
 ### Clustered (SQuAD-style mixture)
 
 | n | ef | p50 (ms) | p95 (ms) | recall@10 | RSS post-build / post-query | holds ≥0.30? |
