@@ -306,6 +306,17 @@ const FdQueue = struct {
         self.mu.unlock(self.io);
     }
 
+    fn tryPush(self: *FdQueue, fd: std.posix.fd_t) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.count == self.slots.len) return false;
+        self.slots[self.tail] = fd;
+        self.tail = (self.tail + 1) % self.slots.len;
+        self.count += 1;
+        self.cv.signal(self.io);
+        return true;
+    }
+
     fn pop(self: *FdQueue) std.posix.fd_t {
         self.mu.lockUncancelable(self.io);
         while (self.count == 0) {
@@ -376,8 +387,8 @@ fn poolWorker(ctx: *PoolCtx) void {
     var xfer = ConnXfer{};
     while (true) {
         const fd = ctx.queue.pop();
-        handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state) catch {};
-        _ = std.os.linux.close(fd);
+        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.queue) catch .close;
+        if (end == .close) _ = std.os.linux.close(fd);
     }
 }
 
@@ -438,8 +449,8 @@ fn serveIoUring(
         // A lone connection is handled inline to avoid a futex wake (~0.3ms).
         drainListenBacklog(listen_fd, queue);
         if (queue.isEmpty()) {
-            handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state) catch {};
-            _ = std.os.linux.close(fd);
+            const end = handleIoUringConn(&xfer, fd, alloc, io, registry, o, &store, &arena_state, queue) catch .close;
+            if (end == .close) _ = std.os.linux.close(fd);
         } else {
             queue.push(fd);
         }
@@ -460,6 +471,8 @@ const ConnXfer = struct {
     }
 };
 
+const ConnEnd = enum { close, requeued };
+
 fn handleIoUringConn(
     xfer: *ConnXfer,
     fd: std.posix.fd_t,
@@ -469,7 +482,8 @@ fn handleIoUringConn(
     o: Options,
     store: *std.ArrayList(u8),
     arena_state: *std.heap.ArenaAllocator,
-) !void {
+    queue: ?*FdQueue,
+) !ConnEnd {
     var n: usize = 0;
     while (true) {
         while (iouring.completeHttpRequest(store.items[0..n]) == 0) {
@@ -479,7 +493,7 @@ fn handleIoUringConn(
                 try store.resize(alloc, cap * 2);
             }
             const got = try xfer.recv(fd, store.items[n..]);
-            if (got == 0) return;
+            if (got == 0) return .close;
             n += got;
         }
         const used = iouring.completeHttpRequest(store.items[0..n]);
@@ -498,13 +512,19 @@ fn handleIoUringConn(
         const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
         try xfer.sendAll(fd, wire);
 
-        if (!keepalive) return;
+        if (!keepalive) return .close;
         if (used < n) {
             const rest = n - used;
             std.mem.copyForwards(u8, store.items[0..rest], store.items[used..n]);
             n = rest;
-        } else {
-            n = 0;
+            continue;
+        }
+        n = 0;
+        // Keep-alive would otherwise pin this worker until the client hangs up.
+        // Mixed query+upsert traffic then starves: ncpu query sockets occupy
+        // every worker and writes sit in FdQueue until a query conn closes.
+        if (queue) |q| {
+            if (!q.isEmpty() and q.tryPush(fd)) return .requeued;
         }
     }
 }
