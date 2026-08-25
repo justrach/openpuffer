@@ -31,6 +31,8 @@ const Namespace = struct {
     pending_wal: u64 = 0,
     io: std.Io,
     lock: std.Io.RwLock = .init,
+    /// Serializes id_map get/put among writers. Queries do not take this.
+    map_mu: std.Io.Mutex = .init,
     /// Serializes back-edge splices among writers. Readers never take this.
     splice_mu: std.Io.Mutex = .init,
     /// Publishes that have not finished `spliceBackEdges`. Snapshot waits
@@ -992,16 +994,26 @@ fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f
     try ns.id_map.put(persist, id, local);
 }
 
+fn reserveWriteRoom(ns: *Namespace, persist: std.mem.Allocator) !void {
+    if (ns.index.hasInsertRoom(1) and ns.doc_ids.capacity > ns.doc_ids.items.len) {
+        return;
+    }
+    ns.lock.lockUncancelable(ns.io);
+    defer ns.lock.unlock(ns.io);
+    try ns.index.ensureInsertRoom(1024);
+    try ns.doc_ids.ensureTotalCapacity(persist, ns.doc_ids.items.len + 1024);
+    try ns.id_map.ensureTotalCapacity(persist, ns.id_map.count() + 1024);
+}
+
 fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32) !void {
-    ns.lock.lockSharedUncancelable(ns.io);
-    if (ns.id_map.get(id)) |local| {
-        defer ns.lock.unlockShared(ns.io);
+    ns.map_mu.lockUncancelable(ns.io);
+    const existing = ns.id_map.get(id);
+    ns.map_mu.unlock(ns.io);
+    if (existing) |local| {
         try ns.index.update(local, vec);
         return;
     }
-    const empty = ns.index.entry_point == null;
-    ns.lock.unlockShared(ns.io);
-    if (empty) {
+    if (ns.index.entryPoint() == null) {
         ns.lock.lockUncancelable(ns.io);
         defer ns.lock.unlock(ns.io);
         try upsertDoc(ns, persist, id, vec);
@@ -1019,41 +1031,38 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
     };
     ns.lock.unlockShared(ns.io);
 
-    ns.lock.lockUncancelable(ns.io);
-    if (ns.id_map.get(id)) |local| {
-        ns.lock.unlock(ns.io);
+    reserveWriteRoom(ns, persist) catch |e| {
         plan.discard(ns.index.allocator);
-        ns.lock.lockSharedUncancelable(ns.io);
-        defer ns.lock.unlockShared(ns.io);
+        return e;
+    };
+
+    ns.splice_mu.lockUncancelable(ns.io);
+    defer ns.splice_mu.unlock(ns.io);
+    ns.map_mu.lockUncancelable(ns.io);
+    if (ns.id_map.get(id)) |local| {
+        ns.map_mu.unlock(ns.io);
+        plan.discard(ns.index.allocator);
         try ns.index.update(local, vec);
         return;
     }
-    const local = ns.index.publishInsert(&plan) catch |e| {
-        ns.lock.unlock(ns.io);
-        plan.discard(ns.index.allocator);
-        return e;
-    };
-    ns.doc_ids.append(persist, id) catch |e| {
-        ns.lock.unlock(ns.io);
-        plan.discard(ns.index.allocator);
-        return e;
-    };
-    ns.id_map.put(persist, id, local) catch |e| {
-        ns.lock.unlock(ns.io);
-        plan.discard(ns.index.allocator);
-        return e;
-    };
-    _ = @atomicRmw(u32, &ns.unspliced, .Add, 1, .acq_rel);
-    ns.lock.unlock(ns.io);
+    ns.map_mu.unlock(ns.io);
 
-    // Back-edge splice + prune is the slow exclusive leftover. Hold shared
-    // so lockShared queries keep walking; splice_mu serializes writers so
-    // two pushes cannot overflow the +1 neighbor slack.
+    const local = ns.index.publishInsert(&plan) catch |e| {
+        plan.discard(ns.index.allocator);
+        return e;
+    };
+    ns.doc_ids.appendAssumeCapacity(id);
+    ns.map_mu.lockUncancelable(ns.io);
+    ns.id_map.putAssumeCapacity(id, local);
+    ns.map_mu.unlock(ns.io);
+    ns.index.publishEntry(local, plan.level);
+    _ = @atomicRmw(u32, &ns.unspliced, .Add, 1, .acq_rel);
+    defer _ = @atomicRmw(u32, &ns.unspliced, .Sub, 1, .acq_rel);
+
+    // Splice under shared so a concurrent capacity grow (exclusive) waits.
+    // Queries also hold shared and keep walking.
     ns.lock.lockSharedUncancelable(ns.io);
     defer ns.lock.unlockShared(ns.io);
-    ns.splice_mu.lockUncancelable(ns.io);
-    defer ns.splice_mu.unlock(ns.io);
-    defer _ = @atomicRmw(u32, &ns.unspliced, .Sub, 1, .acq_rel);
     try ns.index.spliceBackEdges(&plan, local);
 }
 
@@ -1164,10 +1173,9 @@ fn handleWrite(
         }
     }
 
-    // Updates: shared + vec_gen seqlock (no exclusive). Inserts: shared
-    // neighbor search, exclusive publish (append + outgoing + entry),
-    // then shared back-edge splice so lockShared queries do not wait
-    // on prune.
+    // Updates: vec_gen seqlock, no namespace lock. Inserts: shared
+    // neighbor search, exclusive only if slabs need to grow, then
+    // splice_mu publish + shared back-edge splice.
     for (batch.items) |iv| {
         try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
     }
@@ -1221,7 +1229,7 @@ fn handleQuery(
 
     ns.lock.lockSharedUncancelable(ns.io);
     defer ns.lock.unlockShared(ns.io);
-    if (ns.index.entry_point == null) return respondJson(res, .ok, "{\"rows\":[]}");
+    if (ns.index.entryPoint() == null) return respondJson(res, .ok, "{\"rows\":[]}");
     if (query_vec.len != ns.dim) {
         var dbuf: [128]u8 = undefined;
         const dmsg = try std.fmt.bufPrint(&dbuf, "{{\"error\":\"dimension mismatch\",\"expected\":{d},\"got\":{d}}}", .{ ns.dim, query_vec.len });
