@@ -13,6 +13,17 @@ Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB 
 
 Chart regenerated with `python3 tools/plot_results.py` after every completed experiment.
 
+## SSD-shaped next step (not implemented)
+
+In-memory flatten is the ROI step: Record payload and graph are now contiguous slabs
+(`vectors_flat` / `qvecs_flat` / packed CSR). The durable follow-on is a log-structured
+map, not a full NVMe/SPDK/ZNS engine:
+
+- **RecordID → {segment, offset, generation}** on large append-only segments.
+- Updates append a new record and bump generation; readers ignore stale gen.
+- Segments are mmap/O_DIRECT-friendly; compaction rewrites live records.
+- Do **not** plumb raw NVMe/SPDK/ZNS until the address map and flatten prove out.
+
 | id | date | hypothesis | change summary | files touched | gate | p50 (ms) | recall@10 | delta p50 vs best | verdict | notes |
 |----|------|------------|----------------|---------------|------|----------|-----------|-------------------|---------|-------|
 | E000 | 2026-08-23 | baseline (seeded by human, never edit) | none — unmodified tree | — | pass | 1.013 / 0.981 | 0.3130 | — | keep | two consecutive runs; ±3% p50 variance, recall bit-stable; M1 Mac |
