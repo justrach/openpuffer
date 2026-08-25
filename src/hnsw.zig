@@ -149,7 +149,12 @@ pub fn Hnsw(comptime D: type) type {
                     @panic("hnsw invariant broken");
                 }
                 const neighbors = self.node_links.items[c.id][layer].items;
-                for (neighbors) |nid| {
+                for (neighbors, 0..) |nid, ni| {
+                    // one-ahead software prefetch: the next neighbor's int8
+                    // vector starts its memory fetch while we dot this one.
+                    if (ni + 1 < neighbors.len) {
+                        @prefetch(self.qvecs.items[neighbors[ni + 1]], .{});
+                    }
                     if (visited.isSet(nid)) continue;
                     visited.set(nid);
                     const d = dist_ctx.dist(nid);
