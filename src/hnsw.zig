@@ -367,6 +367,10 @@ pub fn Hnsw(comptime D: type) type {
             }
         };
 
+        pub fn nextLevel(self: *Self) u32 {
+            return self.randomLevel();
+        }
+
         fn quantizeOwned(self: *const Self, vector_in: []const f32) !struct { copy: []f32, q8: []i8, scale: f32 } {
             const alloc = self.allocator;
             const copy = try alloc.alloc(f32, self.dim);

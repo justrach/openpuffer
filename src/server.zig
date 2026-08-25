@@ -975,6 +975,40 @@ fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f
     try ns.id_map.put(persist, id, local);
 }
 
+fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32) !void {
+    ns.lock.lockUncancelable(ns.io);
+    if (ns.id_map.get(id)) |local| {
+        defer ns.lock.unlock(ns.io);
+        try ns.index.update(local, vec);
+        return;
+    }
+    if (ns.index.entry_point == null) {
+        defer ns.lock.unlock(ns.io);
+        try upsertDoc(ns, persist, id, vec);
+        return;
+    }
+    const level = ns.index.nextLevel();
+    ns.lock.unlock(ns.io);
+
+    ns.lock.lockSharedUncancelable(ns.io);
+    const plan = ns.index.planInsert(vec, level, scratch) catch |e| {
+        ns.lock.unlockShared(ns.io);
+        return e;
+    };
+    ns.lock.unlockShared(ns.io);
+
+    ns.lock.lockUncancelable(ns.io);
+    defer ns.lock.unlock(ns.io);
+    if (ns.id_map.get(id)) |local| {
+        plan.discard(ns.index.allocator);
+        try ns.index.update(local, vec);
+        return;
+    }
+    const local = try ns.index.commitInsert(plan);
+    try ns.doc_ids.append(persist, id);
+    try ns.id_map.put(persist, id, local);
+}
+
 fn replayWalBody(ns: *Namespace, persist: std.mem.Allocator, alloc: std.mem.Allocator, body: []const u8) !usize {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -1079,8 +1113,14 @@ fn handleWrite(
         }
         for (batch.items) |iv| {
             if (iv.vec.len != ns.dim) return respondJson(res, .bad_request, "{\"error\":\"dimension mismatch\"}");
-            try upsertDoc(ns, persist, iv.id, iv.vec);
         }
+    }
+
+    // Updates memcpy in place (brief exclusive). Inserts search neighbors
+    // under a shared lock so ANN queries keep running, then splice under
+    // exclusive only for the pointer publishes / back-edges.
+    for (batch.items) |iv| {
+        try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
     }
 
     // durable WAL: group-commit via persist worker when configured
