@@ -527,7 +527,9 @@ pub fn Hnsw(comptime D: type) type {
             return self.searchAdvanced(query, k, ef_search, 4, alloc);
         }
 
-        /// `rerank_mult` exposes the recall/latency knob; 1 disables rerank.
+        /// `rerank_mult` is the recall/latency knob (CLI `--rerank-mult`, default 4).
+        /// 1 disables rerank (int8 order only). Raising it only helps if the true
+        /// neighbors are already in the ef-sized candidate list.
         pub fn searchAdvanced(
             self: *Self,
             query: []const f32,
