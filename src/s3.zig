@@ -241,7 +241,9 @@ pub const Client = struct {
             .keep_alive = false,
         });
         if (result.status.class() != .success) {
-            std.debug.print("s3 {s} {s} -> {d}: {s}\n", .{ @tagName(method), key, @intFromEnum(result.status), resp.written()[0..@min(resp.written().len, 300)] });
+            if (result.status != .not_found) {
+                std.debug.print("s3 {s} {s} -> {d}: {s}\n", .{ @tagName(method), key, @intFromEnum(result.status), resp.written()[0..@min(resp.written().len, 300)] });
+            }
             return error.S3RequestFailed;
         }
         return alloc.dupe(u8, resp.written());
