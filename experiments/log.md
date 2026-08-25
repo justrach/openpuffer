@@ -8,6 +8,7 @@ Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
 Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
 Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB (no recall; `--no-exact`). 2M does not fit. Numbers live in the Scale section below — do not put them in the E-table p50 cell or results.svg.
+Multi-instance sharding (N serve processes + Python router) is a **separate** design note below the Scale section — not an E-row.
 
 ![p50 per experiment](results.svg)
 
@@ -161,3 +162,102 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 Serve default **ef=128** is the right product default: clustered holds ≥0.98 at 20k–200k, and 1M query p50 stays 1.4 ms. Raise `--ef` only for uniform-random-like workloads (20k: 128, 50k: 512, 200k: cannot hold 0.30).
 
 1M `--no-exact` p50s are the clean latency numbers (no brute-force cache pollution). 20k–200k rows above compute exact recall after each query, which dirties cache — treat those p50s as slightly pessimistic vs a recall-free serve path. 200k random p50 is also inflated by a 1.2 GiB exact scan between queries.
+
+## Multi-instance sharding (not an E-row) — 2026-08-25
+
+Scale path that does **not** put 2M vectors in one 16 GiB address space:
+N independent `openpuffer serve` processes + a thin Python router
+(`tools/shard_router.py`). Chart / E-table p50 cells are unchanged.
+
+```
+python3 tools/shard_router.py --shards 4 --port 8800 --ef 128
+OPENPUFFER_SHARDS=4 python3 tools/shard_router.py --port 8800
+python3 tools/shard_bench.py --n 8000 --queries 80 --dim 1536 --ef 128
+```
+
+### Shard key
+
+FNV-1a 64-bit (`tools/shard_key.py`). Canonical bytes for the default
+`doc` mode:
+
+```
+utf-8(namespace) + 0x00 + utf-8(decimal_id)     then  key % N
+```
+
+Integer ids are ASCII decimal with no leading zeros, so `42` and `"42"`
+hash the same. Namespace mode hashes only `utf-8(namespace)` — a tenant
+fits on one process; that does **not** split a 2M-doc namespace.
+
+Writes (upsert) split the batch and send each document to exactly one
+child. Queries scatter-gather to all children (doc mode) or the owning
+child (namespace mode), then merge rows by `$distance` ascending.
+
+### Measured (this host, 4-core Xeon, 16 GiB, flatten+ef=128 tree)
+
+n=8000 × 1536, ef=128, k=10, 80 queries, per-child `--workers 2`.
+Router uses a **new localhost TCP** to each child per request (honest
+first-experiment hop; keep-alive reuse against serve reset under
+scatter-gather). Same total vectors in every row.
+
+| layout | shards | upsert | ka p50 | ka QPS | ka+c4 p50 | ka+c4 QPS | child RSS | route |
+|---|---|---|---|---|---|---|---|---|
+| 1-direct (no router) | 1 | 20.5 s | **0.749 ms** | 787 | 0.814 ms | 966 | 86.2 MiB | n/a |
+| router-1 | 1 | 27.4 s | **1.208 ms** | 558 | 4.792 ms | 696 | 86.2 MiB | n/a |
+| router-2 | 2 | 17.9 s | **1.455 ms** | 495 | 6.402 ms | 565 | 88.1 MiB | 32/32 ok |
+| router-4 | 4 | 14.1 s | **2.113 ms** | 378 | 9.012 ms | 417 | 92.5 MiB | 32/32 ok |
+
+Smoke n=200 was the same shape (direct 0.48 ms, router-1 1.21 ms,
+router-4 1.61 ms). Clustered merge (400 docs, 4 centroids, k=10):
+**router-4 top-k == 1-direct top-k == exact**, overlap 1.000.
+
+Write routing: sampled docs appear only on `shard_for(ns, id, N)`.
+GET count across children sums to n.
+
+### What this means for 1M / 2M
+
+Do **not** read the 8k p50s as “sharding is slower at 1M”. At 8k the
+graph walk is ~0.7 ms; the Python hop (~0.46 ms router-1 − direct) and
+N parallel child requests dominate. At 1M the old-layout walk was 12.7 ms; flatten measured **1.41 ms /
+7481 MiB** (see Pareto). Same-box 4×250k is still not a RAM win.
+
+| | 1×1M | 4×250k |
+|---|---|---|
+| payload | ~7.5 GiB flatten | same bytes, split ~1.9 GiB/process |
+| process RSS | one address space | 4 heaps + 4 copies of code; at 8k the extra was only +6 MiB |
+| fits 16 GiB? | yes after flatten (~7.5 vs old 11.2) | yes, each child well under ulimit |
+| 2M | ~15 GiB + overhead — **does not fit one process** | 4×500k ≈ 3.8 GiB/process. Total RAM still ~15 GiB so one 16 GiB box is tight; **four boxes (or a bigger one) is the actual 2M path** |
+| query p50 | 12.7 ms (old 1M) | expect ~max(per-shard walk) + hop + merge. 200k in-process was 2.8 ms; 4-way DRAM contention on this 4-core host will eat some of that |
+| recall@10 random ef=128 | 0.04 at 200k, unknown at 1M | each shard is a smaller graph (250k ≈ 0.04? or better than 1M). Merge of per-shard ANN ≠ one 1M walk |
+| QPS | one walk per query | N walks per query — **hurts** concurrent QPS unless you have N machines |
+
+Sharding is an **address-space / isolation / multi-box** move, not a
+free latency win on one 4-core box at modest n.
+
+### Honest limits
+
+1. **Cross-shard recall.** Merge is of *per-shard HNSW* top-k, not a
+   unified graph walk. If a shard’s local ANN misses a true neighbor
+   that lives on that shard, the merge misses it. On clustered data at
+   n=400 this did not show up (overlap 1.0). On uniform random 1536-d
+   at large n, per-shard recall is already the story (see Scale table).
+2. **Network hop.** Every query is client → Python router → N child
+   HTTP requests → merge. Measured hop ≈ **0.46 ms** (router-1 −
+   1-direct) with a new TCP per child. A Zig/io_uring router with
+   keep-alive would shrink this; it would not remove scatter-gather.
+3. **Merge cost** is tiny (N×k sort). The p50 rise 1.21 → 2.11 ms from
+   1→4 shards is waiting on N child searches + N handshakes, not the
+   sort.
+4. **Oversubscription.** 4 shards × `--workers 2` = 8 serve threads on
+   4 cores, plus the router. Concurrent QPS fell as N grew. Pin
+   `--workers 1` per child on a 4-core host if you care about one
+   query’s DRAM, or put shards on separate machines.
+5. **Keep-alive to children.** First attempt reused HTTP connections
+   and reset under scatter-gather (serve’s lone-conn path pins accept
+   when workers=1; throwaway executor threads reset sockets). Fresh
+   connections are the working experiment; pooling is follow-up.
+6. **Not implemented:** NVMe/SPDK, Zig router, resharding, replication,
+   cross-process snapshot. Persistence still lives inside each child.
+
+Verdict: the path works. Use it when one process cannot hold the
+vectors (2M, or 1M + room for other things). Do not turn it on at 8k
+expecting a p50 win.
