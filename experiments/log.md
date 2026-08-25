@@ -6,7 +6,7 @@ Protocol: see `program.md`. Append-only EXCEPT completing the current experiment
 Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
-Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
+Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Shard hop n=8000: Python **0.46 ms** → Zig keep-alive **0.32 ms** (E031). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
 Scale (dim=1536, ef=128, 16 GiB host): flatten 1M random `--no-exact` p50 **1.410 ms** / RSS **7481 MiB**. Clustered 1M `--index-exact` recall@10 **0.846 (ef=64) / 0.942 (ef=128)**, p50 **0.382 / 0.429 ms**, RSS **7492 MiB**. Index+second f32 corpus at 1M does not fit. 2M not launched. Numbers live in the Scale/Pareto sections — not the E-table p50 cell or results.svg.
 Multi-instance sharding (N serve processes + Zig/io_uring `shard-router`, Python fallback) is documented below the Scale section. E031 is the serve-track hop row — do not copy hop p50s into engine cells or `results.svg`.
 mmap slabs (E028, memory track): load-via-mmap RSS Δ**0.0 MiB** vs load-via-alloc **373.2 MiB** at n=50k / **1492.7 MiB** at n=200k (dim=1536, blank-slab reopen). Not an E-table p50. See Memory/mmap below.
@@ -60,7 +60,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 | E028 | 2026-08-26 | mmap the flat HNSW slabs so a snapshot reopen is demand-paged (no copy-in of vectors_flat / qvecs_flat / packed CSR) | HMLS slab file; POSIX mmap MAP_PRIVATE; heap ArrayLists are the post-mmap append buffer; persist SNAP v2 envelope + page-aligned HMLS; atomic tmp+fsync+rename | src/hnsw.zig src/persist.zig | pass | — | — | — | keep | memory | MEMORY keep: MAP_PRIVATE + heap append. Reopen RSS ~0.8 MiB vs ~1.5 GiB alloc. load-via-mmap vs load-via-alloc (blank slabs, dim=1536): n=50k **Δ0.0 vs Δ373.2 MiB**; n=200k **Δ0.0 vs Δ1492.7 MiB**. Touching one mapped row stays Δ0.0. Snapshot file is never written by load/insert. Combined with E027 drop-f32 on GRAPH serialize. No NVMe/SPDK/ZNS. |
 | E029 | 2026-08-26 | remaining exclusive splice still blocks lockShared queries; publish node with a generation / reserved-slab RCU so mixed query p50 does not track write p50 | publishInsert + spliceBackEdges; nbr_gen/vec_gen seqlocks; exclusive only on slab grow; splice_mu publish; snapshot waits unspliced | src/hnsw.zig src/server.zig src/persist.zig tools/mixed_bench.py | pass | — | — | serve (not engine) | keep | serve | SERVING keep. Chart not regenerated — do not copy mixed HTTP p50 into this cell or results.svg. Mixed idle **2.08 ms** / mixed **3.78 ms (1.82×)** vs PR #3 2.31 / 5.17 (2.24×). See Mixed live section. |
 | E030 | 2026-08-26 | 1M clustered recall@10 is measurable without a second f32 corpus by scoring ANN against the index `vectors_flat` slab; ef=64/128 should hold ≥0.98 like 200k | `--index-exact` harness: no-retain insert + post-ANN brute-force vs stored f32; pre-reserve slabs so 1M does not 2×-peak; scored 20k path unchanged | src/main.zig | pass | — | 0.846 / 0.942 | — | keep | scale | SCALE keep (not a p50 claim; chart not regenerated). n=2000 clustered: index-exact recall matched corpus GT (1.0000 @ ef=64/128). 1M×1536 clustered 50q `--index-exact --ef-sweep 64,128`: build 1221 s (819 vec/s), RSS **7492 / 7499 / 7506** MiB. ef=64 p50 **0.382** ms recall@10 **0.8460**; ef=128 p50 **0.429** ms recall@10 **0.9420**. Exact GT 580 ms/q, 7.6 MiB Dist scratch. Hypothesis ≥0.98 was high — quality drops 200k→1M (0.98/0.998 → 0.846/0.942) but both hold ≫0.30. Index+second corpus (~13.6 GiB) does not fit. 2M not launched. HTTP-upsert 1M not launched. Do not copy 1M p50 into results.svg. |
-| E031 | 2026-08-26 | replace the Python shard-router hop (~0.46 ms) with a Zig/io_uring router that keep-alives to child `openpuffer serve` processes | `openpuffer shard-router`: FNV-1a same as shard_key.py; writes to one child; query scatter-gather merge by $distance; child keep-alive + TCP_NODELAY | src/shard_router.zig src/main.zig src/iouring_sock.zig tools/shard_bench.py | pending | — | — | — | running | serve | SERVING hop (not engine p50). Measure n=8000 dim=1536 ef=128: 1-direct vs zig-router-1 vs zig-router-4. Python router stays as fallback. No 1M/2M. |
+| E031 | 2026-08-26 | replace the Python shard-router hop (~0.46 ms) with a Zig/io_uring router that keep-alives to child `openpuffer serve` processes | `openpuffer shard-router`: FNV-1a same as shard_key.py; writes to one child; query scatter-gather merge by $distance; one mutexed keep-alive + TCP_NODELAY per child | src/shard_router.zig src/main.zig src/iouring_sock.zig tools/shard_bench.py | pass | 0.694 / 1.015 / 1.584 | — | hop 0.32 ms vs Python 0.46 ms (−30%) | keep | serve | SERVING hop (not engine p50; chart not regenerated). n=8000 dim=1536 ef=128 ka: 1-direct 0.694 ms, zig-router-1 1.015 ms, zig-router-4 1.584 ms. Python fallback: 0.749 / 1.208 / 2.113. Clustered merge overlap 1.000. One shared child socket — per-worker keep-alives pinned serve recv. No 1M/2M. |
 
 ## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
 
@@ -229,16 +229,20 @@ Serve default **ef=128** is the right product default: clustered holds ≥0.98 a
 
 1M `--no-exact` p50s are the clean latency numbers (no brute-force cache pollution). 20k–200k rows above compute exact recall after each query, which dirties cache — treat those p50s as slightly pessimistic vs a recall-free serve path. 200k random p50 is also inflated by a 1.2 GiB exact scan between queries.
 
-## Multi-instance sharding (not an E-row) — 2026-08-25
+## Multi-instance sharding (E031 serve hop) — 2026-08-25
 
 Scale path that does **not** put 2M vectors in one 16 GiB address space:
-N independent `openpuffer serve` processes + a thin Python router
-(`tools/shard_router.py`). Chart / E-table p50 cells are unchanged.
+N independent `openpuffer serve` processes + a thin router.
+Prefer Zig/io_uring (`openpuffer shard-router`); Python
+`tools/shard_router.py` is the fallback. Chart / engine p50 cells
+are unchanged (E031 is a serve-track hop row).
 
 ```
-python3 tools/shard_router.py --shards 4 --port 8800 --ef 128
-OPENPUFFER_SHARDS=4 python3 tools/shard_router.py --port 8800
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/openpuffer shard-router --shards 4 --port 8800 --ef 128
+OPENPUFFER_SHARDS=4 ./zig-out/bin/openpuffer shard-router --port 8800
 python3 tools/shard_bench.py --n 8000 --queries 80 --dim 1536 --ef 128
+python3 tools/shard_bench.py --router python   # fallback
 ```
 
 ### Shard key
@@ -261,9 +265,9 @@ child (namespace mode), then merge rows by `$distance` ascending.
 ### Measured (this host, 4-core Xeon, 16 GiB, flatten+ef=128 tree)
 
 n=8000 × 1536, ef=128, k=10, 80 queries, per-child `--workers 2`.
-Router uses a **new localhost TCP** to each child per request (honest
-first-experiment hop; keep-alive reuse against serve reset under
-scatter-gather). Same total vectors in every row.
+Same total vectors in every row.
+
+Python router (new localhost TCP per child request; first experiment):
 
 | layout | shards | upsert | ka p50 | ka QPS | ka+c4 p50 | ka+c4 QPS | child RSS | route |
 |---|---|---|---|---|---|---|---|---|
@@ -272,9 +276,21 @@ scatter-gather). Same total vectors in every row.
 | router-2 | 2 | 17.9 s | **1.455 ms** | 495 | 6.402 ms | 565 | 88.1 MiB | 32/32 ok |
 | router-4 | 4 | 14.1 s | **2.113 ms** | 378 | 9.012 ms | 417 | 92.5 MiB | 32/32 ok |
 
-Smoke n=200 was the same shape (direct 0.48 ms, router-1 1.21 ms,
-router-4 1.61 ms). Clustered merge (400 docs, 4 centroids, k=10):
-**router-4 top-k == 1-direct top-k == exact**, overlap 1.000.
+Zig/io_uring router (E031; one mutexed keep-alive + TCP_NODELAY per
+child). Same harness, same n/dim/ef. Host also had a 2M/`--no-f32`
+and a clustered 1M bench on the other two cores — hop is still
+router-1 − 1-direct from this paired run:
+
+| layout | shards | upsert | ka p50 | ka QPS | ka+c4 p50 | ka+c4 QPS | child RSS | route |
+|---|---|---|---|---|---|---|---|---|
+| 1-direct (no router) | 1 | 18.8 s | **0.694 ms** | 767 | 2.358 ms | 1155 | 111.4 MiB | n/a |
+| zig-router-1 | 1 | 21.2 s | **1.015 ms** | 658 | 2.751 ms | 1105 | 112.0 MiB | n/a |
+| zig-router-4 | 4 | 12.0 s | **1.584 ms** | 462 | 4.316 ms | 679 | 117.0 MiB | 32/32 ok |
+
+Hop (router-1 − 1-direct): Python **0.46 ms** → Zig **0.32 ms** (−30%).
+zig-router-4 is 1.58 ms vs Python router-4 2.11 ms. Clustered merge
+(400 docs, 4 centroids, k=10): **zig-router-4 top-k == 1-direct
+top-k == exact**, overlap 1.000.
 
 Write routing: sampled docs appear only on `shard_for(ns, id, N)`.
 GET count across children sums to n.
@@ -282,8 +298,8 @@ GET count across children sums to n.
 ### What this means for 1M / 2M
 
 Do **not** read the 8k p50s as “sharding is slower at 1M”. At 8k the
-graph walk is ~0.7 ms; the Python hop (~0.46 ms router-1 − direct) and
-N parallel child requests dominate. At 1M the old-layout walk was 12.7 ms; flatten measured **1.41 ms /
+graph walk is ~0.7 ms; the hop (Python ~0.46 ms, Zig keep-alive
+~0.32 ms) and N parallel child requests dominate. At 1M the old-layout walk was 12.7 ms; flatten measured **1.41 ms /
 7481 MiB** (see Pareto). Same-box 4×250k is still not a RAM win.
 
 | | 1×1M | 4×250k |
@@ -306,22 +322,23 @@ free latency win on one 4-core box at modest n.
    that lives on that shard, the merge misses it. On clustered data at
    n=400 this did not show up (overlap 1.0). On uniform random 1536-d
    at large n, per-shard recall is already the story (see Scale table).
-2. **Network hop.** Every query is client → Python router → N child
-   HTTP requests → merge. Measured hop ≈ **0.46 ms** (router-1 −
-   1-direct) with a new TCP per child. A Zig/io_uring router with
-   keep-alive would shrink this; it would not remove scatter-gather.
-3. **Merge cost** is tiny (N×k sort). The p50 rise 1.21 → 2.11 ms from
-   1→4 shards is waiting on N child searches + N handshakes, not the
-   sort.
+2. **Network hop.** Every query is client → router → N child HTTP
+   requests → merge. Python hop ≈ **0.46 ms** (new TCP per child).
+   Zig hop ≈ **0.32 ms** (one keep-alive + TCP_NODELAY per child).
+   Scatter-gather remains.
+3. **Merge cost** is tiny (N×k sort). The p50 rise zig-1 1.02 →
+   zig-4 1.58 ms is waiting on N child searches, not the sort.
 4. **Oversubscription.** 4 shards × `--workers 2` = 8 serve threads on
    4 cores, plus the router. Concurrent QPS fell as N grew. Pin
    `--workers 1` per child on a 4-core host if you care about one
    query’s DRAM, or put shards on separate machines.
-5. **Keep-alive to children.** First attempt reused HTTP connections
-   and reset under scatter-gather (serve’s lone-conn path pins accept
-   when workers=1; throwaway executor threads reset sockets). Fresh
-   connections are the working experiment; pooling is follow-up.
-6. **Not implemented:** NVMe/SPDK, Zig router, resharding, replication,
+5. **Keep-alive to children.** Serve requeues a keep-alive fd after
+   one request (E024). One idle socket per child serve worker pins
+   that worker in `recv`. The Zig router shares **one** mutexed
+   keep-alive per child. GET/DELETE use `Connection: close` so a
+   following POST is not left unread. Per-worker child sockets
+   deadlocked on the third upsert.
+6. **Not implemented:** NVMe/SPDK, resharding, replication,
    cross-process snapshot. Persistence still lives inside each child.
 
 Verdict: the path works. Use it when one process cannot hold the
