@@ -427,6 +427,11 @@ const ChildConn = struct {
                 continue;
             };
             store.deinit(alloc);
+            // Don't reuse a child socket after GET/DELETE. serve requeues the
+            // keep-alive fd after one request; the next POST can sit unread.
+            if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "DELETE")) {
+                self.close();
+            }
             return .{ .status = status, .body = copy };
         }
         return last orelse error.ChildUnreachable;

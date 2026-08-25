@@ -196,9 +196,11 @@ pub fn formatRequest(alloc: std.mem.Allocator, method: []const u8, path: []const
             .{ method, path, payload.len, payload },
         );
     }
+    // GET/DELETE: no Content-Length. Serve requeues keep-alive fds after one
+    // request; a GET+CL=0 followed by a POST on the same socket can stall.
     return std.fmt.allocPrint(
         alloc,
-        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         .{ method, path },
     );
 }
