@@ -8,6 +8,7 @@ Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
 Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
 Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB (no recall; `--no-exact`). 2M does not fit. Numbers live in the Scale section below — do not put them in the E-table p50 cell or results.svg.
+Multi-instance sharding (N serve processes + Python router) is a **separate** design note below the Scale section — not an E-row.
 
 ![p50 per experiment](results.svg)
 
