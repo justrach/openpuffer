@@ -58,7 +58,10 @@ fn dotI8Widen(a: []const i8, b: []const i8) i32 {
 /// 16 i32 lanes (one zmm acc; E019 dual 64-lane accs were a discard).
 /// Signed i8×i8 is recovered by XOR-0x80 on `a` and subtracting 128*sum(b).
 pub fn dotI8(a: []const i8, b: []const i8) i32 {
-    if (comptime has_avx512_vnni) {
+    // Debug uses the self-hosted backend, which cannot move @Vector(16, i32)
+    // (`TODO moveStrategy`). VNNI is the ReleaseFast path that the metric
+    // actually runs.
+    if (comptime has_avx512_vnni and builtin.mode != .Debug) {
         const I = struct {
             extern fn @"llvm.x86.avx512.vpdpbusd.512"(
                 src1: @Vector(16, i32),
