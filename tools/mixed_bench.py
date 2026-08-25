@@ -208,11 +208,15 @@ def load_docs(base, docs, batch):
     return time.perf_counter() - t0
 
 
-def query_worker(stop, host, port, ns, queries, k, ef, timeout, stats):
+def query_worker(ready, go, stop, host, port, ns, queries, k, ef, timeout, stats):
     client = Keepalive(host, port, timeout)
     path = f"/v2/namespaces/{ns}/query"
     rng = random.Random(threading.get_ident() ^ int(time.time() * 1e6))
     try:
+        # Prime the keep-alive socket so connect/handshake is outside the window.
+        client.post(path, query_payload(queries[0], k, ef))
+        ready.set()
+        go.wait()
         while not stop.is_set():
             qv = queries[rng.randrange(len(queries))]
             elapsed, ok, err = client.post(path, query_payload(qv, k, ef))
@@ -221,11 +225,19 @@ def query_worker(stop, host, port, ns, queries, k, ef, timeout, stats):
         client.close()
 
 
-def write_worker(kind, stop, host, port, ns, dim, batch, timeout, stats, ids, vec_rng_seed):
+def write_worker(kind, ready, go, stop, host, port, ns, dim, batch, timeout, stats, ids, vec_rng_seed):
     client = Keepalive(host, port, timeout)
     path = f"/v2/namespaces/{ns}"
     rng = random.Random(vec_rng_seed)
     try:
+        vecs = [unit_vec(dim, rng) for _ in range(batch)]
+        if kind == "insert":
+            id_list = ids.next_insert_ids(batch)
+        else:
+            id_list = ids.random_existing(rng, batch) or [0]
+        client.post(path, upsert_payload(id_list, vecs))
+        ready.set()
+        go.wait()
         while not stop.is_set():
             vecs = [unit_vec(dim, rng) for _ in range(batch)]
             if kind == "insert":
@@ -244,42 +256,58 @@ def write_worker(kind, stop, host, port, ns, dim, batch, timeout, stats, ids, ve
 def run_window(label, seconds, host, port, ns, queries, args, ids, insert_n, update_n):
     stats = Stats()
     stop = threading.Event()
+    go = threading.Event()
+    ready_flags = []
     threads = []
     for i in range(args.query_workers):
+        ready = threading.Event()
+        ready_flags.append(ready)
         threads.append(
             threading.Thread(
                 target=query_worker,
-                args=(stop, host, port, ns, queries, args.k, args.ef, args.timeout, stats),
+                args=(ready, go, stop, host, port, ns, queries, args.k, args.ef, args.timeout, stats),
                 name=f"q{i}",
                 daemon=True,
             )
         )
     for i in range(insert_n):
+        ready = threading.Event()
+        ready_flags.append(ready)
         threads.append(
             threading.Thread(
                 target=write_worker,
-                args=("insert", stop, host, port, ns, args.dim, args.write_batch, args.timeout, stats, ids, 1000 + i),
+                args=("insert", ready, go, stop, host, port, ns, args.dim, args.write_batch, args.timeout, stats, ids, 1000 + i),
                 name=f"ins{i}",
                 daemon=True,
             )
         )
     for i in range(update_n):
+        ready = threading.Event()
+        ready_flags.append(ready)
         threads.append(
             threading.Thread(
                 target=write_worker,
-                args=("update", stop, host, port, ns, args.dim, args.write_batch, args.timeout, stats, ids, 2000 + i),
+                args=("update", ready, go, stop, host, port, ns, args.dim, args.write_batch, args.timeout, stats, ids, 2000 + i),
                 name=f"upd{i}",
                 daemon=True,
             )
         )
-    wall0 = time.perf_counter()
     for t in threads:
         t.start()
+    deadline = time.perf_counter() + args.timeout + 2
+    for ev in ready_flags:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0 or not ev.wait(timeout=max(0.1, remaining)):
+            stop.set()
+            go.set()
+            sys.exit(f"{label}: worker failed to become ready")
+    wall0 = time.perf_counter()
+    go.set()
     time.sleep(seconds)
     stop.set()
+    wall = time.perf_counter() - wall0
     for t in threads:
         t.join(timeout=args.timeout + 2)
-    wall = time.perf_counter() - wall0
     snap = stats.snapshot()
     return summarize(label, wall, snap, ids.high)
 
