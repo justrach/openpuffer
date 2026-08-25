@@ -274,8 +274,10 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
 }
 
 fn workerCount() usize {
+    // One worker per core: extra threads oversubscribe a memory-bound ANN
+    // walk and raise concurrent p50 without adding QPS.
     const n = std.Thread.getCpuCount() catch 4;
-    return @min(32, @max(4, n * 2));
+    return @min(16, @max(1, n));
 }
 
 const FdQueue = struct {
@@ -328,7 +330,7 @@ fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o:
     ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue };
     const n = workerCount();
     for (0..n) |_| {
-        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, poolWorker, .{ctx});
+        const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
         t.detach();
     }
     return queue;
@@ -338,10 +340,12 @@ fn poolWorker(ctx: *PoolCtx) void {
     var store: std.ArrayList(u8) = .empty;
     defer store.deinit(ctx.alloc);
     store.resize(ctx.alloc, 1 << 16) catch return;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
     var xfer = ConnXfer{};
     while (true) {
         const fd = ctx.queue.pop();
-        handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store) catch {};
+        handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state) catch {};
         _ = std.os.linux.close(fd);
     }
 }
@@ -418,6 +422,7 @@ fn handleIoUringConn(
     registry: *Registry,
     o: Options,
     store: *std.ArrayList(u8),
+    arena_state: *std.heap.ArenaAllocator,
 ) !void {
     var n: usize = 0;
     while (true) {
@@ -435,8 +440,7 @@ fn handleIoUringConn(
         const raw = try iouring.parseHttpRequest(store.items[0..used]);
         const keepalive = !iouring.wantsClose(store.items[0..used]);
 
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
+        _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         var res = Responder{ .raw_alloc = arena };
         dispatch(arena, io, raw.method, raw.path, raw.body, registry, o, &res) catch {
