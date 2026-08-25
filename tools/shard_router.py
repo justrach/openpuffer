@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -165,24 +166,40 @@ def rss_mib(pid: int) -> float | None:
     return None
 
 
+def _nodelay(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
 class ShardClient:
-    """Per-thread keep-alive connections to child serve processes."""
+    """Pooled keep-alive connections to child serve processes.
+
+    A new ThreadPoolExecutor per fan-out used to spawn throwaway threads,
+    each opening a connection and resetting it on pool shutdown. That
+    produced ConnectionResetError under concurrent queries. Connections
+    now live in a per-shard queue and have TCP_NODELAY set (a 40ms
+    delayed-ACK hop showed up as ~43ms p50 on the first router bench).
+    """
 
     def __init__(self, ports: list[int], timeout: float = 60.0):
         self.ports = ports
         self.timeout = timeout
-        self._local = threading.local()
+        self._pools = [queue.Queue() for _ in ports]
 
-    def _conn(self, idx: int) -> HTTPConnection:
-        conns = getattr(self._local, "conns", None)
-        if conns is None:
-            conns = {}
-            self._local.conns = conns
-        c = conns.get(idx)
-        if c is None:
-            c = HTTPConnection("127.0.0.1", self.ports[idx], timeout=self.timeout)
-            conns[idx] = c
-        return c
+    def _checkout(self, idx: int) -> HTTPConnection:
+        try:
+            return self._pools[idx].get_nowait()
+        except queue.Empty:
+            conn = HTTPConnection("127.0.0.1", self.ports[idx], timeout=self.timeout)
+            conn.connect()
+            if conn.sock is not None:
+                _nodelay(conn.sock)
+            return conn
+
+    def _checkin(self, idx: int, conn: HTTPConnection) -> None:
+        self._pools[idx].put(conn)
 
     def request(self, idx: int, method: str, path: str, body: bytes | None = None):
         headers = {"connection": "keep-alive"}
@@ -190,22 +207,22 @@ class ShardClient:
             headers["content-type"] = "application/json"
             headers["content-length"] = str(len(body))
         last_err = None
-        for attempt in range(2):
+        for _attempt in range(3):
+            conn = self._checkout(idx)
             try:
-                conn = self._conn(idx)
+                if conn.sock is not None:
+                    _nodelay(conn.sock)
                 conn.request(method, path, body=body, headers=headers)
                 resp = conn.getresponse()
                 data = resp.read()
+                self._checkin(idx, conn)
                 return resp.status, data
             except (HTTPException, OSError, ConnectionError) as e:
                 last_err = e
                 try:
-                    self._local.conns.pop(idx, None)
                     conn.close()
                 except Exception:
                     pass
-                if attempt == 1:
-                    raise
         raise last_err  # pragma: no cover
 
 
@@ -223,10 +240,14 @@ class ShardCluster:
         self.n_shards = n_shards
         self.shard_ports = shard_ports
         self.ef = ef
-        self.workers = workers if workers is not None else (1 if n_shards > 1 else None)
+        # workers=1 pins the io_uring accept thread on a keep-alive socket
+        # (see E024 / mixed-workload notes). Two workers leave accept free
+        # when the router holds a persistent child connection.
+        self.workers = workers if workers is not None else (2 if n_shards > 1 else 1)
         self.shard_by = shard_by
         self.procs: list[subprocess.Popen] = []
         self.client = ShardClient(shard_ports)
+        self._fanout_pool = ThreadPoolExecutor(max_workers=max(1, n_shards))
 
     def start(self) -> None:
         if not os.path.exists(self.binary):
@@ -271,6 +292,7 @@ class ShardCluster:
             raise TimeoutError(f"shards not ready on ports {sorted(pending)}")
 
     def stop(self) -> None:
+        self._fanout_pool.shutdown(wait=False, cancel_futures=True)
         for proc in self.procs:
             if proc.poll() is None:
                 proc.terminate()
@@ -302,16 +324,15 @@ class ShardCluster:
             status, data = self.client.request(targets[0], method, path, body)
             return [(targets[0], status, data)]
 
+        futs = {
+            self._fanout_pool.submit(self.client.request, i, method, path, body): i
+            for i in targets
+        }
         out = []
-        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-            futs = {
-                pool.submit(self.client.request, i, method, path, body): i
-                for i in targets
-            }
-            for fut in as_completed(futs):
-                idx = futs[fut]
-                status, data = fut.result()
-                out.append((idx, status, data))
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            status, data = fut.result()
+            out.append((idx, status, data))
         out.sort(key=lambda t: t[0])
         return out
 
@@ -398,12 +419,13 @@ def handle_route(state: RouterState, method: str, path: str, body: bytes) -> tup
             return sid, cluster.client.request(sid, "POST", f"{PREFIX}{ns}", payload)
 
         results = []
-        if len(slices) == 1:
-            results.append(one(next(iter(slices.items()))))
+        items = list(slices.items())
+        if len(items) == 1:
+            results.append(one(items[0]))
         else:
-            with ThreadPoolExecutor(max_workers=len(slices)) as pool:
-                for fut in as_completed([pool.submit(one, item) for item in slices.items()]):
-                    results.append(fut.result())
+            futs = [cluster._fanout_pool.submit(one, item) for item in items]
+            for fut in as_completed(futs):
+                results.append(fut.result())
         for sid, (status, data) in results:
             if status != 200:
                 return status, data or json.dumps({"error": "shard write failed", "shard": sid}).encode()
@@ -485,8 +507,16 @@ def serve_router(state: RouterState, port: int) -> ThreadingHTTPServer:
     def factory(*args, **kwargs):
         return make_handler(state, *args, **kwargs)
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), factory)
-    httpd.daemon_threads = True
+    class NodelayServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def get_request(self):
+            sock, addr = super().get_request()
+            _nodelay(sock)
+            return sock, addr
+
+    httpd = NodelayServer(("127.0.0.1", port), factory)
     return httpd
 
 

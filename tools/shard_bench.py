@@ -105,6 +105,12 @@ class Keepalive:
     def __init__(self, host, port, ns):
         self.path = f"/v2/namespaces/{ns}/query"
         self.conn = HTTPConnection(host, port, timeout=60)
+        self.conn.connect()
+        if self.conn.sock is not None:
+            try:
+                self.conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
 
     def query(self, qv, k, ef=None):
         body = {"rank_by": ["vector", "ANN", qv], "top_k": k}
@@ -425,7 +431,7 @@ def main():
     ap.add_argument("--ef", type=int, default=128)
     ap.add_argument("--port", type=int, default=8800)
     ap.add_argument("--binary", default="./zig-out/bin/openpuffer")
-    ap.add_argument("--workers", type=int, default=1, help="per serve process (fair 1 vs N)")
+    ap.add_argument("--workers", type=int, default=2, help="per serve process (2 avoids keep-alive pinning accept)")
     ap.add_argument("--skip-direct", action="store_true")
     args = ap.parse_args()
 

@@ -1,5 +1,7 @@
 .zig-cache/
 zig-out/
+**/__pycache__/
+*.pyc
 .graff/
 engram/
 .DS_Store
