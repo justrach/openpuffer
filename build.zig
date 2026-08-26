@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Public in-process engine module. Consumers such as codedb use the HNSW
+    // index directly and do not pull in the HTTP server or cloud clients.
+    _ = b.addModule("openpuffer", .{
+        .root_source_file = b.path("src/hnsw.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
