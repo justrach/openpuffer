@@ -252,6 +252,13 @@ ef=1024 — do not spend engine budget chasing that cliff.
    512-d / k=24 / clustered ledger (`experiments/codedb.md`). It does
    not move the 1536-d engine best. Recall@24 floor is 0.99. This is an
    ANN engine number; embedder/GPU time is measured elsewhere.
+4. **codedb real-repository gate.** `python3 tools/codedb_repo_bench.py`
+   builds or consumes external, secret-filtered Qwen3 0.6B/512D caches and derives
+   agent-like queries from codedb commit subjects. Exact cosine top-24 is the
+   ANN ground truth (floor 0.99); changed-file hit/MRR/nDCG are reported as
+   separate embedding-quality diagnostics. Configuration sweeps are
+   interleaved to control machine drift. The measured codedb caller profile is
+   `ef=48, rerank_mult=2`; it does not change the generic server default.
 
 GHA `macos-latest` / `ubuntu-latest` (2026-08-26, PR #22, main tree
 without later engine keeps):

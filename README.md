@@ -102,6 +102,30 @@ export GEMINI_API_KEY=...
 Options for both bench commands: `--n`, `--queries`, `--dim` (MRL output
 dimensionality sent to Gemini), `--k`, `--ef`, `--namespace`, `--model`.
 
+### Real code-repository gate
+
+`tools/codedb_repo_bench.py` (Python 3 + NumPy) measures the 512D ANN path on
+an actual git repository. It builds secret-filtered tracked-file cards, sends
+embedding work only to the configured GPU endpoint, derives agent-like queries
+from commit subjects, and reports exact-cosine ANN recall separately from
+changed-file hit/MRR/nDCG. Corpus and query `.npz` caches stay external.
+
+```sh
+python3 tools/codedb_repo_bench.py \
+  --repo /path/to/codedb \
+  --corpus-cache /tmp/codedb-files-d512.npz \
+  --query-cache /tmp/codedb-queries-d512.npz \
+  --gateway http://127.0.0.1:9000 \
+  --ef-sweep 48,64,96,128 --rerank-mults 1,2,4 \
+  --require-quality
+```
+
+The measured codedb 512D/k=24 caller profile is `ef=48, rerank_mult=2`:
+paired direct-engine runs were 0.058–0.059 ms at recall@24 0.9992, versus
+0.090–0.091 ms at recall 1.0000 for the generic `128/4` control. The global
+server default is unchanged. Full protocol and provenance are in
+[`experiments/codedb-repo.md`](experiments/codedb-repo.md).
+
 ## Measured results (M1 Mac, gcp-us-central1 turbopuffer region)
 
 ### Head-to-head vs turbopuffer (live gemini-embedding-2 data, k=10)
