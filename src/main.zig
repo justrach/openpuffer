@@ -14,6 +14,7 @@ const gemini = @import("gemini.zig");
 const tpuf_mod = @import("tpuf.zig");
 const server_mod = @import("server.zig");
 const s3_mod = @import("s3.zig");
+const shard_router = @import("shard_router.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -121,6 +122,24 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         try server_mod.serve(gpa, io, .{ .port = port, .ef = ef, .rerank_mult = rerank_mult, .workers = workers, .s3_cfg = s3_cfg }, &w.interface);
+    } else if (std.mem.eql(u8, cmd, "shard-router")) {
+        const a = args.items[1..];
+        var so = shard_router.Options{};
+        if (optOf(a, "--port")) |v| so.port = std.fmt.parseInt(u16, v, 10) catch so.port;
+        if (optOf(a, "--shards")) |v| so.shards = std.fmt.parseInt(usize, v, 10) catch so.shards;
+        if (init.environ_map.get("OPENPUFFER_SHARDS")) |s| {
+            if (optOf(a, "--shards") == null) so.shards = std.fmt.parseInt(usize, s, 10) catch so.shards;
+        }
+        if (optOf(a, "--shard-port-base")) |v| so.shard_port_base = std.fmt.parseInt(u16, v, 10) catch null;
+        if (optOf(a, "--ef")) |v| so.ef = std.fmt.parseInt(u32, v, 10) catch so.ef;
+        if (optOf(a, "--workers")) |v| so.workers = std.fmt.parseInt(usize, v, 10) catch null;
+        if (optOf(a, "--router-workers")) |v| so.router_workers = std.fmt.parseInt(usize, v, 10) catch null;
+        if (optOf(a, "--binary")) |v| so.binary = v;
+        if (optOf(a, "--shard-by")) |v| {
+            if (std.mem.eql(u8, v, "namespace")) so.shard_by = .namespace;
+        }
+        if (hasFlag(a, "--no-spawn")) so.spawn_children = false;
+        try shard_router.serve(gpa, io, so, &w.interface);
     } else {
         try w.interface.writeAll(
             \\openpuffer — fast vector search engine + turbopuffer benchmark
@@ -134,6 +153,10 @@ pub fn main(init: std.process.Init) !void {
             \\  openpuffer serve [--port 8080] [--ef 128] [--rerank-mult 4] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
+            \\  openpuffer shard-router [--shards N] [--port 8800] [--shard-port-base P]
+            \\                  [--ef 128] [--workers N] [--shard-by doc|namespace]
+            \\                  [--binary ./zig-out/bin/openpuffer] [--no-spawn]
+            \\                  (OPENPUFFER_SHARDS is an alias for --shards)
             \\  openpuffer bench-live [--namespace openpuffer-bench-1] [--n 512] [--queries 30] [--dim 768]
             \\                  [--model gemini-embedding-2] [--k 10] [--ef 200]
             \\                  (env: TURBOPUFFER_API_KEY, GEMINI_API_KEY)
