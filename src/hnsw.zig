@@ -523,11 +523,11 @@ pub fn Hnsw(comptime D: type) type {
             }
         };
 
-        /// Drop the last 128 i8 dims on wide vectors (2 AVX-512 chunks).
+        /// The E037 shortcut was measured only for the fixed 1536-d engine
+        /// profile. Other dimensions must keep their full traversal vector;
+        /// applying it to codedb's 512-d profile reduced recall@24 to 0.7549.
         fn searchPrefix(self: *const Self) usize {
-            if (self.dim < 512) return self.dim;
-            const keep = self.dim - 128;
-            return keep & ~@as(usize, 63);
+            return if (self.dim == 1536) 1408 else self.dim;
         }
 
         fn markVisited(visited: *std.DynamicBitSetUnmanaged, alloc: std.mem.Allocator, id: u32) !void {
@@ -1747,6 +1747,20 @@ pub fn Hnsw(comptime D: type) type {
             }
         }
     };
+}
+
+test "search prefix is restricted to its measured 1536-d profile" {
+    const Index = Hnsw(void);
+    var codedb = Index.init(std.testing.allocator, 512, .{});
+    defer codedb.deinit();
+    var embedding = Index.init(std.testing.allocator, 768, .{});
+    defer embedding.deinit();
+    var engine = Index.init(std.testing.allocator, 1536, .{});
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 512), codedb.searchPrefix());
+    try std.testing.expectEqual(@as(usize, 768), embedding.searchPrefix());
+    try std.testing.expectEqual(@as(usize, 1408), engine.searchPrefix());
 }
 
 test "hnsw finds planted neighbor" {
