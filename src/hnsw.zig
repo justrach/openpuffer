@@ -73,7 +73,21 @@ pub fn Hnsw(comptime D: type) type {
         /// post-mmap append buffer (empty until the first insert after load).
         slab_map: ?SlabMap = null,
 
-        entry_point: ?u32 = null,
+        /// Per-node generation for RCU-style neighbor snapshots.
+        /// Even = stable; odd = a writer is replacing that node's adjacency.
+        /// `pushNeighbor` does not bump this (write-then-release-degree is enough).
+        /// Heap-sized to `len()` including mmap-backed ids (zeros on load).
+        nbr_gen: std.ArrayList(u32) = .empty,
+        /// Per-node seqlock for in-place vector updates. Distances retry
+        /// when the generation is odd or changes mid-dot.
+        vec_gen: std.ArrayList(u32) = .empty,
+
+        /// Visible node count. `vectors_flat.items` may be ahead while a
+        /// writer fills a new row; readers use this acquire-load.
+        published: usize = 0,
+        /// Sentinel `maxInt(u32)` = none. Atomic so publish need not take
+        /// the namespace exclusive lock.
+        entry_id: u32 = std.math.maxInt(u32),
         max_level: u32 = 0,
 
         pub const SLAB_MAGIC: u32 = 0x534C4D48; // 'HMLS' le
@@ -96,6 +110,23 @@ pub fn Hnsw(comptime D: type) type {
             hi_nbrs: []u32,
         };
 
+        pub fn entryPoint(self: *const Self) ?u32 {
+            const v = @atomicLoad(u32, &self.entry_id, .acquire);
+            return if (v == std.math.maxInt(u32)) null else v;
+        }
+
+        fn setEntryPoint(self: *Self, id: u32) void {
+            @atomicStore(u32, &self.entry_id, id, .release);
+        }
+
+        pub fn getMaxLevel(self: *const Self) u32 {
+            return @atomicLoad(u32, &self.max_level, .acquire);
+        }
+
+        fn setMaxLevel(self: *Self, lvl: u32) void {
+            @atomicStore(u32, &self.max_level, lvl, .release);
+        }
+
         pub fn init(allocator: std.mem.Allocator, dim: usize, opts: Options) Self {
             return .{
                 .allocator = allocator,
@@ -117,6 +148,8 @@ pub fn Hnsw(comptime D: type) type {
             self.hi_start.deinit(self.allocator);
             self.hi_deg.deinit(self.allocator);
             self.hi_nbrs.deinit(self.allocator);
+            self.nbr_gen.deinit(self.allocator);
+            self.vec_gen.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -125,7 +158,7 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         pub fn len(self: *const Self) usize {
-            return self.mappedCount() + self.qscales.items.len;
+            return @atomicLoad(usize, &self.published, .acquire);
         }
 
         /// True when this index retains the f32 slab (exact rerank / snapshot f32).
@@ -135,6 +168,51 @@ pub fn Hnsw(comptime D: type) type {
 
         pub fn isMmapBacked(self: *const Self) bool {
             return self.slab_map != null;
+        }
+
+        /// True when one more insert will not realloc any packed slab.
+        pub fn hasInsertRoom(self: *const Self, extra: usize) bool {
+            if (self.dim == 0) return false;
+            const heap_n = self.qscales.items.len;
+            const mapped = self.mappedCount();
+            const total = mapped + heap_n + extra;
+            const need_heap = heap_n + extra;
+            if (self.opts.store_f32 and self.vectors_flat.capacity < need_heap * self.dim) return false;
+            if (self.qvecs_flat.capacity < need_heap * self.dim) return false;
+            if (self.qscales.capacity < need_heap) return false;
+            if (self.levels.capacity < need_heap) return false;
+            if (self.l0_deg.capacity < need_heap) return false;
+            if (self.l0_nbrs.capacity < need_heap * self.l0Stride()) return false;
+            if (self.hi_start.capacity < need_heap) return false;
+            if (self.nbr_gen.capacity < total) return false;
+            if (self.vec_gen.capacity < total) return false;
+            const hi_extra = extra * 8;
+            if (self.hi_deg.capacity < self.hi_deg.items.len + hi_extra) return false;
+            if (self.hi_nbrs.capacity < self.hi_nbrs.items.len + hi_extra * self.hiStride()) return false;
+            return true;
+        }
+
+        /// Grow slabs. Caller must hold exclusive so live readers cannot
+        /// hold dangling `items` pointers across the realloc.
+        pub fn ensureInsertRoom(self: *Self, extra: usize) !void {
+            const alloc = self.allocator;
+            const heap_n = self.qscales.items.len;
+            const mapped = self.mappedCount();
+            const total = mapped + heap_n + extra;
+            const need_heap = heap_n + extra;
+            if (self.opts.store_f32) {
+                try self.vectors_flat.ensureTotalCapacity(alloc, need_heap * @max(self.dim, 1));
+            }
+            try self.qvecs_flat.ensureTotalCapacity(alloc, need_heap * @max(self.dim, 1));
+            try self.qscales.ensureTotalCapacity(alloc, need_heap);
+            try self.levels.ensureTotalCapacity(alloc, need_heap);
+            try self.l0_deg.ensureTotalCapacity(alloc, need_heap);
+            try self.l0_nbrs.ensureTotalCapacity(alloc, need_heap * self.l0Stride());
+            try self.hi_start.ensureTotalCapacity(alloc, need_heap);
+            try self.nbr_gen.ensureTotalCapacity(alloc, total);
+            try self.vec_gen.ensureTotalCapacity(alloc, total);
+            try self.hi_deg.ensureTotalCapacity(alloc, self.hi_deg.items.len + extra * 8);
+            try self.hi_nbrs.ensureTotalCapacity(alloc, self.hi_nbrs.items.len + extra * 8 * self.hiStride());
         }
 
         inline fn m0(self: *const Self) usize {
@@ -252,24 +330,28 @@ pub fn Hnsw(comptime D: type) type {
             return self.neighborSlotsConst(id, layer)[0..deg];
         }
 
-        fn degree(self: *const Self, id: u32, layer: u32) usize {
+        fn degPtr(self: *const Self, id: u32, layer: u32) *u16 {
             if (layer == 0) {
                 if (self.slab_map) |m| {
-                    if (id < m.n) return m.l0_deg[id];
-                    return self.l0_deg.items[self.heapId(id)];
+                    if (id < m.n) return &m.l0_deg[id];
+                    return @constCast(&self.l0_deg.items[self.heapId(id)]);
                 }
-                return self.l0_deg.items[id];
+                return @constCast(&self.l0_deg.items[id]);
             }
             if (self.slab_map) |m| {
                 if (id < m.n) {
                     const slot = m.hi_start[id] + (layer - 1);
-                    return m.hi_deg[slot];
+                    return &m.hi_deg[slot];
                 }
                 const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
-                return self.hi_deg.items[slot];
+                return @constCast(&self.hi_deg.items[slot]);
             }
             const slot = self.hi_start.items[id] + (layer - 1);
-            return self.hi_deg.items[slot];
+            return @constCast(&self.hi_deg.items[slot]);
+        }
+
+        fn degree(self: *const Self, id: u32, layer: u32) usize {
+            return @atomicLoad(u16, self.degPtr(id, layer), .acquire);
         }
 
         fn neighborSlotsConst(self: *const Self, id: u32, layer: u32) []const u32 {
@@ -333,27 +415,27 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn setDegree(self: *Self, id: u32, layer: u32, deg: u16) void {
-            if (layer == 0) {
-                if (self.slab_map) |m| {
-                    if (id < m.n) {
-                        m.l0_deg[id] = deg;
-                        return;
-                    }
-                    self.l0_deg.items[self.heapId(id)] = deg;
-                    return;
+            @atomicStore(u16, self.degPtr(id, layer), deg, .release);
+        }
+
+        /// Copy a stable neighbor list. Retries if a writer is mid-replace
+        /// (`nbr_gen` odd or changed). `pushNeighbor` is wait-free for readers:
+        /// it writes the slack slot first, then publishes degree.
+        fn snapshotNeighbors(self: *const Self, id: u32, layer: u32, buf: []u32) []const u32 {
+            var spins: u32 = 0;
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.nbr_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    spins +%= 1;
+                    if (spins > 8) std.atomic.spinLoopHint();
+                    continue;
                 }
-                self.l0_deg.items[id] = deg;
-            } else if (self.slab_map) |m| {
-                if (id < m.n) {
-                    const slot = m.hi_start[id] + (layer - 1);
-                    m.hi_deg[slot] = deg;
-                } else {
-                    const slot = self.hi_start.items[self.heapId(id)] + (layer - 1);
-                    self.hi_deg.items[slot] = deg;
-                }
-            } else {
-                const slot = self.hi_start.items[id] + (layer - 1);
-                self.hi_deg.items[slot] = deg;
+                const deg = self.degree(id, layer);
+                const slots = self.neighborSlotsConst(id, layer);
+                const n = @min(deg, @min(buf.len, slots.len));
+                if (n > 0) @memcpy(buf[0..n], slots[0..n]);
+                const g2 = @atomicLoad(u32, &self.nbr_gen.items[id], .acquire);
+                if (g1 == g2) return buf[0..n];
             }
         }
 
@@ -364,9 +446,12 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         fn replaceNeighbors(self: *Self, id: u32, layer: u32, ids: []const u32) void {
+            const g = @atomicLoad(u32, &self.nbr_gen.items[id], .monotonic);
+            @atomicStore(u32, &self.nbr_gen.items[id], g +% 1, .release);
             const slots = self.neighborSlots(id, layer);
             @memcpy(slots[0..ids.len], ids);
             self.setDegree(id, layer, @intCast(ids.len));
+            @atomicStore(u32, &self.nbr_gen.items[id], g +% 2, .release);
         }
 
         fn randomLevel(self: *Self) u32 {
@@ -381,7 +466,16 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         inline fn distTo(self: *const Self, q: []const f32, id: u32) f32 {
-            return vecmath.cosineDistance(q, self.vectorConst(id));
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const d = vecmath.cosineDistance(q, self.vectorConst(id));
+                const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if (g1 == g2) return d;
+            }
         }
 
         /// Pairwise distance used while splicing the graph. Exact when f32
@@ -394,9 +488,17 @@ pub fn Hnsw(comptime D: type) type {
         inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
             // stored vectors are unit-norm; a ~= aq * scale, so
             // cos(a,b) ~= dot(aq,bq) * qs * scale_b
-            const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
-                qs * self.qscaleOf(id);
-            return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
+                    qs * self.qscaleOf(id);
+                const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if (g1 == g2) return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+            }
         }
 
         /// Distance contexts let searchLayer run on either exact or quantized math.
@@ -415,6 +517,24 @@ pub fn Hnsw(comptime D: type) type {
                 return d.s.distQ(d.qq, d.qs, id);
             }
         };
+
+        fn markVisited(visited: *std.DynamicBitSetUnmanaged, alloc: std.mem.Allocator, id: u32) !void {
+            if (id >= visited.capacity()) {
+                try visited.resize(alloc, @max(@as(usize, id) + 256, visited.capacity() * 2), false);
+            }
+            visited.set(id);
+        }
+
+        fn alreadyVisited(visited: *std.DynamicBitSetUnmanaged, alloc: std.mem.Allocator, id: u32) !bool {
+            if (id >= visited.capacity()) {
+                try visited.resize(alloc, @max(@as(usize, id) + 256, visited.capacity() * 2), false);
+                visited.set(id);
+                return false;
+            }
+            if (visited.isSet(id)) return true;
+            visited.set(id);
+            return false;
+        }
 
         /// greedy search on a single layer; `ef` bounds result set size.
         fn searchLayer(
@@ -449,7 +569,7 @@ pub fn Hnsw(comptime D: type) type {
             defer results.deinit(alloc);
 
             for (entry_points) |c| {
-                visited.set(c.id);
+                try markVisited(visited, alloc, c.id);
                 try candidates.push(alloc, c);
                 try results.push(alloc, c);
             }
@@ -460,17 +580,18 @@ pub fn Hnsw(comptime D: type) type {
                 if (c.d > worst and results.count() >= ef) break;
 
                 if (layer >= self.layerCount(c.id)) {
-                    std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.layerCount(c.id), layer, self.max_level, self.entry_point, if (self.entry_point) |e| self.layerCount(e) else 0 });
+                    std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.layerCount(c.id), layer, self.getMaxLevel(), self.entryPoint(), if (self.entryPoint()) |e| self.layerCount(e) else 0 });
                     @panic("hnsw invariant broken");
                 }
-                const nbrs = self.neighbors(c.id, layer);
+                var nbr_buf: [64]u32 = undefined;
+                const nbrs = self.snapshotNeighbors(c.id, layer, &nbr_buf);
                 for (nbrs, 0..) |nid, ni| {
                     // one-ahead software prefetch: the next neighbor's int8
                     // vector starts its memory fetch while we dot this one.
                     // Skip already-visited neighbors (wasted prefetches).
                     if (ni + 1 < nbrs.len) {
                         const nxt = nbrs[ni + 1];
-                        if (!visited.isSet(nxt)) {
+                        if (nxt >= visited.capacity() or !visited.isSet(nxt)) {
                             @prefetch(self.qvecConst(nxt).ptr, .{
                                 .rw = .read,
                                 .locality = 3,
@@ -478,8 +599,7 @@ pub fn Hnsw(comptime D: type) type {
                             });
                         }
                     }
-                    if (visited.isSet(nid)) continue;
-                    visited.set(nid);
+                    if (try alreadyVisited(visited, alloc, nid)) continue;
                     const d = dist_ctx.dist(nid);
                     const w = if (results.count() > 0) results.peek().?.d else std.math.floatMax(f32);
                     if (results.count() < ef or d < w) {
@@ -534,6 +654,7 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         /// Replace the vector at `id` in place (requantize; graph links stay).
+        /// Safe under a shared lock: seqlock so in-flight dots retry.
         pub fn update(self: *Self, id: u32, vector_in: []const f32) !void {
             if (id >= self.len()) return error.NotFound;
             if (vector_in.len != self.dim) return error.DimensionMismatch;
@@ -546,6 +667,8 @@ pub fn Hnsw(comptime D: type) type {
                 heap_tmp = try self.allocator.alloc(f32, self.dim);
                 break :blk heap_tmp.?;
             };
+            const g = @atomicLoad(u32, &self.vec_gen.items[id], .monotonic);
+            @atomicStore(u32, &self.vec_gen.items[id], g +% 1, .release);
             @memcpy(copy, vector_in);
             vecmath.normalize(copy);
             var amax: f32 = 0;
@@ -558,6 +681,7 @@ pub fn Hnsw(comptime D: type) type {
                 for (copy, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
             }
             self.setQscaleOf(id, scale);
+            @atomicStore(u32, &self.vec_gen.items[id], g +% 2, .release);
         }
 
         /// Neighbor picks for one insert. `copy`/`q8` are owned by the index
@@ -572,10 +696,10 @@ pub fn Hnsw(comptime D: type) type {
             scratch: std.mem.Allocator,
 
             pub fn discard(self: InsertPlan, index_alloc: std.mem.Allocator) void {
-                index_alloc.free(self.copy);
-                index_alloc.free(self.q8);
+                if (self.copy.len != 0) index_alloc.free(self.copy);
+                if (self.q8.len != 0) index_alloc.free(self.q8);
                 for (self.layers) |ids| self.scratch.free(ids);
-                self.scratch.free(self.layers);
+                if (self.layers.len != 0) self.scratch.free(self.layers);
             }
         };
 
@@ -600,7 +724,7 @@ pub fn Hnsw(comptime D: type) type {
 
         fn appendRecord(self: *Self, copy: []const f32, q8: []const i8, scale: f32, level: u32) !u32 {
             const alloc = self.allocator;
-            const id: u32 = @intCast(self.len());
+            const id: u32 = @intCast(self.mappedCount() + self.qscales.items.len);
             if (self.opts.store_f32) {
                 try self.vectors_flat.appendSlice(alloc, copy);
             }
@@ -611,6 +735,8 @@ pub fn Hnsw(comptime D: type) type {
             const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
             @memset(l0_pad, 0);
             try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
+            try self.nbr_gen.append(alloc, 0);
+            try self.vec_gen.append(alloc, 0);
             if (level > 0) {
                 const slots: usize = level;
                 const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
@@ -618,6 +744,7 @@ pub fn Hnsw(comptime D: type) type {
                 const nbrs = try self.hi_nbrs.addManyAsSlice(alloc, slots * self.hiStride());
                 @memset(nbrs, 0);
             }
+            @atomicStore(usize, &self.published, @as(usize, id) + 1, .release);
             return id;
         }
 
@@ -630,20 +757,21 @@ pub fn Hnsw(comptime D: type) type {
                 self.allocator.free(q.copy);
                 self.allocator.free(q.q8);
             }
-            const n_layers: usize = @as(usize, @min(level, self.max_level)) + 1;
+            const n_layers: usize = @as(usize, @min(level, self.getMaxLevel())) + 1;
             const layers = try scratch.alloc([]u32, n_layers);
             errdefer scratch.free(layers);
             for (layers) |*slot| slot.* = &.{};
 
-            if (self.entry_point == null) {
+            if (self.entryPoint() == null) {
                 return .{ .copy = q.copy, .q8 = q.q8, .scale = q.scale, .level = level, .layers = layers, .scratch = scratch };
             }
 
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len());
+            var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len() + 2048);
             defer visited.deinit(scratch);
             const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale };
-            var ep: [1]Candidate = .{.{ .id = self.entry_point.?, .d = qctx.dist(self.entry_point.?) }};
-            var cur = self.max_level;
+            const ep_id = self.entryPoint().?;
+            var ep: [1]Candidate = .{.{ .id = ep_id, .d = qctx.dist(ep_id) }};
+            var cur = self.getMaxLevel();
             while (cur > level) : (cur -= 1) {
                 var res = try self.searchLayer(qctx, &ep, 1, cur, &visited, scratch);
                 defer res.deinit(scratch);
@@ -670,14 +798,49 @@ pub fn Hnsw(comptime D: type) type {
             return .{ .copy = q.copy, .q8 = q.q8, .scale = q.scale, .level = level, .layers = layers, .scratch = scratch };
         }
 
-        /// Splice a planned node into the graph. Caller must hold exclusive lock.
-        /// Copies `plan.copy` / `plan.q8` into the flat pools and frees them.
-        pub fn commitInsert(self: *Self, plan: InsertPlan) !u32 {
+        /// Publish a planned node: append the payload row, write outgoing
+        /// edges, and (if needed) swing `entry_point`. Does not splice
+        /// back-edges. Caller must hold exclusive lock so ArrayList growth
+        /// cannot race readers. Frees `plan.copy` / `plan.q8`; leaves
+        /// `plan.layers` for `spliceBackEdges`.
+        pub fn publishInsert(self: *Self, plan: *InsertPlan) !u32 {
             const alloc = self.allocator;
             const id = try self.appendRecord(plan.copy, plan.q8, plan.scale, plan.level);
             alloc.free(plan.copy);
             alloc.free(plan.q8);
+            plan.copy = &.{};
+            plan.q8 = &.{};
 
+            const connect_n = @min(plan.layers.len, self.layerCount(id));
+            var layer: u32 = 0;
+            while (layer < connect_n) : (layer += 1) {
+                for (plan.layers[layer]) |nid| {
+                    if (nid >= self.len() or layer >= self.layerCount(nid)) continue;
+                    self.pushNeighbor(id, layer, nid);
+                }
+            }
+            return id;
+        }
+
+        /// Swing entry point after the new row is mapped in `doc_ids`.
+        pub fn publishEntry(self: *Self, id: u32, level: u32) void {
+            if (self.entryPoint() == null or level > self.getMaxLevel()) {
+                self.setMaxLevel(level);
+                self.setEntryPoint(id);
+            }
+        }
+
+        /// Splice back-edges + prune. Safe under a shared lock: adjacency
+        /// writes are generation-published so `snapshotNeighbors` retries
+        /// instead of walking a torn list. Does not grow the packed arrays.
+        /// Always frees `plan.layers`.
+        pub fn spliceBackEdges(self: *Self, plan: *InsertPlan, id: u32) !void {
+            defer {
+                for (plan.layers) |ids| plan.scratch.free(ids);
+                if (plan.layers.len != 0) plan.scratch.free(plan.layers);
+                plan.layers = &.{};
+            }
+            const alloc = self.allocator;
             const max_m0: u32 = @intCast(self.m0());
             const connect_n = @min(plan.layers.len, self.layerCount(id));
             var layer: u32 = 0;
@@ -685,12 +848,12 @@ pub fn Hnsw(comptime D: type) type {
                 const max_m: u32 = if (layer == 0) max_m0 else self.opts.m;
                 for (plan.layers[layer]) |nid| {
                     if (nid >= self.len() or layer >= self.layerCount(nid)) continue;
-                    self.pushNeighbor(id, layer, nid);
                     self.pushNeighbor(nid, layer, id);
                     if (self.degree(nid, layer) > max_m) {
                         var cands: std.ArrayList(Candidate) = .empty;
                         defer cands.deinit(alloc);
-                        const back = self.neighbors(nid, layer);
+                        var back_buf: [64]u32 = undefined;
+                        const back = self.snapshotNeighbors(nid, layer, &back_buf);
                         try cands.ensureTotalCapacity(alloc, back.len);
                         for (back) |n| {
                             cands.appendAssumeCapacity(.{ .id = n, .d = self.distPair(nid, n) });
@@ -710,13 +873,15 @@ pub fn Hnsw(comptime D: type) type {
                     }
                 }
             }
-            for (plan.layers) |ids| plan.scratch.free(ids);
-            plan.scratch.free(plan.layers);
+        }
 
-            if (self.entry_point == null or plan.level > self.max_level) {
-                self.max_level = plan.level;
-                self.entry_point = id;
-            }
+        /// Splice a planned node into the graph (publish + back-edges).
+        /// Single-threaded / exclusive-lock callers (tests, `insert`).
+        pub fn commitInsert(self: *Self, plan: InsertPlan) !u32 {
+            var p = plan;
+            const id = try self.publishInsert(&p);
+            self.publishEntry(id, p.level);
+            try self.spliceBackEdges(&p, id);
             return id;
         }
 
@@ -753,7 +918,7 @@ pub fn Hnsw(comptime D: type) type {
             alloc: std.mem.Allocator,
         ) ![]SearchResult {
             if (query.len != self.dim) return error.DimensionMismatch;
-            const ep_id = self.entry_point orelse return alloc.alloc(SearchResult, 0);
+            const ep_id = self.entryPoint() orelse return alloc.alloc(SearchResult, 0);
             var norm_buf: [512]f32 = undefined;
             var heap_nq: ?[]f32 = null;
             defer if (heap_nq) |h| alloc.free(h);
@@ -790,11 +955,11 @@ pub fn Hnsw(comptime D: type) type {
             };
             const ctx = QDist{ .s = self, .qq = qq, .qs = qs };
 
-            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len());
+            var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);
 
             var ep: [1]Candidate = .{.{ .id = ep_id, .d = ctx.dist(ep_id) }};
-            var cur = self.max_level;
+            var cur = self.getMaxLevel();
             while (cur > 0) : (cur -= 1) {
                 var res = try self.searchLayer(ctx, &ep, 1, cur, &visited, alloc);
                 defer res.deinit(alloc);
@@ -879,8 +1044,8 @@ pub fn Hnsw(comptime D: type) type {
             wr.u32le(buf, &i, version);
             wr.u64le(buf, &i, self.dim);
             wr.u64le(buf, &i, self.len());
-            wr.u32le(buf, &i, self.entry_point orelse std.math.maxInt(u32));
-            wr.u32le(buf, &i, self.max_level);
+            wr.u32le(buf, &i, self.entryPoint() orelse std.math.maxInt(u32));
+            wr.u32le(buf, &i, self.getMaxLevel());
             wr.u32le(buf, &i, self.opts.m);
             wr.u32le(buf, &i, self.opts.m0_factor);
             wr.u32le(buf, &i, self.opts.ef_construction);
@@ -970,8 +1135,12 @@ pub fn Hnsw(comptime D: type) type {
             self.opts.m0_factor = m0_factor;
             self.opts.ef_construction = efc;
             self.opts.store_f32 = has_f32;
-            self.max_level = max_level;
-            self.entry_point = if (ep_raw == std.math.maxInt(u32)) null else ep_raw;
+            self.setMaxLevel(max_level);
+            if (ep_raw == std.math.maxInt(u32)) {
+                @atomicStore(u32, &self.entry_id, std.math.maxInt(u32), .release);
+            } else {
+                self.setEntryPoint(ep_raw);
+            }
 
             const alloc = self.allocator;
             try self.levels.ensureTotalCapacity(alloc, n);
@@ -981,6 +1150,8 @@ pub fn Hnsw(comptime D: type) type {
             try self.l0_deg.ensureTotalCapacity(alloc, n);
             try self.l0_nbrs.ensureTotalCapacity(alloc, n * self.l0Stride());
             try self.hi_start.ensureTotalCapacity(alloc, n);
+            try self.nbr_gen.ensureTotalCapacity(alloc, n);
+            try self.vec_gen.ensureTotalCapacity(alloc, n);
 
             for (0..n) |_| self.levels.appendAssumeCapacity(try rd.u32le(bytes, &i));
             for (0..n) |_| {
@@ -1007,6 +1178,8 @@ pub fn Hnsw(comptime D: type) type {
                 if (id >= self.levels.items.len) return error.Truncated;
                 self.levels.items[id] = level;
                 self.l0_deg.appendAssumeCapacity(0);
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
                 const l0_pad = try self.l0_nbrs.addManyAsSlice(alloc, self.l0Stride());
                 @memset(l0_pad, 0);
                 try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
@@ -1029,6 +1202,7 @@ pub fn Hnsw(comptime D: type) type {
                 }
             }
             if (i != bytes.len) return error.TrailingBytes;
+            @atomicStore(usize, &self.published, n, .release);
         }
 
         pub fn pageAlign(n: usize) usize {
@@ -1099,8 +1273,8 @@ pub fn Hnsw(comptime D: type) type {
             std.mem.writeInt(u32, buf[4..8], SLAB_VERSION, .little);
             std.mem.writeInt(u64, buf[8..16], layout.dim, .little);
             std.mem.writeInt(u64, buf[16..24], layout.n, .little);
-            std.mem.writeInt(u32, buf[24..28], self.entry_point orelse 0, .little);
-            std.mem.writeInt(u32, buf[28..32], self.max_level, .little);
+            std.mem.writeInt(u32, buf[24..28], self.entryPoint() orelse 0, .little);
+            std.mem.writeInt(u32, buf[28..32], self.getMaxLevel(), .little);
             std.mem.writeInt(u32, buf[32..36], self.opts.m, .little);
             std.mem.writeInt(u32, buf[36..40], self.opts.m0_factor, .little);
             std.mem.writeInt(u32, buf[40..44], self.opts.ef_construction, .little);
@@ -1303,7 +1477,11 @@ pub fn Hnsw(comptime D: type) type {
         pub fn writeBlankSlabs(path: []const u8, n: usize, dim: usize, opts: Options) !void {
             var index = Self.init(std.heap.page_allocator, dim, opts);
             defer index.deinit();
-            index.entry_point = if (n == 0) null else 0;
+            if (n == 0) {
+                @atomicStore(u32, &index.entry_id, std.math.maxInt(u32), .release);
+            } else {
+                index.setEntryPoint(0);
+            }
             const layout = SlabLayout.compute(n, dim, 0, index.l0Stride(), index.hiStride());
             var tmp_buf: [posix.PATH_MAX]u8 = undefined;
             const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
@@ -1355,8 +1533,13 @@ pub fn Hnsw(comptime D: type) type {
             self.opts.m = parsed.m;
             self.opts.m0_factor = parsed.m0_factor;
             self.opts.ef_construction = parsed.efc;
-            self.max_level = parsed.max_level;
-            self.entry_point = if (L.n == 0) null else parsed.entry;
+            self.setMaxLevel(parsed.max_level);
+            if (L.n == 0) {
+                @atomicStore(u32, &self.entry_id, std.math.maxInt(u32), .release);
+            } else {
+                self.setEntryPoint(parsed.entry);
+            }
+            @atomicStore(usize, &self.published, L.n, .release);
 
             const base = hmls_off;
             const l0_stride = self.l0Stride();
@@ -1424,6 +1607,14 @@ pub fn Hnsw(comptime D: type) type {
             errdefer posix.munmap(mapped);
             const off = try hmlsOffsetIn(mapped);
             try self.attachMapped(mapped, off);
+            const n = self.mappedCount();
+            try self.nbr_gen.ensureTotalCapacity(self.allocator, n);
+            try self.vec_gen.ensureTotalCapacity(self.allocator, n);
+            var gi: usize = 0;
+            while (gi < n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
 
         fn copySlabInto(comptime T: type, list: *std.ArrayList(T), alloc: std.mem.Allocator, src: []const T) !void {
@@ -1443,8 +1634,13 @@ pub fn Hnsw(comptime D: type) type {
             self.opts.m = parsed.m;
             self.opts.m0_factor = parsed.m0_factor;
             self.opts.ef_construction = parsed.efc;
-            self.max_level = parsed.max_level;
-            self.entry_point = if (L.n == 0) null else parsed.entry;
+            self.setMaxLevel(parsed.max_level);
+            if (L.n == 0) {
+                @atomicStore(u32, &self.entry_id, std.math.maxInt(u32), .release);
+            } else {
+                self.setEntryPoint(parsed.entry);
+            }
+            @atomicStore(usize, &self.published, L.n, .release);
             if (off + L.file_len > bytes.len) return error.Truncated;
 
             const alloc = self.allocator;
@@ -1469,6 +1665,13 @@ pub fn Hnsw(comptime D: type) type {
             try copySlabInto(u32, &self.hi_start, alloc, try take.sl(u32, base, L.hi_start_off, L.n));
             try copySlabInto(u16, &self.hi_deg, alloc, try take.sl(u16, base, L.hi_deg_off, L.hi_slots));
             try copySlabInto(u32, &self.hi_nbrs, alloc, try take.sl(u32, base, L.hi_nbrs_off, L.hi_slots * hi_stride));
+            try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            try self.vec_gen.ensureTotalCapacity(alloc, L.n);
+            var gi: usize = 0;
+            while (gi < L.n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
 
         /// Read an HMLS (or persist v2) file into heap ArrayLists. No mmap.
@@ -1488,8 +1691,13 @@ pub fn Hnsw(comptime D: type) type {
             self.opts.m = parsed.m;
             self.opts.m0_factor = parsed.m0_factor;
             self.opts.ef_construction = parsed.efc;
-            self.max_level = parsed.max_level;
-            self.entry_point = if (L.n == 0) null else parsed.entry;
+            self.setMaxLevel(parsed.max_level);
+            if (L.n == 0) {
+                @atomicStore(u32, &self.entry_id, std.math.maxInt(u32), .release);
+            } else {
+                self.setEntryPoint(parsed.entry);
+            }
+            @atomicStore(usize, &self.published, L.n, .release);
 
             const alloc = self.allocator;
             const l0_stride = self.l0Stride();
@@ -1511,6 +1719,13 @@ pub fn Hnsw(comptime D: type) type {
             try readInto.go(u32, &self.hi_start, alloc, fd, off + L.hi_start_off, L.n);
             try readInto.go(u16, &self.hi_deg, alloc, fd, off + L.hi_deg_off, L.hi_slots);
             try readInto.go(u32, &self.hi_nbrs, alloc, fd, off + L.hi_nbrs_off, L.hi_slots * hi_stride);
+            try self.nbr_gen.ensureTotalCapacity(alloc, L.n);
+            try self.vec_gen.ensureTotalCapacity(alloc, L.n);
+            var gi: usize = 0;
+            while (gi < L.n) : (gi += 1) {
+                self.nbr_gen.appendAssumeCapacity(0);
+                self.vec_gen.appendAssumeCapacity(0);
+            }
         }
     };
 }
@@ -1568,8 +1783,8 @@ test "layer-0 connectivity and recall on clustered data" {
     var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
     defer visited.deinit(alloc);
     var queue: std.ArrayList(u32) = .empty;
-    try queue.append(alloc, index.entry_point.?);
-    visited.set(index.entry_point.?);
+    try queue.append(alloc, index.entryPoint().?);
+    visited.set(index.entryPoint().?);
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const id = queue.items[head];
@@ -1666,8 +1881,8 @@ test "hnsw serialize/load preserves neighbors and search" {
     try loaded.load(blob);
 
     try std.testing.expectEqual(index.len(), loaded.len());
-    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
-    try std.testing.expectEqual(index.max_level, loaded.max_level);
+    try std.testing.expectEqual(index.entryPoint(), loaded.entryPoint());
+    try std.testing.expectEqual(index.getMaxLevel(), loaded.getMaxLevel());
     var id: u32 = 0;
     while (id < index.len()) : (id += 1) {
         try std.testing.expectEqual(index.layerCount(id), loaded.layerCount(id));
@@ -1743,7 +1958,7 @@ test "hnsw store_f32=false serialize/load and update" {
     try loaded.load(blob);
     try std.testing.expect(!loaded.hasStoredF32());
     try std.testing.expectEqual(index.len(), loaded.len());
-    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    try std.testing.expectEqual(index.entryPoint(), loaded.entryPoint());
     try std.testing.expectEqual(@as(usize, 0), loaded.vectors_flat.items.len);
     var id: u32 = 0;
     while (id < index.len()) : (id += 1) {
@@ -1807,7 +2022,7 @@ test "hnsw slab mmap reopen + insert append buffer" {
     try loaded.loadMmap(path);
     try std.testing.expect(loaded.isMmapBacked());
     try std.testing.expectEqual(index.len(), loaded.len());
-    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    try std.testing.expectEqual(index.entryPoint(), loaded.entryPoint());
     var id: u32 = 0;
     while (id < index.len()) : (id += 1) {
         try std.testing.expectEqual(index.layerCount(id), loaded.layerCount(id));
@@ -1880,5 +2095,51 @@ test "slab mmap vs alloc RSS (blank slabs)" {
             try std.testing.expect(mmap_delta * 4 < alloc_delta);
             try std.testing.expect(alloc_delta + 1024 >= (c.n * c.dim * 5) / 1024 / 2);
         }
+    }
+}
+
+test "publishInsert then spliceBackEdges matches commitInsert" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const dim = 8;
+    var rng = std.Random.DefaultPrng.init(3);
+
+    var via_commit = Hnsw(void).init(alloc, dim, .{ .seed = 99 });
+    defer via_commit.deinit();
+    var via_split = Hnsw(void).init(alloc, dim, .{ .seed = 99 });
+    defer via_split.deinit();
+
+    var v: [dim]f32 = undefined;
+    for (0..40) |_| {
+        for (&v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try via_commit.insert(&v);
+        _ = try via_split.insert(&v);
+    }
+    for (&v) |*x| x.* = rng.random().floatNorm(f32);
+    const level = via_split.nextLevel();
+    _ = via_commit.nextLevel();
+    var plan_split = try via_split.planInsert(&v, level, alloc);
+    const plan_commit = try via_commit.planInsert(&v, level, alloc);
+    const id = try via_split.publishInsert(&plan_split);
+    try via_split.spliceBackEdges(&plan_split, id);
+    _ = try via_commit.commitInsert(plan_commit);
+
+    try std.testing.expectEqual(via_commit.len(), via_split.len());
+    try std.testing.expectEqual(via_commit.entryPoint(), via_split.entryPoint());
+    var nid: u32 = 0;
+    while (nid < via_commit.len()) : (nid += 1) {
+        var layer: u32 = 0;
+        while (layer < via_commit.layerCount(nid)) : (layer += 1) {
+            try std.testing.expectEqualSlices(u32, via_commit.neighbors(nid, layer), via_split.neighbors(nid, layer));
+        }
+    }
+    const q = via_split.vectorConst(id);
+    const a = try via_commit.search(q, 5, 32, alloc);
+    const b = try via_split.search(q, 5, 32, alloc);
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| {
+        try std.testing.expectEqual(x.id, y.id);
+        try std.testing.expectApproxEqAbs(x.distance, y.distance, 1e-6);
     }
 }

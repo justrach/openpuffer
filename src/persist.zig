@@ -397,7 +397,7 @@ test "binary snapshot header roundtrip" {
     defer loaded.deinit();
     try loaded.load(body[hdr.graph_off..]);
     try std.testing.expectEqual(index.len(), loaded.len());
-    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    try std.testing.expectEqual(index.entryPoint(), loaded.entryPoint());
 }
 
 test "slab snapshot file mmap reopen" {
@@ -429,5 +429,5 @@ test "slab snapshot file mmap reopen" {
     try loaded.loadMmap(path);
     try std.testing.expect(loaded.isMmapBacked());
     try std.testing.expectEqual(index.len(), loaded.len());
-    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    try std.testing.expectEqual(index.entryPoint(), loaded.entryPoint());
 }

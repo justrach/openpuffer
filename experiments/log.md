@@ -58,6 +58,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 | E026 | 2026-08-25 | Pareto surface at scale is an (n, ef, distribution) problem, not a 20k p50 micro-opt; expose the existing rerank_mult knob and one-build ef/clustered sweeps so we can find the smallest ef that holds recall@10 ≥ 0.30 | CLI `--rerank-mult` / `--ef-sweep` / `--clustered` (mixture-of-Gaussians); serve + per-query `rerank_mult`; search() default still 4 | src/hnsw.zig src/main.zig src/server.zig tools/qa_bench.py | pass | 0.639 | 0.3130 | +11% vs E025 run2 0.575 (within flatten-host noise; not a p50 claim) | keep | knobs | KNOB/DOCS keep. Scored metric unchanged (searchAdvanced(..., 4) ≡ search()). Scale n×ef lives in the Pareto section below — do not read 1M/200k p50s from this cell. Random cannot hold 0.30 at 200k even at ef=1024; clustered holds 0.98–1.00 from ef=64 through 200k. Flatten 1M `--no-exact`: RSS **7481 MiB** / ef=128 p50 **1.410 ms** (old layout 11153 MiB / 12.7 ms). |
 | E027 | 2026-08-25 | drop the hot-path f32 copy (optional store_f32 / `--no-f32`) so 2M×1536 can fit on 16 GiB after E025 flatten | Options.store_f32 default true; `--no-f32` skips f32 slab; int8 traversal; rerank only if f32 present; serialize v2 omits f32, load still accepts v1 | src/hnsw.zig src/main.zig | pass | 0.679 | 0.3105 | +18% vs E022 0.575 (not a p50 claim) | keep | memory | MEMORY keep. Scored command unchanged (default still stores f32). `--no-f32` 20k recall **0.3100** (−0.0005). RSS `--no-exact`: 50k 375→**82** MiB; 200k 1689→**323** MiB. 2M `--no-exact --no-f32 --ef 128` **fits**: post-build **3222 MiB** (p50 1.760 ms — Scale section only, not this cell / not results.svg). Flatten 1M f32+i8 was 7481 MiB; dropping f32 is the ~5.7 GiB save. |
 | E028 | 2026-08-26 | mmap the flat HNSW slabs so a snapshot reopen is demand-paged (no copy-in of vectors_flat / qvecs_flat / packed CSR) | HMLS slab file; POSIX mmap MAP_PRIVATE; heap ArrayLists are the post-mmap append buffer; persist SNAP v2 envelope + page-aligned HMLS; atomic tmp+fsync+rename | src/hnsw.zig src/persist.zig | pass | — | — | — | keep | memory | MEMORY keep: MAP_PRIVATE + heap append. Reopen RSS ~0.8 MiB vs ~1.5 GiB alloc. load-via-mmap vs load-via-alloc (blank slabs, dim=1536): n=50k **Δ0.0 vs Δ373.2 MiB**; n=200k **Δ0.0 vs Δ1492.7 MiB**. Touching one mapped row stays Δ0.0. Snapshot file is never written by load/insert. Combined with E027 drop-f32 on GRAPH serialize. No NVMe/SPDK/ZNS. |
+| E029 | 2026-08-26 | remaining exclusive splice still blocks lockShared queries; publish node with a generation / reserved-slab RCU so mixed query p50 does not track write p50 | publishInsert + spliceBackEdges; nbr_gen/vec_gen seqlocks; exclusive only on slab grow; splice_mu publish; snapshot waits unspliced | src/hnsw.zig src/server.zig src/persist.zig tools/mixed_bench.py | pass | — | — | serve (not engine) | keep | serve | SERVING keep. Chart not regenerated — do not copy mixed HTTP p50 into this cell or results.svg. Mixed idle **2.08 ms** / mixed **3.78 ms (1.82×)** vs PR #3 2.31 / 5.17 (2.24×). See Mixed live section. |
 
 ## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
 
@@ -316,3 +317,26 @@ free latency win on one 4-core box at modest n.
 Verdict: the path works. Use it when one process cannot hold the
 vectors (2M, or 1M + room for other things). Do not turn it on at 8k
 expecting a p50 win.
+
+## Mixed live (serve track) — 2026-08-25
+
+Not an E-row p50. Do not copy these HTTP numbers into the ledger table
+or `results.svg` engine cells.
+
+PR #3 (lock-split still exclusive for the whole splice), n=8000 dim=1536
+ef=128, batch=1, 4-core Xeon:
+
+| phase | query p50 | query p95 | QPS | write p50 | errors |
+|---|---|---|---|---|---|
+| query-only | 2.31 ms | 5.65 ms | 1238 | — | 0 |
+| mixed | 5.17 ms (2.24×) | 11.65 ms | 635 | 5.56 ms | 0 |
+
+E029 (this branch) — `python3 tools/mixed_bench.py --n 8000 --dim 1536 --seconds 8`
+(4-core Xeon, flatten + ef=128, batch=1, 4 query + 1 insert + 1 update):
+
+| phase | query p50 | query p95 | QPS | write p50 | insert p50 | update p50 | errors |
+|---|---|---|---|---|---|---|---|
+| query-only | **2.08 ms** | 4.94 ms | 1381 | — | — | — | 0 |
+| mixed | **3.78 ms (1.82×)** | 8.49 ms | 856 | 5.01 ms | 5.62 ms | 4.56 ms | 0 |
+
+Vs PR #3 (same command, lock-split still exclusive for the whole splice): idle 2.31 / mixed **5.17 (2.24×)** / write 5.56. Mixed query p50 no longer matches write p50 (3.78 vs 5.01). Leftover 1.82× is 4-core DRAM: insert `planInsert` walks the graph under shared beside 4 query workers. Exclusive is only taken when packed slabs must realloc. Snapshot waits `unspliced==0`. On-disk blob unchanged. `zig build test` + `zig test src/hnsw.zig -OReleaseFast` pass.

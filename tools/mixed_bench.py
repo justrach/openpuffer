@@ -10,9 +10,11 @@ runs HTTP keep-alive threads in parallel on the same namespace:
 
 Compares that mixed window against a query-only control on the same corpus.
 
-Serve holds `std.Io.RwLock` exclusive around HNSW insert/update in
-`handleWrite`, and shared during `handleQuery`. This bench is the first
-measurement of query p50 under concurrent writers.
+Serve holds `std.Io.RwLock` shared during `handleQuery`. Inserts plan
+neighbors under shared, publish the new row under exclusive, then splice
+back-edges under shared (generation / RCU neighbor snapshot). Updates
+still take a brief exclusive memcpy. This bench measures whether mixed
+query p50 tracks write p50.
 
 Keep the corpus modest (n=2000–20000, dim=1536). Do not use this to storm
 1–2M HTTP upserts.
@@ -525,14 +527,22 @@ def main():
             f"write {cmp['write_error_rate_mixed']*100:.2f}%"
         )
         if cmp["writers_stall_readers"]:
-            print(
-                "writers stall readers: YES — exclusive write lock around HNSW "
-                "insert/update blocks lockShared query (expected)."
-            )
+            wp = cmp["write_p50_ms"]
+            mq = cmp["query_p50_mixed_ms"]
+            if wp and mq and mq < 0.85 * wp:
+                print(
+                    "writers stall readers: mixed query p50 is above idle but does "
+                    "not track write p50 (DRAM/CPU share; exclusive is grow-only)."
+                )
+            else:
+                print(
+                    "writers stall readers: YES — mixed query p50 still tracks writes "
+                    "(exclusive section or DRAM contention)."
+                )
         else:
             print(
-                "writers stall readers: not obvious at p50/p95 on this modest corpus "
-                "(insert still takes the exclusive lock for the whole HNSW mutation)."
+                "writers stall readers: not obvious at p50/p95 — query p50 does "
+                "not track write p50 (publish is reserved-slab; splice is shared)."
             )
 
         out = {
