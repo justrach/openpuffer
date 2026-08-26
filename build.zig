@@ -118,6 +118,33 @@ pub fn build(b: *std.Build) void {
     const consumer_tests = b.addTest(.{ .root_module = consumer_mod });
     const run_consumer_tests = b.addRunArtifact(consumer_tests);
 
+    // Compile the public persistence calls for Windows without running them.
+    // Native Windows mmap persistence is intentionally unsupported for now;
+    // the API must still compile and return UnsupportedPlatform explicitly.
+    const windows_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .windows,
+    });
+    const windows_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = windows_target,
+        .optimize = .ReleaseFast,
+    });
+    const windows_guard_mod = b.createModule(.{
+        .root_source_file = b.path("src/windows_persistence_compile.zig"),
+        .target = windows_target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "openpuffer", .module = windows_lib_mod },
+        },
+    });
+    const windows_guard = b.addObject(.{
+        .name = "openpuffer-windows-persistence-guard",
+        .root_module = windows_guard_mod,
+    });
+    const windows_check = b.step("check-windows", "Cross-compile the Windows persistence API guard");
+    windows_check.dependOn(&windows_guard.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_hnsw_tests.step);
