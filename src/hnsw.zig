@@ -1422,6 +1422,14 @@ pub fn Hnsw(comptime D: type) type {
         /// Atomically write an HMLS slab file (`path.tmp` → fsync → rename).
         /// The live snapshot is never opened writeable; a crash leaves `path` intact.
         pub fn writeSlabs(self: *const Self, path: []const u8) !void {
+            if (comptime builtin.os.tag == .windows) {
+                return error.UnsupportedPlatform;
+            } else {
+                return self.writeSlabsPosix(path);
+            }
+        }
+
+        fn writeSlabsPosix(self: *const Self, path: []const u8) !void {
             var tmp_buf: [posix.PATH_MAX]u8 = undefined;
             const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
             const fd = try posix.openat(posix.AT.FDCWD, tmp, .{
@@ -1599,6 +1607,14 @@ pub fn Hnsw(comptime D: type) type {
         /// mmap a raw HMLS file or a persist v2 envelope+HMLS file.
         /// MAP_PRIVATE: reads demand-page; writes COW and never dirty the file.
         pub fn loadMmap(self: *Self, path: []const u8) !void {
+            if (comptime builtin.os.tag == .windows) {
+                return error.UnsupportedPlatform;
+            } else {
+                return self.loadMmapPosix(path);
+            }
+        }
+
+        fn loadMmapPosix(self: *Self, path: []const u8) !void {
             if (self.len() != 0) return error.NotEmpty;
             const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
             const size64 = linux.lseek(fd, 0, linux.SEEK.END);
