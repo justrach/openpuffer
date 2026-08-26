@@ -54,6 +54,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 | E024 | 2026-08-25 | at-scale HTTP: E023 serialized all connections on one accept+handle loop; a fixed OS-thread pool should run concurrent ANN queries on all cores and keep-alive without per-conn pthread_create | io_uring accept + ncpu posix keep-alive workers; per-worker arena; inline lone-conn (drain backlog to pool); serve_bench concurrent keepalive | src/server.zig src/iouring_sock.zig tools/serve_bench.py | pass | HTTP serial 1.026 / ka 0.435 | — | −5.4% vs E023 serial 1.084; ka −60% | keep | serve | SERVING scale (not ANN chart). n=2000 dim=1536: conc8 6.845ms / 988 qps, conc32 19.7ms / 1065 qps, ka+conc8 1.483ms / 1298 qps. n=20000: serial 1.931ms, ka 1.292ms. /proc: all 4 workers take CPU — conc p50 is 4-core DRAM-bound, not a 1-thread queue. |
 | E025 | 2026-08-25 | 1M-scale RSS (~9 GB at 800k, 11.2 GB at 1M) is mostly GPA headers + size-class waste on ~4M live allocs, not payload; flatten f32/i8 pools and pack the graph as fixed-slack CSR so the layout is mmap/SSD-shaped | vectors_flat + qvecs_flat stride dim; layer-0/higher-layer packed neighbors (stride m0+1 / m+1); accessors for distTo/distQ/prefetch/update/planInsert/commitInsert/serialize/load | src/hnsw.zig | pass | 0.744 / 0.581 | 0.3130 | +29% / +1.0% vs host best 0.575 (run2 within noise) | keep | memory | MEMORY keep (not a p50 keep — E004's ~3% was below the 4% bar; re-landed because 1M RSS is the score). Clustered recall@10 = 1.0; serialize/load test pass. RSS no-corpus GPA: n=20k 221.1→150.2 MiB (−32%); n=50k 527.0→374.3 MiB (−29%). Old 1M bench (left running, finished on its own) post-build 11153 MiB / p50 12.7ms. Linear 1M estimate for flatten ≈ 7.5 GiB. Chart not regenerated (E023/E024 serving cells stay HTTP-tagged; do not mix into results.svg). No NVMe/SPDK/ZNS. |
 | E026 | 2026-08-25 | Pareto surface at scale is an (n, ef, distribution) problem, not a 20k p50 micro-opt; expose the existing rerank_mult knob and one-build ef/clustered sweeps so we can find the smallest ef that holds recall@10 ≥ 0.30 | CLI `--rerank-mult` / `--ef-sweep` / `--clustered` (mixture-of-Gaussians); serve + per-query `rerank_mult`; search() default still 4 | src/hnsw.zig src/main.zig src/server.zig tools/qa_bench.py | pass | 0.639 | 0.3130 | +11% vs E025 run2 0.575 (within flatten-host noise; not a p50 claim) | keep | knobs | KNOB/DOCS keep. Scored metric unchanged (searchAdvanced(..., 4) ≡ search()). Scale n×ef lives in the Pareto section below — do not read 1M/200k p50s from this cell. Random cannot hold 0.30 at 200k even at ef=1024; clustered holds 0.98–1.00 from ef=64 through 200k. Flatten 1M `--no-exact`: RSS **7481 MiB** / ef=128 p50 **1.410 ms** (old layout 11153 MiB / 12.7 ms). |
+| E027 | 2026-08-25 | drop the hot-path f32 copy (optional store_f32 / `--no-f32`) so 2M×1536 can fit on 16 GiB after E025 flatten | Options.store_f32 default true; `--no-f32` skips f32 slab; int8 traversal; rerank only if f32 present; serialize v2 omits f32, load still accepts v1 | src/hnsw.zig src/main.zig | pass | 0.679 | 0.3105 | +18% vs E022 0.575 (not a p50 claim) | keep | memory | MEMORY keep. Scored command unchanged (default still stores f32). `--no-f32` 20k recall **0.3100** (−0.0005). RSS `--no-exact`: 50k 375→**82** MiB; 200k 1689→**323** MiB. 2M `--no-exact --no-f32 --ef 128` **fits**: post-build **3222 MiB** (p50 1.760 ms — Scale section only, not this cell / not results.svg). Flatten 1M f32+i8 was 7481 MiB; dropping f32 is the ~5.7 GiB save. |
 
 ## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
 
@@ -71,7 +72,7 @@ Exact commands:
 python3 tools/serve_bench.py --n 20000 --queries 50 --dim 1536 --k 10 --ef 128 --keepalive --port 8098
 ```
 
-2M command was **not launched**. Old-layout 1M was 11153 MiB (2× ≈ 22 GiB). Flatten 1M is **7481 MiB**; 2× ≈ 14.6 GiB still exceeds a comfortable 16 GiB / no-swap budget. Drop-f32 or mmap is what would open 2M.
+2M with f32 stored was **not launched** on the flatten tree (2×7481 ≈ 14.6 GiB). E027 `--no-f32` opened it: see the Drop-f32 RSS subsection below.
 
 | n | build | ANN p50 | p95 | p99 | recall@10 | RSS | notes |
 |---|-------|---------|-----|-----|-----------|-----|-------|
@@ -79,7 +80,8 @@ python3 tools/serve_bench.py --n 20000 --queries 50 --dim 1536 --k 10 --ef 128 -
 | 50k | 119.1 s (420 vec/s) | 1.237 ms | 4.901 ms | 8.579 ms | **0.1860** | — | recall already under the 0.30 floor |
 | 200k | 661.4 s (302 vec/s) | 2.826 ms | 8.295 ms | 11.085 ms | **0.0400** | — | exact scan p50 107 ms; random 1536-d collapse |
 | 1M | 4657.7 s (215 vec/s) | 12.706 ms | 17.359 ms | 23.969 ms | skipped (`--no-exact`) | **11153 MiB** post-build / 11160 post-query | mean 12.645 ms, 3954 qps |
-| 2M | — | — | — | — | — | would be ~22 GiB | skipped; cannot fit |
+| 2M | — | — | — | — | — | would be ~22 GiB old-layout / ~15 GiB flatten+f32 | skipped on f32-on trees |
+| 2M `--no-f32` | 3767 s (531 vec/s) | 1.760 ms | 2.298 ms | 2.298 ms | skipped (`--no-exact`) | **3222 / 3227 MiB** | E027; **fits 16 GiB**. Do not copy this p50 into the E-table or results.svg. |
 | HTTP 20k ka | upsert 60.0 s | 1.118 ms | 2.445 ms | 3.997 ms | nonempty 50/50 | — | `serve --ef 128`; E024 ka at n=20k was 1.292 ms (old implicit ef=256) |
 
 Recall@10 on uniform random 1536-d vectors falls off a cliff as n grows at fixed ef=128 (0.33 → 0.19 → 0.04). The 1M p50 is a latency number, not a quality number. Clustered data (qa_bench) historically held recall ≈ 1.0 at ef=256; qa_bench now **pins `--ef 256`** because serve default changed 256→128.
@@ -88,10 +90,29 @@ What is left at 1–2M:
 
 - **Recall at scale**: raise ef (or M / ef_construction) once n is large; measure on clustered embeddings, not only random.
 - **Memory layout**: E025 flatten **measured** at 1M `--no-exact`: RSS **7481 MiB** (old layout 11153 MiB, −33%). Payload was the estimate; GPA waste is gone.
-- **Drop the f32 copy** (int8-only / optional rerank): saves 5.7 GiB; that plus flatten is how 2M could fit on 16 GiB.
+- **Drop the f32 copy** (E027, done): `--no-f32` / `store_f32=false`. 50k 375→82 MiB; 200k 1689→323 MiB; **2M fits at 3222 MiB**. Default still stores f32 so the 20k scored bench is unchanged.
 - **mmap** the flat pools so RSS is demand-paged.
 - `rerank_mult` is now `--rerank-mult` (default still 4). At 20k/ef=128, mult=1 and mult=8 both recall **0.3280** — rerank cannot recover neighbors that ef never found.
 - Do not HTTP-upsert 1–2M; in-process insert is the only sane load path.
+
+## Drop-f32 RSS (E027) — 2026-08-25, same 16 GiB host
+
+Not an E-row. Do not copy the 2M p50 into the ledger table or `results.svg`.
+
+Default `store_f32=true`. `--no-f32` skips the packed f32 slab; search is int8-only (no exact rerank). `--no-exact` so RSS is the index, not a second corpus.
+
+| n | store_f32 | post-build RSS | saved | notes |
+|---|-----------|----------------|-------|-------|
+| 20k (corpus retained) | on | 285 MiB | | scored path; recall 0.3105 |
+| 20k (corpus retained) | off | 151 MiB | 134 MiB | recall **0.3100** (−0.0005) |
+| 50k `--no-exact` | on | **375 MiB** | | matches E025 flatten 374.3 |
+| 50k `--no-exact` | off | **82 MiB** | 293 MiB | = n×1536×4 |
+| 200k `--no-exact` | on | **1689 MiB** | | |
+| 200k `--no-exact` | off | **323 MiB** | 1366 MiB | |
+| 2M `--no-exact --ef 128` | off | **3222 / 3227 MiB** | ~12 GiB vs flatten+f32 | **fits**; ANN p50 1.760 ms (20 queries; latency-only) |
+| 2M | on | ~17 GiB (200k×10) | | skipped; over 14 GiB bar |
+
+20k `--no-f32` recall stays above the 0.30 floor. On this random 1536-d set rerank was not finding extra neighbors (E026 `rerank_mult` same lesson).
 
 ## Pareto (n × ef, dim=1536) — 2026-08-25, flatten tree, 50 queries
 

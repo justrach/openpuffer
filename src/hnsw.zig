@@ -16,6 +16,10 @@ pub const Options = struct {
     ef_construction: u32 = 100,
     ml: f64 = 1.0 / @log(16.0),
     seed: u64 = 0x9e3779b97f4a7c15,
+    /// Keep a packed f32 copy of every vector for exact rerank / `update`.
+    /// Default true so the scored 20k bench stays comparable. Set false
+    /// (`--no-f32`) to drop ~4×dim bytes per row; search then uses int8 only.
+    store_f32: bool = true,
 };
 
 pub const SearchResult = struct { id: u32, distance: f32 };
@@ -75,8 +79,12 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         pub fn len(self: *const Self) usize {
-            if (self.dim == 0) return 0;
-            return self.vectors_flat.items.len / self.dim;
+            return self.qscales.items.len;
+        }
+
+        /// True when this index retains the f32 slab (exact rerank / snapshot f32).
+        pub fn hasStoredF32(self: *const Self) bool {
+            return self.opts.store_f32;
         }
 
         inline fn m0(self: *const Self) usize {
@@ -92,12 +100,15 @@ pub fn Hnsw(comptime D: type) type {
         }
 
         /// Mutable f32 row. Server snapshot/WAL and `update` use this.
+        /// Empty when `store_f32=false` (callers must check `hasStoredF32`).
         pub fn vector(self: *Self, id: u32) []f32 {
+            if (!self.opts.store_f32 or self.vectors_flat.items.len == 0) return &.{};
             const off = @as(usize, id) * self.dim;
             return self.vectors_flat.items[off..][0..self.dim];
         }
 
         pub fn vectorConst(self: *const Self, id: u32) []const f32 {
+            if (!self.opts.store_f32 or self.vectors_flat.items.len == 0) return &.{};
             const off = @as(usize, id) * self.dim;
             return self.vectors_flat.items[off..][0..self.dim];
         }
@@ -185,6 +196,13 @@ pub fn Hnsw(comptime D: type) type {
 
         inline fn distTo(self: *const Self, q: []const f32, id: u32) f32 {
             return vecmath.cosineDistance(q, self.vectorConst(id));
+        }
+
+        /// Pairwise distance used while splicing the graph. Exact when f32
+        /// is stored; otherwise the same int8 score search already uses.
+        inline fn distPair(self: *const Self, src: u32, dst: u32) f32 {
+            if (self.opts.store_f32) return self.distTo(self.vectorConst(src), dst);
+            return self.distQ(self.qvecConst(src), self.qscales.items[src], dst);
         }
 
         inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
@@ -315,7 +333,7 @@ pub fn Hnsw(comptime D: type) type {
                     continue;
                 }
                 for (selected.items) |s| {
-                    if (self.distTo(self.vectorConst(c.id), s.id) < c.d) {
+                    if (self.distPair(c.id, s.id) < c.d) {
                         try pruned.append(alloc, c);
                         continue :outer;
                     }
@@ -333,7 +351,15 @@ pub fn Hnsw(comptime D: type) type {
         pub fn update(self: *Self, id: u32, vector_in: []const f32) !void {
             if (id >= self.len()) return error.NotFound;
             if (vector_in.len != self.dim) return error.DimensionMismatch;
-            const copy = self.vector(id);
+            var stack: [2048]f32 = undefined;
+            var heap_tmp: ?[]f32 = null;
+            defer if (heap_tmp) |h| self.allocator.free(h);
+            const copy: []f32 = if (self.opts.store_f32) self.vector(id) else if (self.dim <= stack.len)
+                stack[0..self.dim]
+            else blk: {
+                heap_tmp = try self.allocator.alloc(f32, self.dim);
+                break :blk heap_tmp.?;
+            };
             @memcpy(copy, vector_in);
             vecmath.normalize(copy);
             var amax: f32 = 0;
@@ -389,7 +415,9 @@ pub fn Hnsw(comptime D: type) type {
         fn appendRecord(self: *Self, copy: []const f32, q8: []const i8, scale: f32, level: u32) !u32 {
             const alloc = self.allocator;
             const id: u32 = @intCast(self.len());
-            try self.vectors_flat.appendSlice(alloc, copy);
+            if (self.opts.store_f32) {
+                try self.vectors_flat.appendSlice(alloc, copy);
+            }
             try self.qvecs_flat.appendSlice(alloc, q8);
             try self.qscales.append(alloc, scale);
             try self.levels.append(alloc, level);
@@ -479,7 +507,7 @@ pub fn Hnsw(comptime D: type) type {
                         const back = self.neighbors(nid, layer);
                         try cands.ensureTotalCapacity(alloc, back.len);
                         for (back) |n| {
-                            cands.appendAssumeCapacity(.{ .id = n, .d = self.distTo(self.vectorConst(nid), n) });
+                            cands.appendAssumeCapacity(.{ .id = n, .d = self.distPair(nid, n) });
                         }
                         std.mem.sort(Candidate, cands.items, {}, struct {
                             fn cmp(_: void, a: Candidate, b: Candidate) bool {
@@ -590,7 +618,15 @@ pub fn Hnsw(comptime D: type) type {
             var res = try self.searchLayer(ctx, &ep, @max(ef_search, k), 0, &visited, alloc);
             defer res.deinit(alloc);
 
-            // exact rerank of the best candidates (already sorted by approx d)
+            // exact rerank only when the f32 slab is present. Without it,
+            // reported order is the int8 traversal order (still valid ANN).
+            if (!self.opts.store_f32) {
+                const out_n = @min(k, res.items.len);
+                const out = try alloc.alloc(SearchResult, out_n);
+                for (out, 0..) |*o, i| o.* = .{ .id = res.items[i].id, .distance = res.items[i].d };
+                return out;
+            }
+
             const rerank_n = @min(res.items.len, @max(k * rerank_mult, k));
             const Rerank = struct { id: u32, d: f32 };
             var rr: std.ArrayList(Rerank) = .empty;
@@ -612,13 +648,17 @@ pub fn Hnsw(comptime D: type) type {
 
         pub const GRAPH_MAGIC: u32 = 0x57534E48; // 'HNSW' le
         pub const GRAPH_VERSION: u32 = 1;
+        /// Version 2: f32 slab is optional (FLAG_HAS_F32). Version 1 always has f32.
+        pub const GRAPH_VERSION_OPT_F32: u32 = 2;
+        pub const FLAG_HAS_QVECS: u32 = 1;
+        pub const FLAG_HAS_F32: u32 = 2;
 
         pub fn serializedSize(self: *const Self) usize {
             var n: usize = 48; // header
             const count = self.len();
             n += count * 4; // levels
             n += count * 4; // qscales
-            n += count * self.dim * 4; // f32
+            if (self.opts.store_f32) n += count * self.dim * 4; // f32
             n += count * self.dim; // i8
             var id: u32 = 0;
             while (id < count) : (id += 1) {
@@ -649,7 +689,8 @@ pub fn Hnsw(comptime D: type) type {
                 }
             };
             wr.u32le(buf, &i, GRAPH_MAGIC);
-            wr.u32le(buf, &i, GRAPH_VERSION);
+            const version: u32 = if (self.opts.store_f32) GRAPH_VERSION else GRAPH_VERSION_OPT_F32;
+            wr.u32le(buf, &i, version);
             wr.u64le(buf, &i, self.dim);
             wr.u64le(buf, &i, self.len());
             wr.u32le(buf, &i, self.entry_point orelse std.math.maxInt(u32));
@@ -657,16 +698,20 @@ pub fn Hnsw(comptime D: type) type {
             wr.u32le(buf, &i, self.opts.m);
             wr.u32le(buf, &i, self.opts.m0_factor);
             wr.u32le(buf, &i, self.opts.ef_construction);
-            wr.u32le(buf, &i, 1); // flags: has_qvecs
+            var flags: u32 = FLAG_HAS_QVECS;
+            if (self.opts.store_f32) flags |= FLAG_HAS_F32;
+            wr.u32le(buf, &i, flags);
 
             for (self.levels.items) |lv| wr.u32le(buf, &i, lv);
             for (self.qscales.items) |s| {
                 const bits: u32 = @bitCast(s);
                 wr.u32le(buf, &i, bits);
             }
-            const fbytes = std.mem.sliceAsBytes(self.vectors_flat.items);
-            @memcpy(buf[i..][0..fbytes.len], fbytes);
-            i += fbytes.len;
+            if (self.opts.store_f32) {
+                const fbytes = std.mem.sliceAsBytes(self.vectors_flat.items);
+                @memcpy(buf[i..][0..fbytes.len], fbytes);
+                i += fbytes.len;
+            }
             const qbytes = std.mem.sliceAsBytes(self.qvecs_flat.items);
             @memcpy(buf[i..][0..qbytes.len], qbytes);
             i += qbytes.len;
@@ -705,7 +750,8 @@ pub fn Hnsw(comptime D: type) type {
                 }
             };
             if (try rd.u32le(bytes, &i) != GRAPH_MAGIC) return error.BadMagic;
-            if (try rd.u32le(bytes, &i) != GRAPH_VERSION) return error.UnsupportedVersion;
+            const version = try rd.u32le(bytes, &i);
+            if (version != GRAPH_VERSION and version != GRAPH_VERSION_OPT_F32) return error.UnsupportedVersion;
             const dim: usize = @intCast(try rd.u64le(bytes, &i));
             const n: usize = @intCast(try rd.u64le(bytes, &i));
             const ep_raw = try rd.u32le(bytes, &i);
@@ -714,19 +760,22 @@ pub fn Hnsw(comptime D: type) type {
             const m0_factor = try rd.u32le(bytes, &i);
             const efc = try rd.u32le(bytes, &i);
             const flags = try rd.u32le(bytes, &i);
-            _ = flags;
+            // v1 always stored f32; v2 honors FLAG_HAS_F32 so a no-f32 snapshot
+            // (and a later WAL compact of that ns) cannot crash on a missing slab.
+            const has_f32 = version == GRAPH_VERSION or (flags & FLAG_HAS_F32) != 0;
             if (self.dim == 0) self.dim = dim;
             if (self.dim != dim) return error.DimensionMismatch;
             self.opts.m = m;
             self.opts.m0_factor = m0_factor;
             self.opts.ef_construction = efc;
+            self.opts.store_f32 = has_f32;
             self.max_level = max_level;
             self.entry_point = if (ep_raw == std.math.maxInt(u32)) null else ep_raw;
 
             const alloc = self.allocator;
             try self.levels.ensureTotalCapacity(alloc, n);
             try self.qscales.ensureTotalCapacity(alloc, n);
-            try self.vectors_flat.ensureTotalCapacity(alloc, n * dim);
+            if (has_f32) try self.vectors_flat.ensureTotalCapacity(alloc, n * dim);
             try self.qvecs_flat.ensureTotalCapacity(alloc, n * dim);
             try self.l0_deg.ensureTotalCapacity(alloc, n);
             try self.l0_nbrs.ensureTotalCapacity(alloc, n * self.l0Stride());
@@ -737,11 +786,13 @@ pub fn Hnsw(comptime D: type) type {
                 const bits = try rd.u32le(bytes, &i);
                 self.qscales.appendAssumeCapacity(@bitCast(bits));
             }
-            const fnbytes = n * dim * @sizeOf(f32);
-            if (i + fnbytes > bytes.len) return error.Truncated;
-            const fdest = try self.vectors_flat.addManyAsSlice(alloc, n * dim);
-            @memcpy(std.mem.sliceAsBytes(fdest), bytes[i..][0..fnbytes]);
-            i += fnbytes;
+            if (has_f32) {
+                const fnbytes = n * dim * @sizeOf(f32);
+                if (i + fnbytes > bytes.len) return error.Truncated;
+                const fdest = try self.vectors_flat.addManyAsSlice(alloc, n * dim);
+                @memcpy(std.mem.sliceAsBytes(fdest), bytes[i..][0..fnbytes]);
+                i += fnbytes;
+            }
             const qnbytes = n * dim;
             if (i + qnbytes > bytes.len) return error.Truncated;
             const qdest = try self.qvecs_flat.addManyAsSlice(alloc, n * dim);
@@ -950,4 +1001,80 @@ test "hnsw serialize/load preserves neighbors and search" {
         try std.testing.expectEqual(b.id, a.id);
         try std.testing.expectApproxEqAbs(b.distance, a.distance, 1e-6);
     }
+}
+
+test "hnsw store_f32=false search still finds planted neighbor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const dim = 16;
+    var rng = std.Random.DefaultPrng.init(42);
+    var index = Hnsw(void).init(alloc, dim, .{ .store_f32 = false });
+    defer index.deinit();
+
+    var v: [dim]f32 = undefined;
+    for (0..500) |_| {
+        for (&v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try index.insert(&v);
+    }
+    try std.testing.expect(!index.hasStoredF32());
+    try std.testing.expectEqual(@as(usize, 0), index.vectors_flat.items.len);
+    try std.testing.expectEqual(@as(usize, 500), index.len());
+
+    @memset(&v, 0);
+    v[3] = 1;
+    const target = try index.insert(&v);
+    const results = try index.search(&v, 1, 64, alloc);
+    try std.testing.expectEqual(target, results[0].id);
+}
+
+test "hnsw store_f32=false serialize/load and update" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const dim = 32;
+    var rng = std.Random.DefaultPrng.init(7);
+    var index = Hnsw(void).init(alloc, dim, .{ .store_f32 = false });
+    defer index.deinit();
+
+    var v: [dim]f32 = undefined;
+    for (0..80) |_| {
+        for (&v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try index.insert(&v);
+    }
+    @memset(&v, 0);
+    v[1] = 1;
+    const planted = try index.insert(&v);
+    const before = try index.search(&v, 5, 64, alloc);
+
+    const blob = try index.serialize(alloc);
+    defer alloc.free(blob);
+    try std.testing.expectEqual(index.serializedSize(), blob.len);
+    try std.testing.expectEqual(Hnsw(void).GRAPH_VERSION_OPT_F32, std.mem.readInt(u32, blob[4..8], .little));
+    try std.testing.expectEqual(@as(usize, 0), index.vectors_flat.items.len);
+
+    var loaded = Hnsw(void).init(alloc, dim, .{});
+    defer loaded.deinit();
+    try loaded.load(blob);
+    try std.testing.expect(!loaded.hasStoredF32());
+    try std.testing.expectEqual(index.len(), loaded.len());
+    try std.testing.expectEqual(index.entry_point, loaded.entry_point);
+    try std.testing.expectEqual(@as(usize, 0), loaded.vectors_flat.items.len);
+    var id: u32 = 0;
+    while (id < index.len()) : (id += 1) {
+        try std.testing.expectEqualSlices(u32, index.neighbors(id, 0), loaded.neighbors(id, 0));
+    }
+
+    const after = try loaded.search(&v, 5, 64, alloc);
+    try std.testing.expectEqual(planted, after[0].id);
+    try std.testing.expectEqual(before[0].id, after[0].id);
+
+    var flip: [dim]f32 = undefined;
+    @memset(&flip, 0);
+    flip[4] = 1;
+    try loaded.update(planted, &flip);
+    const updated = try loaded.search(&flip, 1, 64, alloc);
+    try std.testing.expectEqual(planted, updated[0].id);
 }
