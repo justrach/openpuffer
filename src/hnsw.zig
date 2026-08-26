@@ -2005,7 +2005,7 @@ test "hnsw slab mmap reopen + insert append buffer" {
 
     var path_buf: [160]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-roundtrip-{d}-{x}.slabs", .{
-        std.time.milliTimestamp(),
+        if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
         @intFromPtr(&path_buf),
     });
     try index.writeSlabs(path);
@@ -2067,7 +2067,7 @@ test "slab mmap vs alloc RSS (blank slabs)" {
         var path_buf: [128]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}-{d}-{x}.slabs", .{
             c.n,
-            std.time.milliTimestamp(),
+            if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
             @intFromPtr(&path_buf),
         });
         try Hnsw(void).writeBlankSlabs(path, c.n, c.dim, .{});
