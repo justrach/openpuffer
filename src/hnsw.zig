@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vecmath = @import("vector.zig");
+const rss = @import("rss.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -1031,11 +1032,11 @@ pub fn Hnsw(comptime D: type) type {
             var i: usize = 0;
             const wr = struct {
                 fn u32le(b: []u8, off: *usize, v: u32) void {
-                    std.mem.writeInt(u32, b[off.* ..][0..4], v, .little);
+                    std.mem.writeInt(u32, b[off.*..][0..4], v, .little);
                     off.* += 4;
                 }
                 fn u64le(b: []u8, off: *usize, v: u64) void {
-                    std.mem.writeInt(u64, b[off.* ..][0..8], v, .little);
+                    std.mem.writeInt(u64, b[off.*..][0..8], v, .little);
                     off.* += 8;
                 }
             };
@@ -1104,13 +1105,13 @@ pub fn Hnsw(comptime D: type) type {
             const rd = struct {
                 fn u32le(b: []const u8, off: *usize) !u32 {
                     if (off.* + 4 > b.len) return error.Truncated;
-                    const v = std.mem.readInt(u32, b[off.* ..][0..4], .little);
+                    const v = std.mem.readInt(u32, b[off.*..][0..4], .little);
                     off.* += 4;
                     return v;
                 }
                 fn u64le(b: []const u8, off: *usize) !u64 {
                     if (off.* + 8 > b.len) return error.Truncated;
-                    const v = std.mem.readInt(u64, b[off.* ..][0..8], .little);
+                    const v = std.mem.readInt(u64, b[off.*..][0..8], .little);
                     off.* += 8;
                     return v;
                 }
@@ -1978,19 +1979,7 @@ test "hnsw store_f32=false serialize/load and update" {
 }
 
 fn rssKiBSelf() ?u64 {
-    const fd = posix.openat(posix.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = linux.close(fd);
-    var buf: [4096]u8 = undefined;
-    const n = linux.read(fd, &buf, buf.len);
-    if (posix.errno(n) != .SUCCESS) return null;
-    const text = buf[0..n];
-    const key = "VmRSS:";
-    const idx = std.mem.indexOf(u8, text, key) orelse return null;
-    var rest = text[idx + key.len ..];
-    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
-    var end: usize = 0;
-    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
-    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+    return rss.currentKiB();
 }
 
 test "hnsw slab mmap reopen + insert append buffer" {
@@ -2014,7 +2003,11 @@ test "hnsw slab mmap reopen + insert append buffer" {
     const planted = try index.insert(&v);
     const before = try index.search(&v, 5, 64, alloc);
 
-    const path = "/tmp/openpuffer-mmap-roundtrip.slabs";
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-roundtrip-{d}-{x}.slabs", .{
+        if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
+        @intFromPtr(&path_buf),
+    });
     try index.writeSlabs(path);
 
     var loaded = Hnsw(void).init(alloc, dim, .{});
@@ -2072,7 +2065,11 @@ test "slab mmap vs alloc RSS (blank slabs)" {
     for (cases) |c| {
         if (c.n == 0) continue;
         var path_buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}.slabs", .{c.n});
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}-{d}-{x}.slabs", .{
+            c.n,
+            if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
+            @intFromPtr(&path_buf),
+        });
         try Hnsw(void).writeBlankSlabs(path, c.n, c.dim, .{});
 
         const baseline = rssKiBSelf() orelse 0;

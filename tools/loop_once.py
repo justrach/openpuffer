@@ -2,7 +2,8 @@
 """One scored-metric cycle for the openpuffer research loop.
 
 Runs the exact program.md command, parses p50 + recall@10, and compares
-against the best *engine-track* keep in experiments/log.md.
+against the best *engine-track* keep with a compatible hardware/workload
+key (`tools/bench_key.py`). Xeon and Apple numbers are not one score.
 
 This does not edit code or decide a hypothesis. It only makes the keep /
 discard arithmetic mechanical so agents stop mixing HTTP / memory / knob
@@ -24,6 +25,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG = ROOT / "experiments" / "log.md"
+sys.path.insert(0, str(ROOT / "tools"))
+from bench_key import (  # noqa: E402
+    ENGINE_PROFILE,
+    current_key,
+    keys_compatible,
+    row_key,
+)
 DEFAULT_BENCH_LOG = Path("/tmp/openpuffer-bench.log")
 METRIC = [
     "./zig-out/bin/openpuffer",
@@ -131,32 +139,45 @@ def ledger_rows(text: str) -> list[dict]:
                 "verdict": verdict,
                 "recall": recall_v,
                 "track": track,
+                "notes": notes,
             }
         )
     return rows
 
 
-def best_engine(rows: list[dict]) -> tuple[str, float] | None:
-    kept = [
-        (r["id"], min(r["runs"]))
-        for r in rows
-        if r["verdict"] == "keep" and r["track"] == "engine" and r["runs"]
-    ]
+def best_engine(rows: list[dict], host_key: str) -> tuple[str, float] | None:
+    kept = []
+    for r in rows:
+        if r["verdict"] != "keep" or r["track"] != "engine" or not r["runs"]:
+            continue
+        rk = row_key(r)
+        if rk is None or not keys_compatible(rk, host_key):
+            continue
+        kept.append((r["id"], min(r["runs"])))
     if not kept:
         return None
     return min(kept, key=lambda t: t[1])
 
 
-def decide(p50: float, recall: float, best: tuple[str, float] | None) -> str:
+def decide(p50: float, recall: float, best: tuple[str, float] | None, host_key: str) -> str:
     if recall < RECALL_FLOOR:
-        return f"discard (recall {recall:.4f} < {RECALL_FLOOR})"
+        return f"discard (recall {recall:.4f} < {RECALL_FLOOR}; key={host_key})"
     if best is None:
-        return "keep (no engine baseline yet)"
+        return f"baseline (no compatible keep for key={host_key})"
     bid, bval = best
     delta = (p50 - bval) / bval
+    control = os.environ.get("OPENPUFFER_CONTROL_P50")
     if delta <= -KEEP_BAR:
-        return f"keep (≥4% vs {bid} {bval:.3f}; {delta:+.1%})"
-    return f"discard (need ≤{-KEEP_BAR:.0%} vs {bid} {bval:.3f}; {delta:+.1%})"
+        if control is None and abs(delta) < 0.08:
+            return (
+                f"need control pair (candidate {p50:.3f} vs {bid} {bval:.3f} "
+                f"{delta:+.1%}; set OPENPUFFER_CONTROL_P50; key={host_key})"
+            )
+        return f"keep (≥4% vs {bid} {bval:.3f}; {delta:+.1%}; key={host_key})"
+    return (
+        f"discard (need ≤{-KEEP_BAR:.0%} vs {bid} {bval:.3f}; {delta:+.1%}; "
+        f"key={host_key})"
+    )
 
 
 def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -172,11 +193,13 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = ledger_rows(LOG.read_text())
-    best = best_engine(rows)
+    host_key = os.environ.get("OPENPUFFER_BENCH_KEY") or current_key(ENGINE_PROFILE)
+    best = best_engine(rows, host_key)
+    print(f"bench key: {host_key}")
     if best:
         print(f"engine best: {best[1]:.3f} ms ({best[0]})")
     else:
-        print("engine best: none")
+        print("engine best: none (need a same-host baseline)")
 
     if args.log:
         p50, recall = parse_bench(args.log.read_text())
@@ -200,7 +223,7 @@ def main() -> int:
         p50, recall = parse_bench(DEFAULT_BENCH_LOG.read_text())
 
     print(f"p50 {p50:.3f} ms  recall@10 {recall:.4f}")
-    print("verdict:", decide(p50, recall, best))
+    print("verdict:", decide(p50, recall, best, host_key))
     print("log:", args.log or DEFAULT_BENCH_LOG)
     return 0
 

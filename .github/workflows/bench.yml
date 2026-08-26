@@ -1,0 +1,107 @@
+# Cross-host numbers. Linux and macOS are different keys (#18).
+# macOS must print numeric RSS (#21). The 512-d codedb profile is #20.
+name: bench
+
+on:
+  pull_request:
+  push:
+    branches: [main, "cursor/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1857+3c46da14d
+      - name: zig version
+        run: zig version
+      - name: python key fixtures
+        run: |
+          python3 tools/bench_key.py --self-test
+          python3 tools/test_bench_key.py
+          python3 tools/codedb_once.py --self-test
+          python3 tools/bench_key.py
+      - name: zig build test
+        run: zig build test
+
+  numbers:
+    name: numbers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1857+3c46da14d
+      - name: ReleaseFast
+        run: zig build -Doptimize=ReleaseFast
+      - name: bench key
+        run: python3 tools/bench_key.py | tee /tmp/bench-key.txt
+      - name: RSS smoke (small n)
+        run: |
+          ./zig-out/bin/openpuffer bench-synthetic \
+            --n 400 --queries 8 --dim 64 --k 4 --ef 16 --no-exact \
+            | tee /tmp/rss-smoke.log
+          if grep -q "rss: unavailable" /tmp/rss-smoke.log; then
+            echo "::error::RSS unavailable on ${{ matrix.os }}"
+            exit 1
+          fi
+          grep -E "rss_mib|rss:" /tmp/rss-smoke.log
+      - name: scored engine 20k×1536
+        run: |
+          ./zig-out/bin/openpuffer bench-synthetic \
+            --n 20000 --queries 200 --dim 1536 --k 10 --ef 128 \
+            | tee /tmp/engine-20k.log
+          python3 tools/loop_once.py --skip-test --skip-build --log /tmp/engine-20k.log \
+            | tee /tmp/engine-verdict.txt
+      - name: codedb 20k×512 clustered
+        run: |
+          ./zig-out/bin/openpuffer bench-synthetic \
+            --n 20000 --queries 500 --dim 512 --k 24 --ef 128 \
+            --rerank-mult 4 --clustered \
+            | tee /tmp/codedb.log
+          python3 tools/codedb_once.py --parse-only --log /tmp/codedb.log \
+            | tee /tmp/codedb-verdict.txt
+      - name: summary
+        if: always()
+        run: |
+          echo "## ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/bench-key.txt 2>/dev/null || true
+          echo '--- engine ---' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "p50|recall|rss_mib|rss:|bench key|verdict|index built" /tmp/engine-20k.log /tmp/engine-verdict.txt 2>/dev/null || true
+          echo '--- codedb ---' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "p50|recall|rss_mib|rss:|bench key|verdict|index built" /tmp/codedb.log /tmp/codedb-verdict.txt 2>/dev/null || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-logs-${{ matrix.os }}
+          path: |
+            /tmp/bench-key.txt
+            /tmp/rss-smoke.log
+            /tmp/engine-20k.log
+            /tmp/engine-verdict.txt
+            /tmp/codedb.log
+            /tmp/codedb-verdict.txt
+          if-no-files-found: warn
