@@ -15,6 +15,7 @@ const tpuf_mod = @import("tpuf.zig");
 const server_mod = @import("server.zig");
 const s3_mod = @import("s3.zig");
 const shard_router = @import("shard_router.zig");
+const rss = @import("rss.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -77,7 +78,11 @@ pub fn main(init: std.process.Init) !void {
         try w.interface.print("selftest ok\n", .{});
     } else if (std.mem.eql(u8, cmd, "bench-synthetic")) {
         try benchSynthetic(gpa, io, &w.interface, optsFromArgs(args.items[1..], .{
-            .n = 20_000, .q = 100, .dim = 1536, .k = 10, .ef = 200,
+            .n = 20_000,
+            .q = 100,
+            .dim = 1536,
+            .k = 10,
+            .ef = 200,
         }), hasFlag(args.items[1..], "--no-exact"));
     } else if (std.mem.eql(u8, cmd, "bench-live")) {
         const tpuf_key = init.environ_map.get("TURBOPUFFER_API_KEY") orelse {
@@ -89,8 +94,13 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingKey;
         };
         try benchLive(gpa, io, &w.interface, optsFromArgs(args.items[1..], .{
-            .n = 512, .q = 30, .dim = 768, .k = 10, .ef = 200,
-            .tpuf_key = tpuf_key, .google_key = google_key,
+            .n = 512,
+            .q = 30,
+            .dim = 768,
+            .k = 10,
+            .ef = 200,
+            .tpuf_key = tpuf_key,
+            .google_key = google_key,
         }));
     } else if (std.mem.eql(u8, cmd, "serve")) {
         var port: u16 = 8080;
@@ -150,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
             \\                  [--rerank-mult 4] [--ef-sweep 64,128,256,512] [--clustered]
             \\                  [--clusters N] [--cluster-noise 0.35] [--no-exact] [--index-exact]
             \\                  [--skip-scan] [--no-f32]
+            \\                  (rss is current RSS in MiB on Linux and macOS; peak is labeled)
             \\  openpuffer serve [--port 8080] [--ef 128] [--rerank-mult 4] [--workers N]
             \\                  [--s3-bucket B] [--s3-region R] [--s3-endpoint URL]
             \\                  (OPENPUFFER_WORKERS is an alias for --workers)
@@ -180,26 +191,24 @@ fn hasFlag(args: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// Linux RSS in MiB. Null on non-Linux or if /proc is unreadable.
+/// Current RSS in MiB. Linux VmRSS and macOS resident_size. Null only
+/// when the platform probe fails or is unsupported.
 fn rssMiB(io: std.Io) ?u64 {
-    const file = std.Io.Dir.openFileAbsolute(io, "/proc/self/status", .{}) catch return null;
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var iov = [_][]u8{buf[0..]};
-    const n = file.readStreaming(io, &iov) catch return null;
-    const key = "VmRSS:";
-    const idx = std.mem.indexOf(u8, buf[0..n], key) orelse return null;
-    var rest = buf[idx + key.len .. n];
-    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
-    var end: usize = 0;
-    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
-    const kb = std.fmt.parseInt(u64, rest[0..end], 10) catch return null;
-    return kb / 1024;
+    _ = io;
+    return rss.currentMiB();
 }
 
 fn printRss(io: std.Io, out: *std.Io.Writer, label: []const u8) !void {
-    if (rssMiB(io)) |m| {
-        try out.print("{s} rss: {d} MiB\n", .{ label, m });
+    _ = io;
+    if (rss.sampleSelf()) |s| {
+        const cur_mib = s.current_kib / 1024;
+        if (s.peak_kib) |pk| {
+            try out.print("{s} rss: {d} MiB current, {d} MiB peak\n", .{ label, cur_mib, pk / 1024 });
+            try out.print("rss_mib phase={s} current={d} peak={d}\n", .{ label, cur_mib, pk / 1024 });
+        } else {
+            try out.print("{s} rss: {d} MiB current\n", .{ label, cur_mib });
+            try out.print("rss_mib phase={s} current={d}\n", .{ label, cur_mib });
+        }
     } else {
         try out.print("{s} rss: unavailable\n", .{label});
     }

@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const iouring = @import("iouring_sock.zig");
+const rss = @import("rss.zig");
 
 pub const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 pub const FNV_PRIME: u64 = 0x00000100000001b3;
@@ -313,14 +314,8 @@ fn rssMiB(io: std.Io, pid: std.posix.pid_t) ?u64 {
     var buf: [4096]u8 = undefined;
     var iov = [_][]u8{buf[0..]};
     const n = file.readStreaming(io, &iov) catch return null;
-    const key = "VmRSS:";
-    const idx = std.mem.indexOf(u8, buf[0..n], key) orelse return null;
-    var rest = buf[idx + key.len .. n];
-    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
-    var end: usize = 0;
-    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
-    const kb = std.fmt.parseInt(u64, rest[0..end], 10) catch return null;
-    return kb / 1024;
+    const s = rss.parseLinuxStatus(buf[0..n]) orelse return null;
+    return s.current_kib / 1024;
 }
 
 fn tcpConnectLoopback(port: u16) !std.posix.fd_t {

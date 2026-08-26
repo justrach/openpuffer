@@ -10,6 +10,7 @@
 const std = @import("std");
 const s3 = @import("s3.zig");
 const hnsw_mod = @import("hnsw.zig");
+const namespace = @import("namespace.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -47,6 +48,7 @@ pub const Store = struct {
     }
 
     fn keyFor(self: *Store, comptime kind: []const u8, ns: []const u8, seq: u64) ![]u8 {
+        try namespace.validate(ns);
         if (comptime std.mem.eql(u8, kind, "snapshot_bin")) {
             return std.fmt.allocPrint(self.alloc, "openpuffer/{s}/snapshot.bin", .{ns});
         } else if (comptime std.mem.eql(u8, kind, "snapshot")) {
@@ -351,6 +353,18 @@ pub fn docIdsFromBinary(body: []const u8, hdr: BinaryHeader, out: []u64) void {
         id.* = std.mem.readInt(u64, body[i..][0..8], .little);
         i += 8;
     }
+}
+
+test "keyFor rejects ambiguous namespace names" {
+    const alloc = std.testing.allocator;
+    var dummy_client: s3.Client = undefined;
+    var store = Store.init(alloc, &dummy_client);
+    try std.testing.expectError(error.InvalidNamespace, store.keyFor("snapshot_bin", "codedb/nested", 0));
+    try std.testing.expectError(error.InvalidNamespace, store.keyFor("wal", "", 1));
+    try std.testing.expectError(error.InvalidNamespace, store.keyFor("snapshot", "..", 0));
+    const key = try store.keyFor("snapshot_bin", "codedb", 0);
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("openpuffer/codedb/snapshot.bin", key);
 }
 
 test "walSeqsFromKeys filters by ns and seq" {

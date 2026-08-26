@@ -16,6 +16,7 @@ const hnsw_mod = @import("hnsw.zig");
 const s3_mod = @import("s3.zig");
 const persist_mod = @import("persist.zig");
 const iouring = @import("iouring_sock.zig");
+const ns_mod = @import("namespace.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
 
@@ -212,6 +213,7 @@ const Registry = struct {
     persist: ?*PersistWorker = null,
 
     fn getOrCreate(self: *Registry, name: []const u8) !*Namespace {
+        try ns_mod.validate(name);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.namespaces.get(name)) |ns| return ns;
@@ -505,7 +507,7 @@ fn handleIoUringConn(
             res.raw_status = .internal_server_error;
             res.raw_body = "{\"error\":\"internal\"}";
         };
-        const status_n: u16 = @intFromEnum(res.raw_status);
+        const status_n: u16 = @backingInt(res.raw_status);
         const phrase = res.raw_status.phrase() orelse "OK";
         const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
         try xfer.sendAll(fd, wire);
@@ -608,6 +610,7 @@ fn recoverAll(
         const tail = k["openpuffer/".len..];
         const slash = std.mem.indexOfScalar(u8, tail, '/') orelse continue;
         const name = tail[0..slash];
+        if (!ns_mod.isValid(name)) continue;
         const rest = tail[slash + 1 ..];
         var found: ?*NsPlan = null;
         for (plans.items) |*p| {
@@ -802,6 +805,24 @@ const Responder = struct {
     raw_body: []const u8 = "",
 };
 
+fn takeNamespace(rest: []const u8, suffix: []const u8) ns_mod.Error![]const u8 {
+    const name = if (suffix.len != 0 and std.mem.endsWith(u8, rest, suffix))
+        rest[0 .. rest.len - suffix.len]
+    else
+        rest;
+    try ns_mod.validate(name);
+    return name;
+}
+
+fn respondInvalidNamespace(res: *Responder, raw: []const u8) !void {
+    var esc_buf: [256]u8 = undefined;
+    const esc = ns_mod.jsonEscape(raw, &esc_buf);
+    var body_buf: [320]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":\"invalid namespace\",\"namespace\":\"{s}\"}}", .{esc}) catch
+        "{\"error\":\"invalid namespace\"}";
+    return respondJson(res, .bad_request, body);
+}
+
 fn respondJson(res: *Responder, status: std.http.Status, body: []const u8) !void {
     if (res.req) |req| {
         try req.respond(body, .{
@@ -929,7 +950,9 @@ fn dispatch(
     const rest = path[prefix.len..];
 
     if (std.mem.endsWith(u8, rest, "/snapshot") and std.mem.eql(u8, method, "POST")) {
-        const ns_name = rest[0 .. rest.len - "/snapshot".len];
+        const ns_name = takeNamespace(rest, "/snapshot") catch |e| switch (e) {
+            error.InvalidNamespace => return respondInvalidNamespace(res, rest[0 .. rest.len - "/snapshot".len]),
+        };
         const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         if (registry.store) |store| {
@@ -946,30 +969,43 @@ fn dispatch(
     }
 
     if (std.mem.endsWith(u8, rest, "/query") and std.mem.eql(u8, method, "POST")) {
-        const ns_name = rest[0 .. rest.len - "/query".len];
+        const ns_name = takeNamespace(rest, "/query") catch |e| switch (e) {
+            error.InvalidNamespace => return respondInvalidNamespace(res, rest[0 .. rest.len - "/query".len]),
+        };
         const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         return handleQuery(alloc, res, ns, o, body);
     }
 
     if (std.mem.eql(u8, method, "POST")) {
-        const ns = try registry.getOrCreate(rest);
+        const ns_name = takeNamespace(rest, "") catch |e| switch (e) {
+            error.InvalidNamespace => return respondInvalidNamespace(res, rest),
+        };
+        const ns = try registry.getOrCreate(ns_name);
         return handleWrite(alloc, registry.alloc, res, ns, body, registry);
     }
 
     if (std.mem.eql(u8, method, "GET")) {
-        const ns = registry.get(rest) orelse
+        const ns_name = takeNamespace(rest, "") catch |e| switch (e) {
+            error.InvalidNamespace => return respondInvalidNamespace(res, rest),
+        };
+        const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         ns.lock.lockSharedUncancelable(ns.io);
         defer ns.lock.unlockShared(ns.io);
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "{{\"namespace\":\"{s}\",\"dim\":{d},\"count\":{d}}}", .{ ns.name, ns.dim, ns.index.len() });
+        var esc_buf: [160]u8 = undefined;
+        const esc = ns_mod.jsonEscape(ns.name, &esc_buf);
+        const s = try std.fmt.bufPrint(&buf, "{{\"namespace\":\"{s}\",\"dim\":{d},\"count\":{d}}}", .{ esc, ns.dim, ns.index.len() });
         return respondJson(res, .ok, s);
     }
 
     if (std.mem.eql(u8, method, "DELETE")) {
+        const ns_name = takeNamespace(rest, "") catch |e| switch (e) {
+            error.InvalidNamespace => return respondInvalidNamespace(res, rest),
+        };
         registry.mutex.lockUncancelable(registry.io);
-        const removed = registry.namespaces.fetchRemove(rest);
+        const removed = registry.namespaces.fetchRemove(ns_name);
         registry.mutex.unlock(registry.io);
         if (removed) |kv| {
             kv.value.lock.lockUncancelable(kv.value.io);
@@ -1272,6 +1308,17 @@ test "parseAnnQuery reads optional ef" {
     try std.testing.expectEqual(@as(usize, 3), spec.top_k);
     try std.testing.expectEqual(@as(?u32, 64), spec.ef);
     try std.testing.expectEqual(@as(?usize, null), spec.rerank_mult);
+}
+
+test "takeNamespace rejects nested and empty names" {
+    try std.testing.expectError(error.InvalidNamespace, takeNamespace("codedb/nested", ""));
+    try std.testing.expectError(error.InvalidNamespace, takeNamespace("codedb/nested/query", "/query"));
+    try std.testing.expectError(error.InvalidNamespace, takeNamespace("", ""));
+    try std.testing.expectError(error.InvalidNamespace, takeNamespace(".", ""));
+    try std.testing.expectError(error.InvalidNamespace, takeNamespace("a\nb/query", "/query"));
+    try std.testing.expectEqualStrings("codedb", try takeNamespace("codedb", ""));
+    try std.testing.expectEqualStrings("codedb", try takeNamespace("codedb/query", "/query"));
+    try std.testing.expectEqualStrings("openpuffer-bench-1", try takeNamespace("openpuffer-bench-1/snapshot", "/snapshot"));
 }
 
 test "parseAnnQuery reads optional rerank_mult" {
