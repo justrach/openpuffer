@@ -523,12 +523,10 @@ pub fn Hnsw(comptime D: type) type {
             }
         };
 
-        /// Drop the last 128 i8 dims on upper layers (2 AVX-512 chunks).
-        /// Layer 0 does almost all evals — drop 192 (3 chunks) there.
-        fn searchPrefix(self: *const Self, layer: u32) usize {
+        /// Drop the last 128 i8 dims on wide vectors (2 AVX-512 chunks).
+        fn searchPrefix(self: *const Self) usize {
             if (self.dim < 512) return self.dim;
-            const drop: usize = if (layer == 0) 192 else 128;
-            const keep = self.dim - drop;
+            const keep = self.dim - 128;
             return keep & ~@as(usize, 63);
         }
 
@@ -974,7 +972,7 @@ pub fn Hnsw(comptime D: type) type {
                 }
                 break :blk buf;
             };
-            var ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = self.searchPrefix(1) };
+            const ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = self.searchPrefix() };
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);
@@ -982,14 +980,11 @@ pub fn Hnsw(comptime D: type) type {
             var ep: [1]Candidate = .{.{ .id = ep_id, .d = ctx.dist(ep_id) }};
             var cur = self.getMaxLevel();
             while (cur > 0) : (cur -= 1) {
-                ctx.n = self.searchPrefix(cur);
                 var res = try self.searchLayer(ctx, &ep, 1, cur, &visited, alloc);
                 defer res.deinit(alloc);
                 ep[0] = res.items[0];
             }
 
-            ctx.n = self.searchPrefix(0);
-            ep[0].d = ctx.dist(ep[0].id);
             var res = try self.searchLayer(ctx, &ep, @max(ef_search, k), 0, &visited, alloc);
             defer res.deinit(alloc);
 
