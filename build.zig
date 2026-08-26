@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Public in-process engine. Dependents `@import("openpuffer")` get Hnsw /
+    // Options / SearchResult without the HTTP server or cloud clients.
+    _ = b.addModule("openpuffer", .{
+        .root_source_file = b.path("src/hnsw.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
