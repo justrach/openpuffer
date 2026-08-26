@@ -504,6 +504,38 @@ pub fn Hnsw(comptime D: type) type {
             }
         }
 
+        /// Conservative early-out: same score as `distQ` unless the remaining
+        /// i8 products cannot beat `worst`. Abandoned neighbors get +inf so
+        /// they never enter the ef-set (they would have lost the `d < w` test).
+        inline fn distQCutoff(
+            self: *const Self,
+            qq: []const i8,
+            qs: f32,
+            id: u32,
+            suffix: []const i32,
+            worst: f32,
+        ) f32 {
+            while (true) {
+                const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if ((g1 & 1) != 0) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const stored = self.qvecConst(id);
+                const n = @min(qq.len, stored.len);
+                const ss = self.qscaleOf(id);
+                const prod = qs * ss;
+                const need: f64 = if (prod <= 0) std.math.floatMax(f64) else
+                    (@as(f64, 1.0) - @as(f64, worst)) / @as(f64, prod);
+                const maybe = vecmath.dotI8Abandon(qq[0..n], stored[0..n], suffix[0 .. n + 1], need);
+                const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
+                if (g1 != g2) continue;
+                const dot_i = maybe orelse return std.math.floatMax(f32);
+                const approx = @as(f64, @floatFromInt(dot_i)) * prod;
+                return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+            }
+        }
+
         /// Distance contexts let searchLayer run on either exact or quantized math.
         pub const F32Dist = struct {
             s: *const Self,
@@ -517,9 +549,15 @@ pub fn Hnsw(comptime D: type) type {
             qq: []const i8,
             qs: f32,
             n: usize,
+            suffix: []const i32 = &.{},
             pub inline fn dist(d: @This(), id: u32) f32 {
                 const n = @min(d.n, d.qq.len);
                 return d.s.distQ(d.qq[0..n], d.qs, id);
+            }
+            pub inline fn distCutoff(d: @This(), id: u32, worst: f32) f32 {
+                const n = @min(d.n, d.qq.len);
+                if (d.suffix.len < n + 1) return d.s.distQ(d.qq[0..n], d.qs, id);
+                return d.s.distQCutoff(d.qq[0..n], d.qs, id, d.suffix, worst);
             }
         };
 
@@ -619,8 +657,11 @@ pub fn Hnsw(comptime D: type) type {
                         }
                     }
                     if (try alreadyVisited(visited, alloc, nid)) continue;
-                    const d = dist_ctx.dist(nid);
                     const w = if (results.count() > 0) results.peek().?.d else std.math.floatMax(f32);
+                    const d = if (results.count() >= ef and @hasDecl(@TypeOf(dist_ctx), "distCutoff"))
+                        dist_ctx.distCutoff(nid, w)
+                    else
+                        dist_ctx.dist(nid);
                     if (results.count() < ef or d < w) {
                         try candidates.push(alloc, .{ .id = nid, .d = d });
                         try results.push(alloc, .{ .id = nid, .d = d });
@@ -972,7 +1013,18 @@ pub fn Hnsw(comptime D: type) type {
                 }
                 break :blk buf;
             };
-            const ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = self.searchPrefix() };
+            const npref = self.searchPrefix();
+            var suffix_buf: [2048]i32 = undefined;
+            var heap_suf: ?[]i32 = null;
+            defer if (heap_suf) |h| alloc.free(h);
+            const suffix: []i32 = blk: {
+                const need = npref + 1;
+                if (need <= suffix_buf.len) break :blk suffix_buf[0..need];
+                heap_suf = try alloc.alloc(i32, need);
+                break :blk heap_suf.?;
+            };
+            vecmath.i8SuffixBound(qq[0..npref], suffix);
+            const ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = npref, .suffix = suffix };
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);
