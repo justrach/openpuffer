@@ -7,7 +7,7 @@ Best-so-far entering E001: p50 = 0.981 ms (the lower of E000's two runs).
 Best-so-far on main (M1) after E009: p50 = 0.830 ms (one-ahead qvec prefetch).
 Best-so-far on Linux Xeon AVX-512 (parallel cloud-agent lineage, now E012–E022): p50 = 0.575 ms. Not comparable to M1 numbers.
 Serving-path (HTTP, Linux, 2026-08-25): p50 1.646 ms → 1.084 ms after E023 → **1.026 ms serial / 0.435 ms keepalive** after E024 (worker pool + inline lone-conn). Not comparable to the in-process ANN metric. Concurrent new-TCP p50 rises on this 4-core host (memory-bound ANN); QPS is the scale score.
-Scale (dim=1536, ef=128, 16 GiB host): 1M ANN p50 **12.706 ms** / RSS 11153 MiB (no recall; `--no-exact`). 2M does not fit. Numbers live in the Scale section below — do not put them in the E-table p50 cell or results.svg.
+Scale (dim=1536, ef=128, 16 GiB host): flatten 1M random `--no-exact` p50 **1.410 ms** / RSS **7481 MiB**. Clustered 1M `--index-exact` recall@10 **0.846 (ef=64) / 0.942 (ef=128)**, p50 **0.382 / 0.429 ms**, RSS **7492 MiB**. Index+second f32 corpus at 1M does not fit. 2M not launched. Numbers live in the Scale/Pareto sections — not the E-table p50 cell or results.svg.
 Multi-instance sharding (N serve processes + Python router) is a **separate** design note below the Scale section — not an E-row.
 mmap slabs (E028, memory track): load-via-mmap RSS Δ**0.0 MiB** vs load-via-alloc **373.2 MiB** at n=50k / **1492.7 MiB** at n=200k (dim=1536, blank-slab reopen). Not an E-table p50. See Memory/mmap below.
 
@@ -59,6 +59,7 @@ map, not a full NVMe/SPDK/ZNS engine:
 | E027 | 2026-08-25 | drop the hot-path f32 copy (optional store_f32 / `--no-f32`) so 2M×1536 can fit on 16 GiB after E025 flatten | Options.store_f32 default true; `--no-f32` skips f32 slab; int8 traversal; rerank only if f32 present; serialize v2 omits f32, load still accepts v1 | src/hnsw.zig src/main.zig | pass | 0.679 | 0.3105 | +18% vs E022 0.575 (not a p50 claim) | keep | memory | MEMORY keep. Scored command unchanged (default still stores f32). `--no-f32` 20k recall **0.3100** (−0.0005). RSS `--no-exact`: 50k 375→**82** MiB; 200k 1689→**323** MiB. 2M `--no-exact --no-f32 --ef 128` **fits**: post-build **3222 MiB** (p50 1.760 ms — Scale section only, not this cell / not results.svg). Flatten 1M f32+i8 was 7481 MiB; dropping f32 is the ~5.7 GiB save. |
 | E028 | 2026-08-26 | mmap the flat HNSW slabs so a snapshot reopen is demand-paged (no copy-in of vectors_flat / qvecs_flat / packed CSR) | HMLS slab file; POSIX mmap MAP_PRIVATE; heap ArrayLists are the post-mmap append buffer; persist SNAP v2 envelope + page-aligned HMLS; atomic tmp+fsync+rename | src/hnsw.zig src/persist.zig | pass | — | — | — | keep | memory | MEMORY keep: MAP_PRIVATE + heap append. Reopen RSS ~0.8 MiB vs ~1.5 GiB alloc. load-via-mmap vs load-via-alloc (blank slabs, dim=1536): n=50k **Δ0.0 vs Δ373.2 MiB**; n=200k **Δ0.0 vs Δ1492.7 MiB**. Touching one mapped row stays Δ0.0. Snapshot file is never written by load/insert. Combined with E027 drop-f32 on GRAPH serialize. No NVMe/SPDK/ZNS. |
 | E029 | 2026-08-26 | remaining exclusive splice still blocks lockShared queries; publish node with a generation / reserved-slab RCU so mixed query p50 does not track write p50 | publishInsert + spliceBackEdges; nbr_gen/vec_gen seqlocks; exclusive only on slab grow; splice_mu publish; snapshot waits unspliced | src/hnsw.zig src/server.zig src/persist.zig tools/mixed_bench.py | pass | — | — | serve (not engine) | keep | serve | SERVING keep. Chart not regenerated — do not copy mixed HTTP p50 into this cell or results.svg. Mixed idle **2.08 ms** / mixed **3.78 ms (1.82×)** vs PR #3 2.31 / 5.17 (2.24×). See Mixed live section. |
+| E030 | 2026-08-26 | 1M clustered recall@10 is measurable without a second f32 corpus by scoring ANN against the index `vectors_flat` slab; ef=64/128 should hold ≥0.98 like 200k | `--index-exact` harness: no-retain insert + post-ANN brute-force vs stored f32; pre-reserve slabs so 1M does not 2×-peak; scored 20k path unchanged | src/main.zig | pass | — | 0.846 / 0.942 | — | keep | scale | SCALE keep (not a p50 claim; chart not regenerated). n=2000 clustered: index-exact recall matched corpus GT (1.0000 @ ef=64/128). 1M×1536 clustered 50q `--index-exact --ef-sweep 64,128`: build 1221 s (819 vec/s), RSS **7492 / 7499 / 7506** MiB. ef=64 p50 **0.382** ms recall@10 **0.8460**; ef=128 p50 **0.429** ms recall@10 **0.9420**. Exact GT 580 ms/q, 7.6 MiB Dist scratch. Hypothesis ≥0.98 was high — quality drops 200k→1M (0.98/0.998 → 0.846/0.942) but both hold ≫0.30. Index+second corpus (~13.6 GiB) does not fit. 2M not launched. HTTP-upsert 1M not launched. Do not copy 1M p50 into results.svg. |
 
 ## Scale (dim=1536, ef=128) — 2026-08-25, 16 GiB / 4-core Xeon, no swap
 
@@ -69,6 +70,7 @@ Host: MemTotal 16398384 kB, ulimit -v 14 GiB so a failed alloc dies instead of t
 Exact commands:
 
 ```
+./zig-out/bin/openpuffer bench-synthetic --n 1000000 --queries 50 --dim 1536 --k 10 --clustered --index-exact --ef-sweep 64,128
 ./zig-out/bin/openpuffer bench-synthetic --n 1000000 --queries 50 --dim 1536 --k 10 --ef 128 --no-exact
 ./zig-out/bin/openpuffer bench-synthetic --n 200000 --queries 50 --dim 1536 --k 10 --ef 128
 ./zig-out/bin/openpuffer bench-synthetic --n 50000 --queries 50 --dim 1536 --k 10 --ef 128
@@ -83,7 +85,9 @@ python3 tools/serve_bench.py --n 20000 --queries 50 --dim 1536 --k 10 --ef 128 -
 | 20k | 43.8 s (457 vec/s) | 0.532 ms | 1.596 ms | 3.820 ms | **0.3280** | — | control; 50 queries (metric uses 200 → recall 0.313) |
 | 50k | 119.1 s (420 vec/s) | 1.237 ms | 4.901 ms | 8.579 ms | **0.1860** | — | recall already under the 0.30 floor |
 | 200k | 661.4 s (302 vec/s) | 2.826 ms | 8.295 ms | 11.085 ms | **0.0400** | — | exact scan p50 107 ms; random 1536-d collapse |
-| 1M | 4657.7 s (215 vec/s) | 12.706 ms | 17.359 ms | 23.969 ms | skipped (`--no-exact`) | **11153 MiB** post-build / 11160 post-query | mean 12.645 ms, 3954 qps |
+| 1M | 4657.7 s (215 vec/s) | 12.706 ms | 17.359 ms | 23.969 ms | skipped (`--no-exact`) | **11153 MiB** post-build / 11160 post-query | old layout; mean 12.645 ms, 3954 qps |
+| 1M clustered | 1221 s (819 vec/s) | **0.382 / 0.429 ms** (ef=64/128) | 0.599 / 0.859 | 0.681 / 0.954 | **0.8460 / 0.9420** (`--index-exact`) | **7492 / 7499 / 7506** MiB | flatten; 50q; GT 580 ms/q; no second corpus; E030 |
+| 1M + retained corpus | — | — | — | — | — | ~13.6 GiB est. | **does not fit** with the index on 16 GiB / no swap |
 | 2M | — | — | — | — | — | would be ~22 GiB old-layout / ~15 GiB flatten+f32 | skipped on f32-on trees |
 | 2M `--no-f32` | 3767 s (531 vec/s) | 1.760 ms | 2.298 ms | 2.298 ms | skipped (`--no-exact`) | **3222 / 3227 MiB** | E027; **fits 16 GiB**. Do not copy this p50 into the E-table or results.svg. |
 | HTTP 20k ka | upsert 60.0 s | 1.118 ms | 2.445 ms | 3.997 ms | nonempty 50/50 | — | `serve --ef 128`; E024 ka at n=20k was 1.292 ms (old implicit ef=256) |
@@ -92,7 +96,7 @@ Recall@10 on uniform random 1536-d vectors falls off a cliff as n grows at fixed
 
 What is left at 1–2M:
 
-- **Recall at scale**: raise ef (or M / ef_construction) once n is large; measure on clustered embeddings, not only random.
+- **Recall at scale**: clustered 1M is now measured (`--index-exact`, no second corpus): ef=64 **0.846** / ef=128 **0.942**. Still ≫0.30; down from 0.98/0.998 at 200k. Random 1M recall still unknown (would need the same slab GT).
 - **Memory layout**: E025 flatten **measured** at 1M `--no-exact`: RSS **7481 MiB** (old layout 11153 MiB, −33%). Payload was the estimate; GPA waste is gone.
 - **Drop the f32 copy** (E027, done): `--no-f32` / `store_f32=false`. 50k 375→82 MiB; 200k 1689→323 MiB; **2M fits at 3222 MiB**. Default still stores f32 so the 20k scored bench is unchanged.
 - **mmap** the flat pools so RSS is demand-paged — **done in E028** (see Memory/mmap below).
@@ -205,6 +209,11 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 | 200k | 256 | 0.478 | 0.640 | 0.9980 | 2675 / 2911 MiB | yes |
 | 200k | 512 | 1.101 | 1.488 | 0.9980 | 2675 / 2991 MiB | yes |
 | 200k | 1024 | 2.100 | 2.473 | 0.9980 | 2675 / 3071 MiB | yes |
+| 1M | 64 | **0.382** | 0.599 | **0.8460** | **7492 / 7499 MiB** | **yes** (3906 centers; `--index-exact`) |
+| 1M | 128 | **0.429** | 0.859 | **0.9420** | 7492 / 7506 MiB | yes |
+| 1M + 2nd f32 corpus | — | — | — | — | ~13.6 GiB est. | **does not fit** (index already holds f32) |
+
+1M clustered command: `bench-synthetic --n 1000000 --queries 50 --dim 1536 --k 10 --clustered --index-exact --ef-sweep 64,128`. ANN timed first; slab GT after (580.1 ms/q, 7.6 MiB Dist scratch). Build 1221.4 s (819 vec/s). n=2000 control: index-exact recall == corpus GT (1.0000). First 1M attempt SIGTERM at 500k / 3758 MiB (peer, not OOM); retry completed.
 
 ### Recommended operating points (so far)
 
@@ -213,9 +222,9 @@ Scored metric on this tree (200 queries, ef=128, random): **p50 0.639 ms**, reca
 | 20k | **ef=128** (0.33 @ 0.62 ms) | **ef=64** (1.00 @ 0.16 ms) | scored default is already the random floor |
 | 50k | **ef=512** (0.45 @ 3.45 ms); ef=256 is 0.294 | **ef=64** (1.00 @ 0.20 ms) | random cannot hold 0.30 at serve default 128 |
 | 200k | **cannot hold 0.30** (ef=1024 → 0.264 @ 8.48 ms) | **ef=64** (0.98 @ 0.27 ms) or ef=128 (0.998 @ 0.31 ms) | random is not the quality axis at this n |
-| 1M | latency/RSS only (ef=128 → **1.410 ms**, RSS **7481 MiB**) | treat as clustered: **ef=64–128** | flatten vs old 12.7 ms / 11153 MiB; no recall (would not fit corpus+index) |
+| 1M | latency/RSS only (ef=128 → **1.410 ms**, RSS **7481 MiB**) | **ef=128** (0.942 @ 0.43 ms) or ef=64 (0.846 @ 0.38 ms) | `--index-exact`; RSS **7492 MiB**. Index+second corpus does not fit. 2M not launched. |
 
-Serve default **ef=128** is the right product default: clustered holds ≥0.98 at 20k–200k, and 1M query p50 stays 1.4 ms. Raise `--ef` only for uniform-random-like workloads (20k: 128, 50k: 512, 200k: cannot hold 0.30).
+Serve default **ef=128** is the right product default: clustered holds ≥0.98 at 20k–200k and **0.942 at 1M** (p50 0.43 ms). ef=64 still clears 0.30 at 1M (0.846) if you want the last tenth of a millisecond. Raise `--ef` only for uniform-random-like workloads (20k: 128, 50k: 512, 200k: cannot hold 0.30).
 
 1M `--no-exact` p50s are the clean latency numbers (no brute-force cache pollution). 20k–200k rows above compute exact recall after each query, which dirties cache — treat those p50s as slightly pessimistic vs a recall-free serve path. 200k random p50 is also inflated by a 1.2 GiB exact scan between queries.
 
