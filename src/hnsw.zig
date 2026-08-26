@@ -595,6 +595,13 @@ pub fn Hnsw(comptime D: type) type {
                     std.debug.print("VIOLATION c.id={d} its_layers={d} layer={d} max_level={d} ep={any} ep_layers={d}\n", .{ c.id, self.layerCount(c.id), layer, self.getMaxLevel(), self.entryPoint(), if (self.entryPoint()) |e| self.layerCount(e) else 0 });
                     @panic("hnsw invariant broken");
                 }
+                if (candidates.count() > 0) {
+                    @prefetch(self.neighborSlotsConst(candidates.peek().?.id, layer).ptr, .{
+                        .rw = .read,
+                        .locality = 3,
+                        .cache = .data,
+                    });
+                }
                 var nbr_buf: [64]u32 = undefined;
                 const nbrs = self.snapshotNeighbors(c.id, layer, &nbr_buf);
                 for (nbrs, 0..) |nid, ni| {
