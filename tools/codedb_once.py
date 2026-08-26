@@ -14,6 +14,7 @@ move the generic 1536-d engine best.
 
     python3 tools/codedb_once.py
     python3 tools/codedb_once.py --parse-only --log /tmp/codedb.log
+    python3 tools/codedb_once.py --parse-only --require-quality --log /tmp/codedb.log
     python3 tools/codedb_once.py --self-test
 """
 from __future__ import annotations
@@ -138,6 +139,15 @@ def decide(sample: dict, best: dict | None, host_key: str, have_control: bool) -
     return f"discard ({'; '.join(reasons)}; key={host_key})"
 
 
+def quality_gate_errors(sample: dict) -> list[str]:
+    errors = []
+    if sample["recall"] < RECALL_FLOOR:
+        errors.append(f"recall {sample['recall']:.4f} < {RECALL_FLOOR}")
+    if sample["rss_mib"] is None:
+        errors.append("post-query RSS unavailable")
+    return errors
+
+
 def self_test() -> None:
     log = """
 index built: 20000 vectors in 5800.0ms (3448 vec/s)
@@ -162,6 +172,10 @@ rss_mib phase=post-query current=284 peak=286
     assert b and b["id"] == "C000"
     assert "keep" in decide({"p50": 0.090, "recall": 1.0, "build_ms": 5500, "rss_mib": 280}, b, m4, True)
     assert "baseline" in decide(s, None, "linux-x86_64-intel-xeon/" + CODEDB_PROFILE, True)
+    assert quality_gate_errors(s) == []
+    low_recall = dict(s)
+    low_recall["recall"] = 0.7549
+    assert quality_gate_errors(low_recall) == ["recall 0.7549 < 0.99"]
     print("codedb_once self-test ok")
 
 
@@ -170,6 +184,11 @@ def main() -> int:
     ap.add_argument("--log", type=Path)
     ap.add_argument("--parse-only", action="store_true")
     ap.add_argument("--skip-test", action="store_true")
+    ap.add_argument(
+        "--require-quality",
+        action="store_true",
+        help="exit nonzero when recall or RSS availability fails the codedb quality gate",
+    )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -212,8 +231,13 @@ def main() -> int:
         f"rss {sample['rss_mib']}"
     )
     have_control = os.environ.get("OPENPUFFER_CONTROL_P50") is not None
-    print("verdict:", decide(sample, best, host_key, have_control))
+    verdict = decide(sample, best, host_key, have_control)
+    print("verdict:", verdict)
     print("need ≥2 samples and a fresh compatible control before a keep")
+    quality_errors = quality_gate_errors(sample)
+    if args.require_quality and quality_errors:
+        print("quality gate FAIL:", "; ".join(quality_errors), file=sys.stderr)
+        return 2
     return 0
 
 

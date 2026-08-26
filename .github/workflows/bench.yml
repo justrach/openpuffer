@@ -79,8 +79,9 @@ jobs:
             --n 20000 --queries 500 --dim 512 --k 24 --ef 128 \
             --rerank-mult 4 --clustered \
             | tee /tmp/codedb.log
-          python3 tools/codedb_once.py --parse-only --log /tmp/codedb.log \
-            | tee /tmp/codedb-verdict.txt
+          python3 tools/codedb_once.py --parse-only --require-quality \
+            --log /tmp/codedb.log > /tmp/codedb-verdict.txt
+          cat /tmp/codedb-verdict.txt
       - name: summary
         if: always()
         run: |
