@@ -495,7 +495,9 @@ pub fn Hnsw(comptime D: type) type {
                     std.atomic.spinLoopHint();
                     continue;
                 }
-                const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq, self.qvecConst(id)))) *
+                const stored = self.qvecConst(id);
+                const n = @min(qq.len, stored.len);
+                const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq[0..n], stored[0..n]))) *
                     qs * self.qscaleOf(id);
                 const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
                 if (g1 == g2) return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
@@ -514,10 +516,19 @@ pub fn Hnsw(comptime D: type) type {
             s: *const Self,
             qq: []const i8,
             qs: f32,
+            n: usize,
             pub inline fn dist(d: @This(), id: u32) f32 {
-                return d.s.distQ(d.qq, d.qs, id);
+                const n = @min(d.n, d.qq.len);
+                return d.s.distQ(d.qq[0..n], d.qs, id);
             }
         };
+
+        /// Drop the last 128 i8 dims on wide vectors (2 AVX-512 chunks).
+        fn searchPrefix(self: *const Self) usize {
+            if (self.dim < 512) return self.dim;
+            const keep = self.dim - 128;
+            return keep & ~@as(usize, 63);
+        }
 
         fn markVisited(visited: *std.DynamicBitSetUnmanaged, alloc: std.mem.Allocator, id: u32) !void {
             if (id >= visited.capacity()) {
@@ -769,7 +780,7 @@ pub fn Hnsw(comptime D: type) type {
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len() + 2048);
             defer visited.deinit(scratch);
-            const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale };
+            const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale, .n = q.q8.len };
             const ep_id = self.entryPoint().?;
             var ep: [1]Candidate = .{.{ .id = ep_id, .d = qctx.dist(ep_id) }};
             var cur = self.getMaxLevel();
@@ -954,7 +965,7 @@ pub fn Hnsw(comptime D: type) type {
                 }
                 break :blk buf;
             };
-            const ctx = QDist{ .s = self, .qq = qq, .qs = qs };
+            const ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = self.searchPrefix() };
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);
