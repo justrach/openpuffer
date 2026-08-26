@@ -7,6 +7,55 @@ head-to-head against [turbopuffer](https://turbopuffer.com), and an
 **autonomous optimization loop** in the style of
 [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
+## Zig library
+
+The in-process engine is a Zig module rooted at `src/lib.zig`. Dependents do
+**not** pull HTTP serve, S3, or the CLI:
+
+```sh
+zig fetch --save git+https://github.com/justrach/openpuffer
+```
+
+```zig
+// build.zig
+const openpuffer_dep = b.dependency("openpuffer", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("openpuffer", openpuffer_dep.module("openpuffer"));
+```
+
+```zig
+const std = @import("std");
+const openpuffer = @import("openpuffer");
+
+const Index = openpuffer.Hnsw(void);
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var idx = Index.init(alloc, 1536, .{});
+    defer idx.deinit();
+
+    const vec = [_]f32{1} ++ [_]f32{0} ** 1535;
+    _ = try idx.insert(&vec);
+    const hits = try idx.search(&vec, 10, 64, alloc);
+    defer alloc.free(hits);
+}
+```
+
+Memory knobs (same as the binary):
+
+- `Options.store_f32 = false` (CLI `--no-f32`) skips the packed f32 slab; search
+  is int8-only and `vector()` / `vectorConst()` are empty.
+- `index.writeSlabs(path)` then `loaded.loadMmap(path)` demand-pages a snapshot
+  (`MAP_PRIVATE` + heap append). `isMmapBacked()` is true after load.
+
+Public surface: `Hnsw`, `Options`, `SearchResult`, and vector helpers
+(`dot`, `cosineDistance`, `l2Norm`, `normalize`, `dotI8`).
+
 ## Engine highlights (`src/hnsw.zig`)
 
 - HNSW index over f32 vectors, cosine distance (vectors L2-normalized on insert)
@@ -17,46 +66,6 @@ head-to-head against [turbopuffer](https://turbopuffer.com), and an
 - Per-layer visited sets (a shared set silently disconnects the graph)
 - Optional `store_f32=false` / `--no-f32` drops the f32 slab (int8-only search)
 - `loadMmap` reopens a slab snapshot with POSIX `MAP_PRIVATE` (demand-paged RSS)
-
-## Zig library
-
-The HNSW engine is a Zig package. HTTP serve, S3, Gemini, and turbopuffer
-clients stay out of the module root.
-
-```zig
-// build.zig
-const openpuffer = b.dependency("openpuffer", .{
-    .target = target,
-    .optimize = optimize,
-});
-mod.addImport("openpuffer", openpuffer.module("openpuffer"));
-```
-
-```zig
-const std = @import("std");
-const hnsw = @import("openpuffer");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    var index = hnsw.Hnsw(void).init(alloc, 1536, .{ .store_f32 = true });
-    defer index.deinit();
-
-    const vec = [_]f32{1} ++ [_]f32{0} ** 1535;
-    _ = try index.insert(&vec);
-    const hits = try index.search(&vec, 10, 128, alloc);
-    defer alloc.free(hits);
-
-    // int8-only: hnsw.Hnsw(void).init(alloc, dim, .{ .store_f32 = false });
-    // snapshot reopen: try index.loadMmap("index.slabs");
-}
-```
-
-```sh
-zig fetch --save git+https://github.com/justrach/openpuffer
-```
 
 ## Server (`src/server.zig`) — drop-in turbopuffer API
 
@@ -149,8 +158,9 @@ noise here is ±3%). Everything lands in the append-only ledger at
 
 ## Layout
 
+- `src/lib.zig` — public module root (`@import("openpuffer")`; no HTTP serve)
 - `src/vector.zig` — SIMD dot product / cosine distance / normalization
-- `src/hnsw.zig` — HNSW index (+ connectivity/recall unit tests); package root (`@import("openpuffer")`)
+- `src/hnsw.zig` — HNSW index (+ connectivity/recall unit tests)
 - `build.zig.zon` — Zig package manifest for in-process dependents
 - `src/server.zig` — turbopuffer-compatible HTTP API over the local engine
 - `src/persist.zig` — WAL-segment + snapshot persistence to object storage
