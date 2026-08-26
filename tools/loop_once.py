@@ -139,6 +139,7 @@ def ledger_rows(text: str) -> list[dict]:
                 "verdict": verdict,
                 "recall": recall_v,
                 "track": track,
+                "notes": notes,
             }
         )
     return rows

@@ -21,6 +21,7 @@ FIXTURE = """
 | E009 | 2026-08-23 | prefetch | one-ahead | src/hnsw.zig | pass | 0.830 | 0.3130 | -11% | keep | engine | M1 Mac |
 | E022 | 2026-08-23 | visited prefetch | guard | src/hnsw.zig | pass | 0.710 / 0.575 | 0.3130 | -6.7% | keep | engine | Linux Xeon AVX-512 |
 | E025 | 2026-08-25 | flatten | slabs | src/hnsw.zig | pass | 0.744 / 0.581 | 0.3130 | +1% | keep | memory | MEMORY keep |
+| E040 | 2026-08-26 | m4 baseline | notes key | src/hnsw.zig | pass | 0.790 | 0.3105 | — | keep | engine | key=darwin-arm64-apple-m4/engine-20k-1536-k10-ef128 |
 """
 
 
@@ -41,8 +42,12 @@ def test_matching_host_only() -> None:
     b_m4 = best_engine(rows, m4)
     assert b_m1 == ("E009", 0.830), b_m1
     assert b_xeon == ("E022", 0.575), b_xeon
-    assert b_m4 is None, b_m4
-    assert "baseline" in decide(0.829, 0.3105, b_m4, m4)
+    assert b_m4 == ("E040", 0.790), b_m4
+    unmatched = make_key(
+        ENGINE_PROFILE, system="Darwin", machine="arm64", brand="Apple M3"
+    )
+    assert best_engine(rows, unmatched) is None
+    assert "baseline" in decide(0.829, 0.3105, None, unmatched)
     assert "key=" in decide(0.829, 0.3105, b_m4, m4)
     assert "E022" in decide(0.550, 0.3105, b_xeon, xeon)
     print("test_bench_key: matching host/profile only — ok")

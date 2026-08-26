@@ -1310,6 +1310,30 @@ test "parseAnnQuery reads optional ef" {
     try std.testing.expectEqual(@as(?usize, null), spec.rerank_mult);
 }
 
+test "recovery listing skips invalid object-key namespaces" {
+    const keys = [_][]const u8{
+        "openpuffer/../snapshot.bin",
+        "openpuffer/wal/snapshot.bin",
+        "openpuffer/codedb/nested/snapshot.bin",
+        "openpuffer/codedb/snapshot.bin",
+    };
+    var kept: usize = 0;
+    var last: []const u8 = "";
+    for (keys) |k| {
+        if (!std.mem.startsWith(u8, k, "openpuffer/")) continue;
+        const tail = k["openpuffer/".len..];
+        const slash = std.mem.indexOfScalar(u8, tail, '/') orelse continue;
+        const name = tail[0..slash];
+        if (!ns_mod.isValid(name)) continue;
+        if (std.mem.eql(u8, tail[slash + 1 ..], "snapshot.bin")) {
+            kept += 1;
+            last = name;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), kept);
+    try std.testing.expectEqualStrings("codedb", last);
+}
+
 test "takeNamespace rejects nested and empty names" {
     try std.testing.expectError(error.InvalidNamespace, takeNamespace("codedb/nested", ""));
     try std.testing.expectError(error.InvalidNamespace, takeNamespace("codedb/nested/query", "/query"));
