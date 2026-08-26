@@ -252,3 +252,15 @@ ef=1024 — do not spend engine budget chasing that cliff.
    512-d / k=24 / clustered ledger (`experiments/codedb.md`). It does
    not move the 1536-d engine best. Recall@24 floor is 0.99. This is an
    ANN engine number; embedder/GPU time is measured elsewhere.
+
+GHA `macos-latest` / `ubuntu-latest` (2026-08-26, PR #22, main tree
+without later engine keeps):
+
+| host key | engine p50 | recall@10 | post-query RSS | codedb p50 | recall@24 | codedb RSS |
+|---|---|---|---|---|---|---|
+| darwin-arm64-apple-m1 | 1.030 ms | 0.3105 | 310 MiB current/peak | 0.173 ms | 1.0000 | 185 MiB |
+| linux-x86_64 (GHA) | 0.852 ms | 0.3105 | 363 MiB current/peak | 0.123 ms | 1.0000 | 219 MiB |
+
+macOS printed numeric `rss_mib` (`resident_size`), not `unavailable`.
+GHA M1 is compared to E009 0.830, not Xeon E022 0.575. Do not mix
+these with the Linux Xeon flatten+RCU 0.433 ms keep.

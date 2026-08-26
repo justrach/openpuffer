@@ -34,7 +34,8 @@ is printed separately when the OS reports it.
 
 | id | date | p50 (ms) | recall@24 | build_ms | rss_mib | verdict | notes |
 |----|------|----------|-----------|----------|---------|---------|-------|
-| C000 | 2026-08-26 | — | — | — | — | running | seed row; fill on first same-host pair. Apple M4 Pro control cited in #20 was ~0.094–0.099 ms / recall 1.0 / build 5.5–6.1 s / ~284 MiB. |
+| C000 | 2026-08-26 | 0.173 | 1.0000 | 8659.6 | 185 | baseline | GHA macos-latest first sample. key=darwin-arm64-apple-m1/codedb-20k-512-k24-ef128-rm4. Need a second sample + control before a keep. Issue #20 M4 Pro cite (~0.094–0.099 / 284 MiB) is a different key. |
+| C001 | 2026-08-26 | 0.123 | 1.0000 | 5563.6 | 219 | baseline | GHA ubuntu-latest first sample. key=linux-x86_64-intel-xeon/codedb-20k-512-k24-ef128-rm4 (runner cpuinfo). Need a second sample + control. Not comparable to C000. |
 
 ## Migration
 

@@ -46,8 +46,16 @@ def test_matching_host_only() -> None:
     unmatched = make_key(
         ENGINE_PROFILE, system="Darwin", machine="arm64", brand="Apple M3"
     )
+    epyc = make_key(
+        ENGINE_PROFILE,
+        system="Linux",
+        machine="x86_64",
+        cpuinfo="vendor_id: AuthenticAMD\nmodel name: AMD EPYC 7763",
+    )
     assert best_engine(rows, unmatched) is None
+    assert best_engine(rows, epyc) is None
     assert "baseline" in decide(0.829, 0.3105, None, unmatched)
+    assert "baseline" in decide(0.852, 0.3105, None, epyc)
     assert "key=" in decide(0.829, 0.3105, b_m4, m4)
     assert "E022" in decide(0.550, 0.3105, b_xeon, xeon)
     print("test_bench_key: matching host/profile only — ok")

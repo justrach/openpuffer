@@ -2003,7 +2003,11 @@ test "hnsw slab mmap reopen + insert append buffer" {
     const planted = try index.insert(&v);
     const before = try index.search(&v, 5, 64, alloc);
 
-    const path = "/tmp/openpuffer-mmap-roundtrip.slabs";
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-roundtrip-{d}-{x}.slabs", .{
+        std.time.milliTimestamp(),
+        @intFromPtr(&path_buf),
+    });
     try index.writeSlabs(path);
 
     var loaded = Hnsw(void).init(alloc, dim, .{});
@@ -2061,7 +2065,11 @@ test "slab mmap vs alloc RSS (blank slabs)" {
     for (cases) |c| {
         if (c.n == 0) continue;
         var path_buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}.slabs", .{c.n});
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}-{d}-{x}.slabs", .{
+            c.n,
+            std.time.milliTimestamp(),
+            @intFromPtr(&path_buf),
+        });
         try Hnsw(void).writeBlankSlabs(path, c.n, c.dim, .{});
 
         const baseline = rssKiBSelf() orelse 0;

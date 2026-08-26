@@ -53,6 +53,10 @@ def _cpu_token(system: str, machine: str, cpuinfo: str = "", brand: str = "") ->
         if "m1" in blob:
             return "apple-m1"
         return "apple"
+    if "epyc" in blob or ("amd" in blob and "ryzen" not in blob):
+        return "amd-epyc"
+    if "ryzen" in blob:
+        return "amd-ryzen"
     if "xeon" in blob:
         return "intel-xeon"
     if "apple" in blob and ("m1" in blob or "m2" in blob or "m3" in blob or "m4" in blob):
@@ -179,12 +183,20 @@ def self_test() -> None:
         machine="x86_64",
         cpuinfo="model name: Intel(R) Xeon(R) Processor",
     )
+    epyc = make_key(
+        ENGINE_PROFILE,
+        system="Linux",
+        machine="x86_64",
+        cpuinfo="vendor_id: AuthenticAMD\nmodel name: AMD EPYC 7763",
+    )
     assert m1 == f"darwin-arm64-apple-m1/{ENGINE_PROFILE}", m1
     assert m4 == f"darwin-arm64-apple-m4/{ENGINE_PROFILE}", m4
     assert xeon == f"linux-x86_64-intel-xeon/{ENGINE_PROFILE}", xeon
+    assert epyc == f"linux-x86_64-amd-epyc/{ENGINE_PROFILE}", epyc
     assert keys_compatible(m1, infer_engine_key("E009", "M1 Mac") or "")
     assert keys_compatible(xeon, infer_engine_key("E022", "") or "")
     assert not keys_compatible(m4, xeon)
+    assert not keys_compatible(epyc, xeon)
     assert not keys_compatible(m1, m4)
     codedb = make_key(CODEDB_PROFILE, system="Darwin", machine="arm64", brand="Apple M4 Pro")
     assert codedb.endswith(CODEDB_PROFILE)
