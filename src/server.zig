@@ -507,7 +507,7 @@ fn handleIoUringConn(
             res.raw_status = .internal_server_error;
             res.raw_body = "{\"error\":\"internal\"}";
         };
-        const status_n: u16 = @backingInt(res.raw_status);
+        const status_n: u16 = @intFromEnum(res.raw_status);
         const phrase = res.raw_status.phrase() orelse "OK";
         const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
         try xfer.sendAll(fd, wire);
