@@ -21,7 +21,6 @@ const builtin = @import("builtin");
 const vecmath = @import("vector.zig");
 const rss = @import("rss.zig");
 const posix = std.posix;
-const linux = std.os.linux;
 
 /// Persist envelope magic ('OPSN' le). Duplicated so this file does not
 /// import persist.zig (persist already imports hnsw).
@@ -1334,38 +1333,42 @@ pub fn Hnsw(comptime D: type) type {
             return .{ .layout = layout, .entry = entry, .max_level = max_level, .m = m, .m0_factor = m0_factor, .efc = efc };
         }
 
-        fn sysWriteAll(fd: linux.fd_t, bytes: []const u8) !void {
+        fn sysWriteAll(fd: posix.fd_t, bytes: []const u8) !void {
             var off: usize = 0;
             while (off < bytes.len) {
-                const n = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+                const n = posix.system.write(fd, bytes[off..].ptr, bytes.len - off);
                 switch (posix.errno(n)) {
-                    .SUCCESS => off += n,
+                    .SUCCESS => off += @intCast(n),
                     .INTR => continue,
                     else => return error.WriteFailed,
                 }
             }
         }
 
-        fn sysPwriteAll(fd: linux.fd_t, bytes: []const u8, offset: u64) !void {
+        fn sysPwriteAll(fd: posix.fd_t, bytes: []const u8, offset: u64) !void {
             var off: usize = 0;
             while (off < bytes.len) {
-                const n = linux.pwrite(fd, bytes[off..].ptr, bytes.len - off, @intCast(offset + off));
+                const write_offset = std.math.add(u64, offset, off) catch return error.InvalidSlabLayout;
+                const file_offset = std.math.cast(posix.off_t, write_offset) orelse return error.InvalidSlabLayout;
+                const n = posix.system.pwrite(fd, bytes[off..].ptr, bytes.len - off, file_offset);
                 switch (posix.errno(n)) {
-                    .SUCCESS => off += n,
+                    .SUCCESS => off += @intCast(n),
                     .INTR => continue,
                     else => return error.WriteFailed,
                 }
             }
         }
 
-        fn sysPreadAll(fd: linux.fd_t, dest: []u8, offset: u64) !void {
+        fn sysPreadAll(fd: posix.fd_t, dest: []u8, offset: u64) !void {
             var off: usize = 0;
             while (off < dest.len) {
-                const n = linux.pread(fd, dest[off..].ptr, dest.len - off, @intCast(offset + off));
+                const read_offset = std.math.add(u64, offset, off) catch return error.InvalidSlabLayout;
+                const file_offset = std.math.cast(posix.off_t, read_offset) orelse return error.InvalidSlabLayout;
+                const n = posix.system.pread(fd, dest[off..].ptr, dest.len - off, file_offset);
                 switch (posix.errno(n)) {
                     .SUCCESS => {
                         if (n == 0) return error.Truncated;
-                        off += n;
+                        off += @intCast(n);
                     },
                     .INTR => continue,
                     else => return error.ReadFailed,
@@ -1373,7 +1376,22 @@ pub fn Hnsw(comptime D: type) type {
             }
         }
 
-        fn writeConcat(fd: linux.fd_t, file_off: u64, a: []const u8, b: []const u8) !void {
+        fn syncParentDir(path: []const u8) !void {
+            if (comptime builtin.os.tag == .windows) return;
+            const parent = std.fs.path.dirname(path) orelse ".";
+            const dir_fd = try posix.openat(posix.AT.FDCWD, parent, .{
+                .ACCMODE = .RDONLY,
+                .CLOEXEC = true,
+                .DIRECTORY = true,
+            }, 0);
+            defer _ = posix.system.close(dir_fd);
+            switch (posix.errno(posix.system.fsync(dir_fd))) {
+                .SUCCESS => {},
+                else => return error.SyncFailed,
+            }
+        }
+
+        fn writeConcat(fd: posix.fd_t, file_off: u64, a: []const u8, b: []const u8) !void {
             if (a.len > 0) try sysPwriteAll(fd, a, file_off);
             if (b.len > 0) try sysPwriteAll(fd, b, file_off + a.len);
         }
@@ -1430,34 +1448,35 @@ pub fn Hnsw(comptime D: type) type {
                 .CREAT = true,
                 .TRUNC = true,
                 .CLOEXEC = true,
-            }, 0o644);
+            }, 0o600);
             var closed = false;
             defer {
-                if (!closed) _ = linux.close(fd);
+                if (!closed) _ = posix.system.close(fd);
             }
             errdefer {
                 if (posix.toPosixPath(tmp)) |z| {
-                    _ = linux.unlink(&z);
+                    _ = posix.system.unlink(&z);
                 } else |_| {}
             }
             _ = try self.writeSlabsAt(fd, 0);
-            switch (posix.errno(linux.fdatasync(fd))) {
+            switch (posix.errno(posix.system.fdatasync(fd))) {
                 .SUCCESS => {},
                 else => return error.SyncFailed,
             }
-            _ = linux.close(fd);
+            _ = posix.system.close(fd);
             closed = true;
             const z_tmp = try posix.toPosixPath(tmp);
             const z_dst = try posix.toPosixPath(path);
-            switch (posix.errno(linux.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
+            switch (posix.errno(posix.system.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
                 .SUCCESS => {},
                 else => return error.RenameFailed,
             }
+            try syncParentDir(path);
         }
 
         /// Write an HMLS image starting at `hmls_off` in an already-open file.
         /// Used by persist to prefix a SNAP envelope. Returns image size.
-        pub fn writeSlabsAt(self: *const Self, fd: linux.fd_t, hmls_off: u64) !u64 {
+        pub fn writeSlabsAt(self: *const Self, fd: posix.fd_t, hmls_off: u64) !u64 {
             const n = self.len();
             const layout = SlabLayout.compute(n, self.dim, self.hiSlotCount(), self.l0Stride(), self.hiStride());
             var hdr: [SLAB_HEADER_SIZE]u8 = undefined;
@@ -1486,7 +1505,7 @@ pub fn Hnsw(comptime D: type) type {
             try writeConcat(fd, base + layout.hi_nbrs_off, std.mem.sliceAsBytes(self.mappedHiNbrs()), std.mem.sliceAsBytes(self.hi_nbrs.items));
 
             const end = hmls_off + layout.file_len;
-            switch (posix.errno(linux.ftruncate(fd, @intCast(end)))) {
+            switch (posix.errno(posix.system.ftruncate(fd, @intCast(end)))) {
                 .SUCCESS => {},
                 else => return error.TruncateFailed,
             }
@@ -1510,29 +1529,30 @@ pub fn Hnsw(comptime D: type) type {
                 .CREAT = true,
                 .TRUNC = true,
                 .CLOEXEC = true,
-            }, 0o644);
+            }, 0o600);
             var hdr: [SLAB_HEADER_SIZE]u8 = undefined;
             writeHeaderBytes(&hdr, layout, &index);
             const wr = sysPwriteAll(fd, &hdr, 0);
-            const tr = linux.ftruncate(fd, @intCast(layout.file_len));
-            const ds = linux.fdatasync(fd);
-            _ = linux.close(fd);
+            const tr = posix.system.ftruncate(fd, @intCast(layout.file_len));
+            const ds = posix.system.fdatasync(fd);
+            _ = posix.system.close(fd);
             wr catch {
                 const z = posix.toPosixPath(tmp) catch return error.WriteFailed;
-                _ = linux.unlink(&z);
+                _ = posix.system.unlink(&z);
                 return error.WriteFailed;
             };
             if (posix.errno(tr) != .SUCCESS or posix.errno(ds) != .SUCCESS) {
                 const z = posix.toPosixPath(tmp) catch return error.WriteFailed;
-                _ = linux.unlink(&z);
+                _ = posix.system.unlink(&z);
                 return error.WriteFailed;
             }
             const z_tmp = try posix.toPosixPath(tmp);
             const z_dst = try posix.toPosixPath(path);
-            switch (posix.errno(linux.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
+            switch (posix.errno(posix.system.renameat(posix.AT.FDCWD, &z_tmp, posix.AT.FDCWD, &z_dst))) {
                 .SUCCESS => {},
                 else => return error.RenameFailed,
             }
+            try syncParentDir(path);
         }
 
         fn sliceField(comptime T: type, bytes: []u8, off: usize, count: usize) ![]T {
@@ -1610,14 +1630,14 @@ pub fn Hnsw(comptime D: type) type {
         fn loadMmapPosix(self: *Self, path: []const u8) !void {
             if (self.len() != 0) return error.NotEmpty;
             const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-            const size64 = linux.lseek(fd, 0, linux.SEEK.END);
+            const size64 = posix.system.lseek(fd, 0, posix.system.SEEK.END);
             if (posix.errno(size64) != .SUCCESS) {
-                _ = linux.close(fd);
+                _ = posix.system.close(fd);
                 return error.SeekFailed;
             }
             const size: usize = @intCast(size64);
             if (size == 0) {
-                _ = linux.close(fd);
+                _ = posix.system.close(fd);
                 return error.Truncated;
             }
             const mapped = posix.mmap(
@@ -1628,10 +1648,10 @@ pub fn Hnsw(comptime D: type) type {
                 fd,
                 0,
             ) catch {
-                _ = linux.close(fd);
+                _ = posix.system.close(fd);
                 return error.MmapFailed;
             };
-            _ = linux.close(fd);
+            _ = posix.system.close(fd);
             errdefer posix.munmap(mapped);
             const off = try hmlsOffsetIn(mapped);
             try self.attachMapped(mapped, off);
@@ -1706,7 +1726,7 @@ pub fn Hnsw(comptime D: type) type {
         pub fn loadSlabsFile(self: *Self, path: []const u8) !void {
             if (self.len() != 0) return error.NotEmpty;
             const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-            defer _ = linux.close(fd);
+            defer _ = posix.system.close(fd);
             var peek: [4096]u8 = undefined;
             try sysPreadAll(fd, peek[0..32], 0);
             const off = try hmlsOffsetIn(peek[0..32]);
@@ -1732,7 +1752,7 @@ pub fn Hnsw(comptime D: type) type {
             const hi_stride = self.hiStride();
 
             const readInto = struct {
-                fn go(comptime T: type, list: *std.ArrayList(T), a: std.mem.Allocator, f: linux.fd_t, file_off: u64, count: usize) !void {
+                fn go(comptime T: type, list: *std.ArrayList(T), a: std.mem.Allocator, f: posix.fd_t, file_off: u64, count: usize) !void {
                     const dest = try list.addManyAsSlice(a, count);
                     if (count == 0) return;
                     try sysPreadAll(f, std.mem.sliceAsBytes(dest), file_off);
@@ -2059,7 +2079,7 @@ fn rssKiBSelf() ?u64 {
 }
 
 test "hnsw slab mmap reopen + insert append buffer" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -2081,7 +2101,7 @@ test "hnsw slab mmap reopen + insert append buffer" {
 
     var path_buf: [160]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-roundtrip-{d}-{x}.slabs", .{
-        if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
+        @intFromPtr(&path_buf),
         @intFromPtr(&path_buf),
     });
     try index.writeSlabs(path);
@@ -2131,8 +2151,8 @@ test "hnsw slab mmap reopen + insert append buffer" {
 }
 
 test "slab mmap vs alloc RSS (blank slabs)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const scale = builtin.mode != .debug;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const scale = builtin.mode != .Debug;
     const cases = [_]struct { n: usize, dim: usize }{
         .{ .n = if (scale) 50_000 else 256, .dim = if (scale) 1536 else 64 },
         .{ .n = if (scale) 200_000 else 0, .dim = 1536 },
@@ -2143,7 +2163,7 @@ test "slab mmap vs alloc RSS (blank slabs)" {
         var path_buf: [128]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "/tmp/openpuffer-mmap-rss-{d}-{d}-{x}.slabs", .{
             c.n,
-            if (builtin.os.tag == .linux) @as(u64, @intCast(std.os.linux.getpid())) else 0,
+            @intFromPtr(&path_buf),
             @intFromPtr(&path_buf),
         });
         try Hnsw(void).writeBlankSlabs(path, c.n, c.dim, .{});
@@ -2215,4 +2235,22 @@ test "publishInsert then spliceBackEdges matches commitInsert" {
         try std.testing.expectEqual(x.id, y.id);
         try std.testing.expectApproxEqAbs(x.distance, y.distance, 1e-6);
     }
+}
+
+test "optional HMLS sidecar loadMmap" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const c_path = std.c.getenv("OPENPUFFER_HMLS") orelse return error.SkipZigTest;
+    const path = std.mem.span(c_path);
+    var index = Hnsw(void).init(std.testing.allocator, 0, .{});
+    defer index.deinit();
+    try index.loadMmap(path);
+    try std.testing.expect(index.isMmapBacked());
+    try std.testing.expect(index.len() > 0);
+    try std.testing.expectEqual(@as(usize, 512), index.dim);
+    const q = index.vectorConst(0);
+    try std.testing.expectEqual(@as(usize, 512), q.len);
+    const hits = try index.search(q, 8, 48, std.testing.allocator);
+    defer std.testing.allocator.free(hits);
+    try std.testing.expect(hits.len > 0);
+    try std.testing.expectEqual(@as(u32, 0), hits[0].id);
 }
