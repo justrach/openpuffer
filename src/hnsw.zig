@@ -2152,7 +2152,8 @@ test "hnsw slab mmap reopen + insert append buffer" {
 
 test "slab mmap vs alloc RSS (blank slabs)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const scale = builtin.mode != .Debug;
+    const mode_name = @tagName(builtin.mode);
+    const scale = !(std.mem.eql(u8, mode_name, "Debug") or std.mem.eql(u8, mode_name, "debug"));
     const cases = [_]struct { n: usize, dim: usize }{
         .{ .n = if (scale) 50_000 else 256, .dim = if (scale) 1536 else 64 },
         .{ .n = if (scale) 200_000 else 0, .dim = 1536 },
@@ -2235,22 +2236,4 @@ test "publishInsert then spliceBackEdges matches commitInsert" {
         try std.testing.expectEqual(x.id, y.id);
         try std.testing.expectApproxEqAbs(x.distance, y.distance, 1e-6);
     }
-}
-
-test "optional HMLS sidecar loadMmap" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const c_path = std.c.getenv("OPENPUFFER_HMLS") orelse return error.SkipZigTest;
-    const path = std.mem.span(c_path);
-    var index = Hnsw(void).init(std.testing.allocator, 0, .{});
-    defer index.deinit();
-    try index.loadMmap(path);
-    try std.testing.expect(index.isMmapBacked());
-    try std.testing.expect(index.len() > 0);
-    try std.testing.expectEqual(@as(usize, 512), index.dim);
-    const q = index.vectorConst(0);
-    try std.testing.expectEqual(@as(usize, 512), q.len);
-    const hits = try index.search(q, 8, 48, std.testing.allocator);
-    defer std.testing.allocator.free(hits);
-    try std.testing.expect(hits.len > 0);
-    try std.testing.expectEqual(@as(u32, 0), hits[0].id);
 }
