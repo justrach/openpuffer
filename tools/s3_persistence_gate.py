@@ -261,9 +261,11 @@ class Gate:
             status, count = self.rig.client.count(ns)
             if status == 503 and allow_quarantined:
                 q_status, _ = self.rig.client.top10(ns, self.probes[ns][0][0])
-                assert q_status == 503, f"{ns}: count says quarantined but query answered {q_status}"
-                refused.add(ns)
-                continue
+                if q_status == 503:
+                    refused.add(ns)
+                    continue
+                # Healed between the two requests: from here it must be exact.
+                status, count = self.rig.client.count(ns)
             assert status == 200, f"{ns}: stats answered {status}"
             assert count == self.expected[ns], f"{ns}: {count} documents, expected {self.expected[ns]}"
             for vec, want in self.probes[ns]:
@@ -360,8 +362,11 @@ def run(args):
             rig.faults(get_503_pct=60)
             rig.start("read-faults")
             refused = gate.check(allow_quarantined=True)
+            # The healer runs during the faults too, so a quarantined namespace may
+            # come back between the check and these writes. A served one must
+            # never refuse; the exact counts below prove accepted writes landed.
             refused_writes = gate.write_strays(2)
-            assert refused_writes == refused, "a quarantined namespace accepted a write, or a served one refused"
+            assert refused_writes <= refused, f"served namespaces refused writes: {sorted(refused_writes - refused)}"
             extra = getattr(gate, "users_extra", None)
             if extra:
                 refused |= extra.check(allow_quarantined=True)
