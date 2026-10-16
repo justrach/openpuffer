@@ -210,12 +210,48 @@ const Registry = struct {
     namespaces: std.StringHashMapUnmanaged(*Namespace) = .empty,
     /// null when running without object-storage persistence
     store: ?*persist_mod.Store = null,
-    persist: ?*PersistWorker = null,
+    /// WAL upload lanes, each with its own S3 connection. A namespace always
+    /// maps to the same lane, so its segments stay in order, while different
+    /// namespaces upload in parallel instead of queueing behind one PUT.
+    lanes: []*PersistWorker = &.{},
+    /// Namespaces whose recovery failed. They are neither served nor
+    /// writable until a restart recovers them: a half-loaded index hides data,
+    /// and a write would reuse WAL sequence numbers or compact over the
+    /// snapshot, destroying what is still in object storage.
+    failed: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn laneFor(self: *Registry, name: []const u8) ?*PersistWorker {
+        if (self.lanes.len == 0) return null;
+        return self.lanes[std.hash.Wyhash.hash(0, name) % self.lanes.len];
+    }
+
+    fn isFailed(self: *Registry, name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.failed.contains(name);
+    }
+
+    /// Drop a partially recovered namespace and refuse it until restart.
+    fn quarantine(self: *Registry, name: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.namespaces.fetchRemove(name)) |kv| {
+            const ns = kv.value;
+            ns.index.deinit();
+            ns.id_map.deinit(self.alloc);
+            ns.doc_ids.deinit(self.alloc);
+            self.alloc.free(ns.name);
+            self.alloc.destroy(ns);
+        }
+        const owned = self.alloc.dupe(u8, name) catch return;
+        self.failed.put(self.alloc, owned, {}) catch self.alloc.free(owned);
+    }
 
     fn getOrCreate(self: *Registry, name: []const u8) !*Namespace {
         try ns_mod.validate(name);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.failed.contains(name)) return error.NamespaceUnavailable;
         if (self.namespaces.get(name)) |ns| return ns;
         const ns = try self.alloc.create(Namespace);
         ns.* = Namespace.init(self.alloc, try self.alloc.dupe(u8, name), self.io);
@@ -243,6 +279,10 @@ pub const Options = struct {
 /// Auto-compaction threshold: snapshot after this many WAL segments.
 const wal_compact_threshold: u64 = 8;
 
+/// WAL upload lanes (`OPENPUFFER_PERSIST_LANES`). Each lane is one thread
+/// with one kept-alive S3 connection.
+const default_persist_lanes: usize = 8;
+
 pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writer) !void {
     var registry = Registry{ .alloc = alloc, .io = io };
 
@@ -253,19 +293,34 @@ pub fn serve(alloc: std.mem.Allocator, io: std.Io, o: Options, out: *std.Io.Writ
         const store = try alloc.create(persist_mod.Store);
         store.* = persist_mod.Store.init(alloc, s3_client);
         registry.store = store;
-        const recovered = recoverAll(alloc, io, &registry, store, out) catch |e| blk: {
-            try out.print("recovery failed ({any}); serving empty (store unreachable?)\n", .{e});
+        // If the bucket can't even be listed, refuse to start. Serving empty
+        // would accept writes at WAL sequence 1 and compact over every
+        // namespace's real snapshot.
+        const recovered = recoverAll(alloc, io, &registry, store, out) catch |e| {
+            try out.print("FATAL: recovery could not list object storage ({any}); not serving, so nothing is overwritten\n", .{e});
             try out.flush();
-            break :blk @as(usize, 0);
+            return e;
         };
         if (recovered > 0) {
             try out.print("recovery total: {d:.1}ms\n", .{@as(f64, @floatFromInt(t_all.readNs(io))) / 1e6});
             try out.flush();
         }
-        const worker = try alloc.create(PersistWorker);
-        worker.* = .{ .alloc = alloc, .store = store, .io = io };
-        try worker.start();
-        registry.persist = worker;
+        var n_lanes = default_persist_lanes;
+        if (std.c.getenv("OPENPUFFER_PERSIST_LANES")) |v| {
+            n_lanes = std.fmt.parseInt(usize, std.mem.span(v), 10) catch n_lanes;
+        }
+        n_lanes = @max(1, @min(n_lanes, 64));
+        const lanes = try alloc.alloc(*PersistWorker, n_lanes);
+        for (lanes) |*lane| {
+            const lane_client = try alloc.create(s3_mod.Client);
+            lane_client.* = s3_mod.Client.init(alloc, io, cfg);
+            const lane_store = try alloc.create(persist_mod.Store);
+            lane_store.* = persist_mod.Store.init(alloc, lane_client);
+            lane.* = try alloc.create(PersistWorker);
+            lane.*.* = .{ .alloc = alloc, .store = lane_store, .io = io };
+            try lane.*.start();
+        }
+        registry.lanes = lanes;
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", o.port);
@@ -578,12 +633,36 @@ const NsPlan = struct {
 const RecoverJob = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
-    cfg: s3_mod.Config,
     registry: *Registry,
     keys: []const []const u8,
     plan: NsPlan,
     out: *std.Io.Writer,
     out_mu: *std.Io.Mutex,
+    ok: bool = false,
+};
+
+/// Parallel recovery is capped: one thread (and S3 connection) per namespace
+/// opened hundreds of connections at once and drew resets from the store.
+/// `OPENPUFFER_RECOVERY_WORKERS` overrides.
+const default_recovery_workers: usize = 32;
+
+const RecoverPool = struct {
+    jobs: []RecoverJob,
+    next: std.atomic.Value(usize) = .init(0),
+    cfg: s3_mod.Config,
+
+    /// One worker: one S3 client (kept-alive connection) for every namespace it takes.
+    fn work(pool: *RecoverPool) void {
+        const first = pool.jobs[0];
+        var client = s3_mod.Client.init(first.alloc, first.io, pool.cfg);
+        defer client.deinit();
+        var store = persist_mod.Store.init(first.alloc, &client);
+        while (true) {
+            const i = pool.next.fetchAdd(1, .monotonic);
+            if (i >= pool.jobs.len) return;
+            recoverOneNs(&pool.jobs[i], &store);
+        }
+    }
 };
 
 /// Load every namespace persisted under the store prefix: snapshot first,
@@ -631,51 +710,65 @@ fn recoverAll(
     var out_mu: std.Io.Mutex = .init;
     const jobs = try alloc.alloc(RecoverJob, plans.items.len);
     defer alloc.free(jobs);
-    var threads: std.ArrayList(std.Thread) = .empty;
-    defer threads.deinit(alloc);
     for (plans.items, 0..) |plan, i| {
         jobs[i] = .{
             .alloc = alloc,
             .io = io,
-            .cfg = store.client.cfg,
             .registry = registry,
             .keys = keys,
             .plan = plan,
             .out = out,
             .out_mu = &out_mu,
         };
-        const t = std.Thread.spawn(.{}, recoverOneNs, .{&jobs[i]}) catch {
-            recoverOneNs(&jobs[i]);
-            continue;
-        };
+    }
+    if (jobs.len == 0) return 0;
+
+    var pool = RecoverPool{ .jobs = jobs, .cfg = store.client.cfg };
+    var n_workers = default_recovery_workers;
+    if (std.c.getenv("OPENPUFFER_RECOVERY_WORKERS")) |v| {
+        n_workers = std.fmt.parseInt(usize, std.mem.span(v), 10) catch n_workers;
+    }
+    n_workers = @max(1, @min(n_workers, jobs.len));
+    var threads: std.ArrayList(std.Thread) = .empty;
+    defer threads.deinit(alloc);
+    for (0..n_workers) |_| {
+        const t = std.Thread.spawn(.{}, RecoverPool.work, .{&pool}) catch break;
         try threads.append(alloc, t);
     }
+    if (threads.items.len == 0) RecoverPool.work(&pool);
     for (threads.items) |t| t.join();
 
-    if (plans.items.len > 0) {
-        try out.print("recovered {d} namespace(s) from object storage in {d:.1}ms\n", .{
-            plans.items.len, @as(f64, @floatFromInt(t_all.readNs(io))) / 1e6,
-        });
+    var failed: usize = 0;
+    for (jobs) |job| {
+        if (!job.ok) {
+            failed += 1;
+            registry.quarantine(job.plan.name);
+        }
     }
-    return plans.items.len;
+    try out.print("recovered {d} namespace(s) from object storage in {d:.1}ms with {d} worker(s)\n", .{
+        jobs.len - failed, @as(f64, @floatFromInt(t_all.readNs(io))) / 1e6, threads.items.len,
+    });
+    if (failed > 0) {
+        try out.print("WARNING: {d} namespace(s) failed to recover and are quarantined (503 until a restart recovers them)\n", .{failed});
+    }
+    return jobs.len - failed;
 }
 
-fn recoverOneNs(job: *RecoverJob) void {
-    recoverOneNsInner(job) catch |e| {
+fn recoverOneNs(job: *RecoverJob, store: *persist_mod.Store) void {
+    recoverOneNsInner(job, store) catch |e| {
         job.out_mu.lockUncancelable(job.io);
         defer job.out_mu.unlock(job.io);
         job.out.print("  recover '{s}' failed: {any}\n", .{ job.plan.name, e }) catch {};
         job.out.flush() catch {};
+        return;
     };
+    job.ok = true;
 }
 
-fn recoverOneNsInner(job: *RecoverJob) !void {
+fn recoverOneNsInner(job: *RecoverJob, store: *persist_mod.Store) !void {
     const alloc = job.alloc;
     const io = job.io;
     const name = job.plan.name;
-    var client = s3_mod.Client.init(alloc, io, job.cfg);
-    defer client.deinit();
-    var store = persist_mod.Store.init(alloc, &client);
     const ns = try job.registry.getOrCreate(name);
 
     var last_seq: u64 = 0;
@@ -726,7 +819,7 @@ fn recoverOneNsInner(job: *RecoverJob) !void {
                 }
                 parsed.deinit();
                 t_build_done = t_build.readNs(io);
-                snapshotNamespace(&store, ns) catch {};
+                snapshotNamespace(store, ns) catch {};
             },
         }
         job.out_mu.lockUncancelable(io);
@@ -757,7 +850,7 @@ fn recoverOneNsInner(job: *RecoverJob) !void {
 
     if (replayed > 0) {
         var tc = Sw.start(io);
-        try snapshotNamespace(&store, ns);
+        try snapshotNamespace(store, ns);
         store.deleteWalListed(name, job.keys, ns.wal_seq);
         const t_compact = tc.readNs(io);
         job.out_mu.lockUncancelable(io);
@@ -953,14 +1046,16 @@ fn dispatch(
         const ns_name = takeNamespace(rest, "/snapshot") catch |e| switch (e) {
             error.InvalidNamespace => return respondInvalidNamespace(res, rest[0 .. rest.len - "/snapshot".len]),
         };
+        if (registry.isFailed(ns_name)) return respondJson(res, .service_unavailable, "{\"error\":\"namespace failed to load from object storage; quarantined until a restart recovers it\"}");
         const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
-        if (registry.store) |store| {
+        if (registry.laneFor(ns.name)) |lane| {
+            // On the namespace's own lane, serialized with its WAL uploads.
             var t = Sw.start(io);
-            if (registry.persist) |pw| pw.s3_mu.lockUncancelable(pw.io);
-            defer if (registry.persist) |pw| pw.s3_mu.unlock(pw.io);
-            try snapshotNamespace(store, ns);
-            store.deleteWalUpTo(ns.name, ns.wal_seq);
+            lane.s3_mu.lockUncancelable(lane.io);
+            defer lane.s3_mu.unlock(lane.io);
+            try snapshotNamespace(lane.store, ns);
+            lane.store.deleteWalUpTo(ns.name, ns.wal_seq);
             var buf: [128]u8 = undefined;
             const msg = try std.fmt.bufPrint(&buf, "{{\"ok\":true,\"snapshot_ms\":{d:.2}}}", .{@as(f64, @floatFromInt(t.readNs(io))) / 1e6});
             return respondJson(res, .ok, msg);
@@ -972,6 +1067,7 @@ fn dispatch(
         const ns_name = takeNamespace(rest, "/query") catch |e| switch (e) {
             error.InvalidNamespace => return respondInvalidNamespace(res, rest[0 .. rest.len - "/query".len]),
         };
+        if (registry.isFailed(ns_name)) return respondJson(res, .service_unavailable, "{\"error\":\"namespace failed to load from object storage; quarantined until a restart recovers it\"}");
         const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         return handleQuery(alloc, res, ns, o, body);
@@ -981,7 +1077,10 @@ fn dispatch(
         const ns_name = takeNamespace(rest, "") catch |e| switch (e) {
             error.InvalidNamespace => return respondInvalidNamespace(res, rest),
         };
-        const ns = try registry.getOrCreate(ns_name);
+        const ns = registry.getOrCreate(ns_name) catch |e| switch (e) {
+            error.NamespaceUnavailable => return respondJson(res, .service_unavailable, "{\"error\":\"namespace failed to load from object storage; quarantined until a restart recovers it\"}"),
+            else => return e,
+        };
         return handleWrite(alloc, registry.alloc, res, ns, body, registry);
     }
 
@@ -989,6 +1088,7 @@ fn dispatch(
         const ns_name = takeNamespace(rest, "") catch |e| switch (e) {
             error.InvalidNamespace => return respondInvalidNamespace(res, rest),
         };
+        if (registry.isFailed(ns_name)) return respondJson(res, .service_unavailable, "{\"error\":\"namespace failed to load from object storage; quarantined until a restart recovers it\"}");
         const ns = registry.get(ns_name) orelse
             return respondJson(res, .not_found, "{\"error\":\"namespace not found\"}");
         ns.lock.lockSharedUncancelable(ns.io);
@@ -1217,7 +1317,7 @@ fn handleWrite(
     }
 
     // durable WAL: group-commit via persist worker when configured
-    if (registry.persist != null or registry.store != null) {
+    if (registry.lanes.len != 0 or registry.store != null) {
         var wb: std.Io.Writer.Allocating = .init(persist);
         const ww = &wb.writer;
         try ww.writeAll("{\"docs\":[");
@@ -1232,7 +1332,7 @@ fn handleWrite(
         }
         try ww.writeAll("]}");
         const wal_body = try wb.toOwnedSlice();
-        if (registry.persist) |pw| {
+        if (registry.laneFor(ns.name)) |pw| {
             var job = WalJob{ .ns = ns, .body = wal_body };
             pw.commit(&job) catch |e| {
                 persist.free(job.body);
