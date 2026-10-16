@@ -38,6 +38,10 @@ jobs:
           python3 tools/bench_key.py
       - name: zig build test
         run: zig build test
+      - name: S3 persistence gate (fake S3 with injected faults)
+        run: |
+          zig build -Doptimize=ReleaseFast
+          python3 tools/s3_persistence_gate.py --bin zig-out/bin/openpuffer
       - name: x86_64 Windows persistence consumer compiles
         if: matrix.os == 'ubuntu-latest'
         run: zig build check-windows
