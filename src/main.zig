@@ -108,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
         var rerank_mult: usize = 4;
         var workers: ?usize = null;
         var s3_cfg: ?s3_mod.Config = null;
+        var persist_opts: server_mod.Options = .{};
         {
             const a = args.items[1..];
             if (optOf(a, "--port")) |v| port = std.fmt.parseInt(u16, v, 10) catch 8080;
@@ -116,6 +117,15 @@ pub fn main(init: std.process.Init) !void {
             if (optOf(a, "--workers")) |v| workers = std.fmt.parseInt(usize, v, 10) catch null;
             if (init.environ_map.get("OPENPUFFER_WORKERS")) |s| {
                 workers = std.fmt.parseInt(usize, s, 10) catch workers;
+            }
+            if (init.environ_map.get("OPENPUFFER_RECOVERY_WORKERS")) |s| {
+                persist_opts.recovery_workers = std.fmt.parseInt(usize, s, 10) catch persist_opts.recovery_workers;
+            }
+            if (init.environ_map.get("OPENPUFFER_PERSIST_LANES")) |s| {
+                persist_opts.persist_lanes = std.fmt.parseInt(usize, s, 10) catch persist_opts.persist_lanes;
+            }
+            if (init.environ_map.get("OPENPUFFER_HEAL_INITIAL_MS")) |s| {
+                persist_opts.heal_initial_ms = std.fmt.parseInt(u64, s, 10) catch persist_opts.heal_initial_ms;
             }
             if (optOf(a, "--s3-bucket")) |bucket| {
                 const creds = s3_mod.resolveCredentials(gpa, io, init.environ_map) catch {
@@ -131,7 +141,12 @@ pub fn main(init: std.process.Init) !void {
                 };
             }
         }
-        try server_mod.serve(gpa, io, .{ .port = port, .ef = ef, .rerank_mult = rerank_mult, .workers = workers, .s3_cfg = s3_cfg }, &w.interface);
+        persist_opts.port = port;
+        persist_opts.ef = ef;
+        persist_opts.rerank_mult = rerank_mult;
+        persist_opts.workers = workers;
+        persist_opts.s3_cfg = s3_cfg;
+        try server_mod.serve(gpa, io, persist_opts, &w.interface);
     } else if (std.mem.eql(u8, cmd, "shard-router")) {
         const a = args.items[1..];
         var so = shard_router.Options{};
