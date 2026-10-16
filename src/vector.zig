@@ -21,6 +21,28 @@ pub fn cosineDistance(a: []const f32, b: []const f32) f32 {
     return @max(0.0, 1.0 - @as(f32, @floatCast(dot(a, b))));
 }
 
+/// Squared Euclidean distance.
+pub fn l2Squared(a: []const f32, b: []const f32) f32 {
+    const lane = 16;
+    var acc: @Vector(lane, f32) = @splat(0);
+    var i: usize = 0;
+    while (i + lane <= a.len) : (i += lane) {
+        const va: @Vector(lane, f32) = a[i..][0..lane].*;
+        const vb: @Vector(lane, f32) = b[i..][0..lane].*;
+        const d = va - vb;
+        acc += d * d;
+    }
+    var sum: f32 = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) sum += (a[i] - b[i]) * (a[i] - b[i]);
+    return sum;
+}
+
+/// Reject empty, NaN or infinite vectors (metrics that keep vectors as given).
+pub fn checkFinite(v: []const f32) !void {
+    if (v.len == 0) return error.InvalidVectorDimensions;
+    for (v) |x| if (!std.math.isFinite(x)) return error.InvalidVectorValue;
+}
+
 pub fn l2Norm(v: []const f32) f32 {
     return @sqrt(@as(f32, @floatCast(dot(v, v))));
 }

@@ -79,6 +79,17 @@ namespace delete. Persistence mirrors turbopuffer's architecture
 S3-compatible bucket (AWS S3 or Cloudflare R2 via `src/s3.zig`, SigV4),
 snapshots compact consumed WAL entries, reads stay local and in-memory.
 
+Documents can carry attributes (any column besides `id` and `vector`:
+strings, numbers, booleans, null) and queries can filter on them
+(`filters: ["And", [["kind","Eq","fact"], ["priority","Gte",2]]]`; `Eq`,
+`NotEq`, `In`, `NotIn`, `Lt`, `Lte`, `Gt`, `Gte`, `And`, `Or`, `Not`) and
+return them (`include_attributes: true` or a list of names). Writes also take
+`deletes: [ids]` and `delete_by_filter`, and `distance_metric` may be
+`cosine_distance`, `euclidean_squared` or `dot_product`. A filter that leaves
+few rows is answered by scanning just those rows; otherwise the graph walk
+accepts only matching rows and keeps going until it has `ef` of them, so
+filtered queries return a full top-k. See `experiments/pgvector-parity.md`.
+
 ## Commands
 
 ```sh

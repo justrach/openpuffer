@@ -1,7 +1,7 @@
 //! Public in-process HNSW engine.
 //!
-//! Dependents `@import("openpuffer")` and get `Hnsw`, `Options`, `SearchResult`,
-//! and the SIMD vector helpers. HTTP serve (`src/server.zig`), persistence
+//! Dependents `@import("openpuffer")` and get `Hnsw`, `Options`, `Metric`,
+//! `SearchResult`, and the SIMD vector helpers. HTTP serve (`src/server.zig`), persistence
 //! clients, and the CLI are not part of this root.
 
 const hnsw = @import("hnsw.zig");
@@ -9,11 +9,13 @@ const vecmath = @import("vector.zig");
 
 pub const Hnsw = hnsw.Hnsw;
 pub const Options = hnsw.Options;
+pub const Metric = hnsw.Metric;
 pub const SearchResult = hnsw.SearchResult;
 
 pub const vector = vecmath;
 pub const dot = vecmath.dot;
 pub const cosineDistance = vecmath.cosineDistance;
+pub const l2Squared = vecmath.l2Squared;
 pub const l2Norm = vecmath.l2Norm;
 pub const normalize = vecmath.normalize;
 pub const dotI8 = vecmath.dotI8;

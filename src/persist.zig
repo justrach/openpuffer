@@ -18,6 +18,10 @@ pub const SNAP_MAGIC: u32 = 0x4E53504F; // 'OPSN' le
 pub const SNAP_VERSION: u32 = 1;
 /// Envelope + page-aligned HMLS slab image (mmap reopen, no copy-in).
 pub const SNAP_VERSION_SLAB: u32 = 2;
+/// v1 plus an extension blob (metric, attributes) between doc ids and graph:
+/// header | doc_ids | u64 ext_len | ext | graph. Written only when the
+/// namespace needs it, so cosine namespaces without attributes stay v1.
+pub const SNAP_VERSION_EXT: u32 = 3;
 
 /// Parse a WAL object filename (prefix already stripped) into a seq number.
 /// Accepts `00000000000000000001.json` and bare integers.
@@ -241,15 +245,28 @@ pub const Store = struct {
         doc_ids: []const u64,
         index: *const Hnsw,
     ) ![]u8 {
+        return buildBinarySnapshotExt(alloc, seq, dim, doc_ids, "", index);
+    }
+
+    /// Like `buildBinarySnapshot`, carrying `ext` (v3) when it is non-empty.
+    pub fn buildBinarySnapshotExt(
+        alloc: std.mem.Allocator,
+        seq: u64,
+        dim: usize,
+        doc_ids: []const u64,
+        ext: []const u8,
+        index: *const Hnsw,
+    ) ![]u8 {
         const graph = try index.serialize(alloc);
         defer alloc.free(graph);
         const n = doc_ids.len;
-        const header_len: usize = 32 + n * 8;
+        const ext_len: usize = if (ext.len == 0) 0 else 8 + ext.len;
+        const header_len: usize = 32 + n * 8 + ext_len;
         const buf = try alloc.alloc(u8, header_len + graph.len);
         var i: usize = 0;
         std.mem.writeInt(u32, buf[i..][0..4], SNAP_MAGIC, .little);
         i += 4;
-        std.mem.writeInt(u32, buf[i..][0..4], SNAP_VERSION, .little);
+        std.mem.writeInt(u32, buf[i..][0..4], if (ext.len == 0) SNAP_VERSION else SNAP_VERSION_EXT, .little);
         i += 4;
         std.mem.writeInt(u64, buf[i..][0..8], seq, .little);
         i += 8;
@@ -260,6 +277,12 @@ pub const Store = struct {
         for (doc_ids) |id| {
             std.mem.writeInt(u64, buf[i..][0..8], id, .little);
             i += 8;
+        }
+        if (ext.len != 0) {
+            std.mem.writeInt(u64, buf[i..][0..8], ext.len, .little);
+            i += 8;
+            @memcpy(buf[i..][0..ext.len], ext);
+            i += ext.len;
         }
         @memcpy(buf[i..], graph);
         return buf;
@@ -333,6 +356,9 @@ pub const BinaryHeader = struct {
     doc_ids_off: usize,
     graph_off: usize,
     version: u32 = SNAP_VERSION,
+    /// extension blob (v3); ext_len 0 when absent
+    ext_off: usize = 0,
+    ext_len: usize = 0,
 };
 
 pub fn parseBinaryHeader(body: []const u8) !BinaryHeader {
@@ -340,12 +366,18 @@ pub fn parseBinaryHeader(body: []const u8) !BinaryHeader {
     const magic = std.mem.readInt(u32, body[0..4], .little);
     if (magic != SNAP_MAGIC) return error.BadMagic;
     const version = std.mem.readInt(u32, body[4..8], .little);
-    if (version != SNAP_VERSION and version != SNAP_VERSION_SLAB) return error.UnsupportedVersion;
+    if (version != SNAP_VERSION and version != SNAP_VERSION_SLAB and version != SNAP_VERSION_EXT) return error.UnsupportedVersion;
     const seq = std.mem.readInt(u64, body[8..16], .little);
     const dim: usize = @intCast(std.mem.readInt(u64, body[16..24], .little));
     const n: usize = @intCast(std.mem.readInt(u64, body[24..32], .little));
     const doc_off: usize = 32;
     const raw_graph = 32 + n * 8;
+    if (version == SNAP_VERSION_EXT) {
+        if (body.len < raw_graph + 8) return error.Truncated;
+        const ext_len: usize = @intCast(std.mem.readInt(u64, body[raw_graph..][0..8], .little));
+        if (ext_len > body.len - raw_graph - 8) return error.Truncated;
+        return .{ .seq = seq, .dim = dim, .n = n, .doc_ids_off = doc_off, .graph_off = raw_graph + 8 + ext_len, .version = version, .ext_off = raw_graph + 8, .ext_len = ext_len };
+    }
     const graph_off = if (version == SNAP_VERSION_SLAB) Hnsw.pageAlign(raw_graph) else raw_graph;
     return .{ .seq = seq, .dim = dim, .n = n, .doc_ids_off = doc_off, .graph_off = graph_off, .version = version };
 }

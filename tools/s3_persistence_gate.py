@@ -14,6 +14,10 @@ Scenarios
                   it heals in the background once the store recovers, no restart
   read-faults     60% of GETs fail at restart: no namespace served partially;
                   all heal; a final clean restart still matches
+  attributes      cosine and euclidean namespaces with attributes, deletes and
+                  delete_by_filter, spanning a compaction and a WAL tail: after a
+                  restart, counts, metric and filtered top-10s (ids and attributes)
+                  are identical
   list-fails      the bucket cannot be listed: the server refuses to start and
                   leaves the bucket untouched
 
@@ -386,6 +390,60 @@ def run(args):
             return (f"{len(refused)} namespace(s) quarantined at restart and healed; none served partially; "
                     f"{injected} total injected 503s")
 
+        def attributes():
+            c = rig.client
+            filters = [None, ["kind", "Eq", "a"], ["n", "Gte", 100], ["kind", "In", ["z", "b"]],
+                       ["Not", ["kind", "Eq", "a"]]]
+
+            def post(path, body):
+                status, data = c.call("POST", path, body)
+                assert status == 200, f"{path}: {status} {data}"
+                return data
+
+            spaces = (("attr-cos", "cosine_distance"), ("attr-l2", "euclidean_squared"))
+            probes = {}
+            for ns, metric in spaces:
+                docs, probes[ns] = user_vectors(500, 120)
+                if metric == "euclidean_squared":  # norms differ, so the metric matters
+                    docs = [[x * (1 + i % 5) for x in d] for i, d in enumerate(docs)]
+                for start in range(0, 120, 10):  # 12 WAL segments: one compaction, then a tail
+                    ids = list(range(start, start + 10))
+                    post(f"/v2/namespaces/{ns}", {"upsert_columns": {
+                        "id": ids, "vector": docs[start:start + 10],
+                        "kind": [["a", "b", "c"][i % 3] for i in ids], "n": ids}, "distance_metric": metric})
+                post(f"/v2/namespaces/{ns}", {"deletes": list(range(0, 120, 7))})
+                post(f"/v2/namespaces/{ns}", {"delete_by_filter": ["And", [["kind", "Eq", "c"], ["n", "Lt", 60]]]})
+                post(f"/v2/namespaces/{ns}", {"upsert_rows": [{"id": 200, "vector": docs[5], "kind": "z", "n": -1},
+                                                              {"id": 3, "vector": docs[3]}]})
+
+            def answers():
+                out = {}
+                for ns, _ in spaces:
+                    status, stats = c.call("GET", f"/v2/namespaces/{ns}")
+                    assert status == 200, f"{ns}: stats answered {status}"
+                    out[ns] = [stats["count"], stats["metric"]]
+                    for p in probes[ns]:
+                        for f in filters:
+                            data = post(f"/v2/namespaces/{ns}/query", {"rank_by": ["vector", "ANN", p], "top_k": 10,
+                                                                       "filters": f, "include_attributes": True})
+                            out[ns].append([{k: (round(v, 4) if k == "$distance" else v) for k, v in r.items()}
+                                            for r in data["rows"]])
+                return out
+
+            before = answers()
+            # 120 docs - 18 deleted by id - delete_by_filter's matches + 1 new
+            assert before["attr-cos"][0] == before["attr-l2"][0] and 80 < before["attr-cos"][0] < 103, before["attr-cos"][0]
+            assert before["attr-l2"][1] == "euclidean_squared", before["attr-l2"][1]
+            for rows in before["attr-cos"][2:]:
+                assert all(r["id"] % 7 != 0 or r["id"] == 200 for r in rows), "a deleted id was returned"
+                assert all(not (r.get("kind") == "c" and r.get("n", 999) < 60) for r in rows), "delete_by_filter missed a row"
+                assert all(r["id"] != 3 or "kind" not in r for r in rows), "re-upserted doc kept old attributes"
+            rig.stop()
+            rig.start("attributes")
+            after = answers()
+            assert after == before, "filtered answers changed across a restart"
+            return f"{before['attr-cos'][0]} live docs per namespace; {len(filters) * 3 * 2} filtered top-10s identical after restart"
+
         def list_fails():
             rig.stop()
             files = rig.bucket_files()
@@ -406,6 +464,7 @@ def run(args):
         step("snapshot-fails", snapshot_fails)
         step("quarantine", quarantine)
         step("read-faults", read_faults)
+        step("attributes", attributes)
         step("list-fails", list_fails)
         print(f"all {len(results)} persistence scenarios passed")
         return 0

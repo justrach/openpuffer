@@ -1,6 +1,8 @@
 //! HNSW (Hierarchical Navigable Small World) ANN index, in-memory.
-//! Cosine distance; vectors are L2-normalized on insert so
+//! Cosine distance by default: vectors are L2-normalized on insert so
 //! cosine distance == 1 - dot, which keeps the inner loop tight.
+//! `Options.metric` also offers squared Euclidean and negative inner
+//! product; those keep vectors as given.
 //!
 //! Memory layout is flat / mmap-shaped (one slab per array, not one malloc
 //! per vector or per neighbor list). Snapshots persist those slabs as one
@@ -26,7 +28,33 @@ const posix = std.posix;
 /// import persist.zig (persist already imports hnsw).
 const SNAP_MAGIC_DUP: u32 = 0x4E53504F;
 
+pub const Metric = enum {
+    /// 1 - cos(a, b). Vectors are normalized on insert.
+    cosine,
+    /// |a - b|^2. Vectors are stored as given.
+    euclidean_squared,
+    /// -(a . b), so smaller is closer. Vectors are stored as given.
+    dot_product,
+
+    /// turbopuffer-style names (`distance_metric`).
+    pub fn name(m: Metric) []const u8 {
+        return switch (m) {
+            .cosine => "cosine_distance",
+            .euclidean_squared => "euclidean_squared",
+            .dot_product => "dot_product",
+        };
+    }
+
+    pub fn parse(s: []const u8) ?Metric {
+        for ([_]Metric{ .cosine, .euclidean_squared, .dot_product }) |m| {
+            if (std.mem.eql(u8, s, m.name())) return m;
+        }
+        return null;
+    }
+};
+
 pub const Options = struct {
+    metric: Metric = .cosine,
     m: u32 = 16,
     m0_factor: u32 = 2,
     ef_construction: u32 = 100,
@@ -39,6 +67,13 @@ pub const Options = struct {
 };
 
 pub const SearchResult = struct { id: u32, distance: f32 };
+
+/// The checks an insert under `metric` applies, without inserting: finite
+/// values, and a non-zero norm for cosine.
+pub fn checkVector(metric: Metric, v: []const f32) !void {
+    try vecmath.checkFinite(v);
+    if (metric == .cosine and vecmath.dot(v, v) == 0) return error.ZeroNormVector;
+}
 
 pub fn Hnsw(comptime D: type) type {
     _ = D;
@@ -81,6 +116,9 @@ pub fn Hnsw(comptime D: type) type {
         /// Per-node seqlock for in-place vector updates. Distances retry
         /// when the generation is odd or changes mid-dot.
         vec_gen: std.ArrayList(u32) = .empty,
+        /// Per-node squared L2 norm (heap, global ids; rebuilt on load).
+        /// Euclidean distance on int8 rows needs |b|^2 next to a . b.
+        sqnorms: std.ArrayList(f32) = .empty,
 
         /// Visible node count. `vectors_flat.items` may be ahead while a
         /// writer fills a new row; readers use this acquire-load.
@@ -150,6 +188,7 @@ pub fn Hnsw(comptime D: type) type {
             self.hi_nbrs.deinit(self.allocator);
             self.nbr_gen.deinit(self.allocator);
             self.vec_gen.deinit(self.allocator);
+            self.sqnorms.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -186,6 +225,7 @@ pub fn Hnsw(comptime D: type) type {
             if (self.hi_start.capacity < need_heap) return false;
             if (self.nbr_gen.capacity < total) return false;
             if (self.vec_gen.capacity < total) return false;
+            if (self.sqnorms.capacity < total) return false;
             const hi_extra = extra * 8;
             if (self.hi_deg.capacity < self.hi_deg.items.len + hi_extra) return false;
             if (self.hi_nbrs.capacity < self.hi_nbrs.items.len + hi_extra * self.hiStride()) return false;
@@ -211,6 +251,7 @@ pub fn Hnsw(comptime D: type) type {
             try self.hi_start.ensureTotalCapacity(alloc, need_heap);
             try self.nbr_gen.ensureTotalCapacity(alloc, total);
             try self.vec_gen.ensureTotalCapacity(alloc, total);
+            try self.sqnorms.ensureTotalCapacity(alloc, total);
             try self.hi_deg.ensureTotalCapacity(alloc, self.hi_deg.items.len + extra * 8);
             try self.hi_nbrs.ensureTotalCapacity(alloc, self.hi_nbrs.items.len + extra * 8 * self.hiStride());
         }
@@ -472,7 +513,12 @@ pub fn Hnsw(comptime D: type) type {
                     std.atomic.spinLoopHint();
                     continue;
                 }
-                const d = vecmath.cosineDistance(q, self.vectorConst(id));
+                const row = self.vectorConst(id);
+                const d: f32 = switch (self.opts.metric) {
+                    .cosine => vecmath.cosineDistance(q, row),
+                    .euclidean_squared => vecmath.l2Squared(q, row),
+                    .dot_product => -@as(f32, @floatCast(vecmath.dot(q, row))),
+                };
                 const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
                 if (g1 == g2) return d;
             }
@@ -482,12 +528,13 @@ pub fn Hnsw(comptime D: type) type {
         /// is stored; otherwise the same int8 score search already uses.
         inline fn distPair(self: *const Self, src: u32, dst: u32) f32 {
             if (self.opts.store_f32) return self.distTo(self.vectorConst(src), dst);
-            return self.distQ(self.qvecConst(src), self.qscaleOf(src), dst);
+            return self.distQ(self.qvecConst(src), self.qscaleOf(src), self.sqnorms.items[src], dst);
         }
 
-        inline fn distQ(self: *const Self, qq: []const i8, qs: f32, id: u32) f32 {
-            // stored vectors are unit-norm; a ~= aq * scale, so
-            // cos(a,b) ~= dot(aq,bq) * qs * scale_b
+        /// `qn2` is the query's squared norm (only euclidean uses it).
+        inline fn distQ(self: *const Self, qq: []const i8, qs: f32, qn2: f32, id: u32) f32 {
+            // a ~= aq * scale, so a . b ~= dot(aq,bq) * qs * scale_b
+            // (for cosine the rows are unit-norm and that is cos(a,b))
             while (true) {
                 const g1 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
                 if ((g1 & 1) != 0) {
@@ -498,8 +545,16 @@ pub fn Hnsw(comptime D: type) type {
                 const n = @min(qq.len, stored.len);
                 const approx = @as(f64, @floatFromInt(vecmath.dotI8(qq[0..n], stored[0..n]))) *
                     qs * self.qscaleOf(id);
+                const bn2 = self.sqnorms.items[id];
                 const g2 = @atomicLoad(u32, &self.vec_gen.items[id], .acquire);
-                if (g1 == g2) return @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+                if (g1 == g2) {
+                    const ab: f32 = @floatCast(approx);
+                    return switch (self.opts.metric) {
+                        .cosine => @max(0.0, 1.0 - ab),
+                        .euclidean_squared => @max(0.0, qn2 + bn2 - 2.0 * ab),
+                        .dot_product => -ab,
+                    };
+                }
             }
         }
 
@@ -515,10 +570,27 @@ pub fn Hnsw(comptime D: type) type {
             s: *const Self,
             qq: []const i8,
             qs: f32,
+            qn2: f32 = 1,
             n: usize,
             pub inline fn dist(d: @This(), id: u32) f32 {
                 const n = @min(d.n, d.qq.len);
-                return d.s.distQ(d.qq[0..n], d.qs, id);
+                return d.s.distQ(d.qq[0..n], d.qs, d.qn2, id);
+            }
+        };
+
+        /// Accept-everything predicate: the unfiltered search compiles to the
+        /// same loop it always had.
+        pub const AcceptAll = struct {
+            pub inline fn ok(_: AcceptAll, _: u32) bool {
+                return true;
+            }
+        };
+
+        /// Accept the ids set in a bitset (ids past its end are rejected).
+        pub const AcceptBits = struct {
+            bits: *const std.DynamicBitSetUnmanaged,
+            pub inline fn ok(a: AcceptBits, id: u32) bool {
+                return id < a.bits.bit_length and a.bits.isSet(id);
             }
         };
 
@@ -526,7 +598,7 @@ pub fn Hnsw(comptime D: type) type {
         /// profile. Other dimensions must keep their full traversal vector;
         /// applying it to codedb's 512-d profile reduced recall@24 to 0.7549.
         fn searchPrefix(self: *const Self) usize {
-            return if (self.dim == 1536) 1408 else self.dim;
+            return if (self.dim == 1536 and self.opts.metric == .cosine) 1408 else self.dim;
         }
 
         fn markVisited(visited: *std.DynamicBitSetUnmanaged, alloc: std.mem.Allocator, id: u32) !void {
@@ -551,6 +623,24 @@ pub fn Hnsw(comptime D: type) type {
         fn searchLayer(
             self: *const Self,
             dist_ctx: anytype,
+            entry_points: []const Candidate,
+            ef: usize,
+            layer: u32,
+            visited: *std.DynamicBitSetUnmanaged,
+            alloc: std.mem.Allocator,
+        ) !std.ArrayList(Candidate) {
+            return self.searchLayerAccept(dist_ctx, AcceptAll{}, entry_points, ef, layer, visited, alloc);
+        }
+
+        /// `searchLayer` that only lets rows passing `accept.ok(id)` into the
+        /// results. Rejected rows are still walked through, so the graph stays
+        /// connected under a filter, and the walk continues until `ef` accepted
+        /// rows are found or nothing closer is left (filtering during the
+        /// traversal rather than after it).
+        fn searchLayerAccept(
+            self: *const Self,
+            dist_ctx: anytype,
+            accept: anytype,
             entry_points: []const Candidate,
             ef: usize,
             layer: u32,
@@ -582,7 +672,7 @@ pub fn Hnsw(comptime D: type) type {
             for (entry_points) |c| {
                 try markVisited(visited, alloc, c.id);
                 try candidates.push(alloc, c);
-                try results.push(alloc, c);
+                if (accept.ok(c.id)) try results.push(alloc, c);
             }
 
             while (candidates.count() > 0) {
@@ -622,8 +712,10 @@ pub fn Hnsw(comptime D: type) type {
                     const w = if (results.count() > 0) results.peek().?.d else std.math.floatMax(f32);
                     if (results.count() < ef or d < w) {
                         try candidates.push(alloc, .{ .id = nid, .d = d });
-                        try results.push(alloc, .{ .id = nid, .d = d });
-                        if (results.count() > ef) _ = results.pop();
+                        if (accept.ok(nid)) {
+                            try results.push(alloc, .{ .id = nid, .d = d });
+                            if (results.count() > ef) _ = results.pop();
+                        }
                     }
                 }
             }
@@ -686,16 +778,14 @@ pub fn Hnsw(comptime D: type) type {
                 break :blk heap_tmp.?;
             };
             @memcpy(normalized, vector_in);
-            try vecmath.normalizeChecked(normalized);
-            var amax: f32 = 0;
-            for (normalized) |x| amax = @max(amax, @abs(x));
-            const scale = amax / 127.0;
+            try self.prepareRow(normalized);
+            const scale = quantScale(normalized);
             const g = @atomicLoad(u32, &self.vec_gen.items[id], .monotonic);
             @atomicStore(u32, &self.vec_gen.items[id], g +% 1, .release);
             if (self.opts.store_f32) @memcpy(self.vector(id), normalized);
-            const q8 = self.qvec(id);
-            for (normalized, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
+            quantizeInto(normalized, scale, self.qvec(id));
             self.setQscaleOf(id, scale);
+            self.sqnorms.items[id] = @floatCast(vecmath.dot(normalized, normalized));
             @atomicStore(u32, &self.vec_gen.items[id], g +% 2, .release);
         }
 
@@ -718,18 +808,37 @@ pub fn Hnsw(comptime D: type) type {
             }
         };
 
+        /// Cosine rows are normalized; the other metrics keep the vector as
+        /// given but still reject NaN/Inf.
+        fn prepareRow(self: *const Self, v: []f32) !void {
+            if (self.opts.metric == .cosine) return vecmath.normalizeChecked(v);
+            return vecmath.checkFinite(v);
+        }
+
+        fn quantScale(v: []const f32) f32 {
+            var amax: f32 = 0;
+            for (v) |x| amax = @max(amax, @abs(x));
+            return amax / 127.0;
+        }
+
+        fn quantizeInto(v: []const f32, scale: f32, out: []i8) void {
+            if (scale == 0) {
+                @memset(out, 0); // an all-zero row (allowed outside cosine)
+                return;
+            }
+            for (v, 0..) |x, di| out[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
+        }
+
         fn quantizeOwned(self: *const Self, vector_in: []const f32) !struct { copy: []f32, q8: []i8, scale: f32 } {
             const alloc = self.allocator;
             const copy = try alloc.alloc(f32, self.dim);
             errdefer alloc.free(copy);
             @memcpy(copy, vector_in);
-            try vecmath.normalizeChecked(copy);
-            var amax: f32 = 0;
-            for (copy) |x| amax = @max(amax, @abs(x));
-            const scale = amax / 127.0;
+            try self.prepareRow(copy);
+            const scale = quantScale(copy);
             const q8 = try alloc.alloc(i8, self.dim);
             errdefer alloc.free(q8);
-            for (copy, 0..) |x, di| q8[di] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
+            quantizeInto(copy, scale, q8);
             return .{ .copy = copy, .q8 = q8, .scale = scale };
         }
 
@@ -748,6 +857,7 @@ pub fn Hnsw(comptime D: type) type {
             try self.hi_start.append(alloc, @intCast(self.hi_deg.items.len));
             try self.nbr_gen.append(alloc, 0);
             try self.vec_gen.append(alloc, 0);
+            try self.sqnorms.append(alloc, @floatCast(vecmath.dot(copy, copy)));
             if (level > 0) {
                 const slots: usize = level;
                 const degs = try self.hi_deg.addManyAsSlice(alloc, slots);
@@ -779,7 +889,7 @@ pub fn Hnsw(comptime D: type) type {
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(scratch, self.len() + 2048);
             defer visited.deinit(scratch);
-            const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale, .n = q.q8.len };
+            const qctx = QDist{ .s = self, .qq = q.q8, .qs = q.scale, .qn2 = @floatCast(vecmath.dot(q.copy, q.copy)), .n = q.q8.len };
             const ep_id = self.entryPoint().?;
             var ep: [1]Candidate = .{.{ .id = ep_id, .d = qctx.dist(ep_id) }};
             var cur = self.getMaxLevel();
@@ -928,43 +1038,69 @@ pub fn Hnsw(comptime D: type) type {
             rerank_mult: usize,
             alloc: std.mem.Allocator,
         ) ![]SearchResult {
+            return self.searchAccept(query, k, ef_search, rerank_mult, AcceptAll{}, alloc);
+        }
+
+        /// A query prepared once per search: the f32 form (normalized for
+        /// cosine), its int8 form and scale, and its squared norm.
+        const PreparedQuery = struct {
+            nq: []const f32,
+            qq: []const i8,
+            qs: f32,
+            qn2: f32,
+            heap_nq: ?[]f32 = null,
+            heap_qq: ?[]i8 = null,
+
+            fn deinit(p: PreparedQuery, alloc: std.mem.Allocator) void {
+                if (p.heap_nq) |h| alloc.free(h);
+                if (p.heap_qq) |h| alloc.free(h);
+            }
+        };
+
+        fn prepareQuery(self: *const Self, query: []const f32, norm_buf: *[512]f32, qbuf: *[512]i8, alloc: std.mem.Allocator) !PreparedQuery {
+            var p: PreparedQuery = .{ .nq = &.{}, .qq = &.{}, .qs = 0, .qn2 = 0 };
+            errdefer p.deinit(alloc);
+            const nq: []f32 = if (query.len <= norm_buf.len) norm_buf[0..query.len] else blk: {
+                p.heap_nq = try alloc.alloc(f32, query.len);
+                break :blk p.heap_nq.?;
+            };
+            @memcpy(nq, query);
+            try self.prepareRow(nq);
+            // quantize the prepared query once; reuse the amax scan for qs
+            const qq: []i8 = if (nq.len <= qbuf.len) qbuf[0..nq.len] else blk: {
+                p.heap_qq = try alloc.alloc(i8, nq.len);
+                break :blk p.heap_qq.?;
+            };
+            p.qs = quantScale(nq);
+            quantizeInto(nq, p.qs, qq);
+            p.nq = nq;
+            p.qq = qq;
+            p.qn2 = @floatCast(vecmath.dot(nq, nq));
+            return p;
+        }
+
+        /// k-ANN search that only returns rows for which `accept.ok(id)` is
+        /// true (any type with `fn ok(self, u32) bool`). The walk goes through
+        /// rejected rows and keeps going until `ef` accepted ones are found, so
+        /// a filter does not cut results short the way filtering after an
+        /// ef-sized search does. Cost grows as the accepted share shrinks;
+        /// below a few thousand accepted rows `searchScan` is cheaper.
+        pub fn searchAccept(
+            self: *const Self,
+            query: []const f32,
+            k: usize,
+            ef_search: u32,
+            rerank_mult: usize,
+            accept: anytype,
+            alloc: std.mem.Allocator,
+        ) ![]SearchResult {
             if (query.len != self.dim) return error.DimensionMismatch;
             const ep_id = self.entryPoint() orelse return alloc.alloc(SearchResult, 0);
             var norm_buf: [512]f32 = undefined;
-            var heap_nq: ?[]f32 = null;
-            defer if (heap_nq) |h| alloc.free(h);
-            const nq: []const f32 = if (query.len <= norm_buf.len) blk: {
-                @memcpy(norm_buf[0..query.len], query);
-                try vecmath.normalizeChecked(norm_buf[0..query.len]);
-                break :blk norm_buf[0..query.len];
-            } else blk: {
-                heap_nq = try alloc.alloc(f32, query.len);
-                @memcpy(heap_nq.?, query);
-                try vecmath.normalizeChecked(heap_nq.?);
-                break :blk heap_nq.?;
-            };
-
-            // quantize the normalized query once; reuse the amax scan for qs
             var qbuf: [512]i8 = undefined;
-            var amax: f32 = 0;
-            for (nq) |x| amax = @max(amax, @abs(x));
-            const scale = amax / 127.0;
-            const qs: f32 = scale;
-            var heap_qq: ?[]i8 = null;
-            defer if (heap_qq) |h| alloc.free(h);
-            const qq: []const i8 = blk: {
-                const buf = if (nq.len <= qbuf.len) qbuf[0..nq.len] else blk2: {
-                    heap_qq = try alloc.alloc(i8, nq.len);
-                    break :blk2 heap_qq.?;
-                };
-                if (scale == 0) {
-                    @memset(buf, 0);
-                } else {
-                    for (nq, 0..) |x, i| buf[i] = @intFromFloat(std.math.clamp(@round(x / scale), -127.0, 127.0));
-                }
-                break :blk buf;
-            };
-            const ctx = QDist{ .s = self, .qq = qq, .qs = qs, .n = self.searchPrefix() };
+            const pq = try self.prepareQuery(query, &norm_buf, &qbuf, alloc);
+            defer pq.deinit(alloc);
+            const ctx = QDist{ .s = self, .qq = pq.qq, .qs = pq.qs, .qn2 = pq.qn2, .n = self.searchPrefix() };
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);
@@ -977,7 +1113,7 @@ pub fn Hnsw(comptime D: type) type {
                 ep[0] = res.items[0];
             }
 
-            var res = try self.searchLayer(ctx, &ep, @max(ef_search, k), 0, &visited, alloc);
+            var res = try self.searchLayerAccept(ctx, accept, &ep, @max(ef_search, k), 0, &visited, alloc);
             defer res.deinit(alloc);
 
             // exact rerank only when the f32 slab is present. Without it,
@@ -990,22 +1126,87 @@ pub fn Hnsw(comptime D: type) type {
             }
 
             const rerank_n = @min(res.items.len, @max(k * rerank_mult, k));
-            const Rerank = struct { id: u32, d: f32 };
-            var rr: std.ArrayList(Rerank) = .empty;
-            defer rr.deinit(alloc);
-            try rr.ensureTotalCapacity(alloc, rerank_n);
-            for (res.items[0..rerank_n]) |c| {
-                rr.appendAssumeCapacity(.{ .id = c.id, .d = self.distTo(nq, c.id) });
-            }
-            std.mem.sort(Rerank, rr.items, {}, struct {
-                fn lt(_: void, a: Rerank, b: Rerank) bool {
-                    return a.d < b.d;
-                }
-            }.lt);
+            for (res.items[0..rerank_n]) |*c| c.d = self.distTo(pq.nq, c.id);
+            std.mem.sort(Candidate, res.items[0..rerank_n], {}, candLess);
 
-            const out = try alloc.alloc(SearchResult, @min(k, rr.items.len));
-            for (out, 0..) |*o, i| o.* = .{ .id = rr.items[i].id, .distance = rr.items[i].d };
+            const out = try alloc.alloc(SearchResult, @min(k, rerank_n));
+            for (out, 0..) |*o, i| o.* = .{ .id = res.items[i].id, .distance = res.items[i].d };
             return out;
+        }
+
+        fn candLess(_: void, a: Candidate, b: Candidate) bool {
+            return a.d < b.d;
+        }
+
+        /// k-NN over the rows set in `allowed` (no graph walk). Linear in the
+        /// number of allowed rows: the right plan when a filter leaves few of
+        /// them. Up to `exact_scan_rows` rows it compares full-precision rows
+        /// and is exact; above that it scans the int8 rows (a quarter of the
+        /// memory traffic) and reranks the best `k * rerank_mult` exactly.
+        pub fn searchScan(
+            self: *const Self,
+            query: []const f32,
+            k: usize,
+            rerank_mult: usize,
+            allowed: *const std.DynamicBitSetUnmanaged,
+            alloc: std.mem.Allocator,
+        ) ![]SearchResult {
+            if (query.len != self.dim) return error.DimensionMismatch;
+            var norm_buf: [512]f32 = undefined;
+            var qbuf: [512]i8 = undefined;
+            const pq = try self.prepareQuery(query, &norm_buf, &qbuf, alloc);
+            defer pq.deinit(alloc);
+            const ctx = QDist{ .s = self, .qq = pq.qq, .qs = pq.qs, .qn2 = pq.qn2, .n = self.dim };
+            const exact = self.opts.store_f32 and allowed.count() <= exact_scan_rows;
+            const pool = if (exact or !self.opts.store_f32) k else @max(k * @max(rerank_mult, 1), 64);
+
+            // max-heap of the best `pool` so far
+            const Worst = struct {
+                fn cmp(_: void, a: Candidate, b: Candidate) std.math.Order {
+                    return std.math.order(b.d, a.d);
+                }
+            };
+            var best = std.PriorityQueue(Candidate, void, Worst.cmp).initContext({});
+            defer best.deinit(alloc);
+            try best.ensureTotalCapacity(alloc, pool + 1);
+            const n = self.len();
+            var it = allowed.iterator(.{});
+            while (it.next()) |i| {
+                if (i >= n) break;
+                const id: u32 = @intCast(i);
+                const d = if (exact) self.distTo(pq.nq, id) else ctx.dist(id);
+                if (best.count() < pool) {
+                    best.push(alloc, .{ .id = id, .d = d }) catch unreachable;
+                } else if (d < best.peek().?.d) {
+                    _ = best.pop();
+                    best.push(alloc, .{ .id = id, .d = d }) catch unreachable;
+                }
+            }
+            const cands = try alloc.alloc(Candidate, best.count());
+            defer alloc.free(cands);
+            for (cands) |*c| c.* = best.pop().?;
+            if (!exact and self.opts.store_f32) {
+                for (cands) |*c| c.d = self.distTo(pq.nq, c.id);
+            }
+            std.mem.sort(Candidate, cands, {}, candLess);
+            const out = try alloc.alloc(SearchResult, @min(k, cands.len));
+            for (out, 0..) |*o, i| o.* = .{ .id = cands[i].id, .distance = cands[i].d };
+            return out;
+        }
+
+        /// Above this many allowed rows `searchScan` scans int8 rows and
+        /// reranks instead of comparing every full-precision row.
+        pub const exact_scan_rows: usize = 2048;
+
+        /// Up to how many allowed rows a filtered query scans instead of
+        /// walking the graph. A filtered walk visits roughly
+        /// (unfiltered visits) / (allowed share) rows, so scanning wins while
+        /// allowed^2 < visits * n; visits ~ 32 * ef was measured on 768-d
+        /// rows (experiments/pgvector-parity.md).
+        pub fn scanLimit(self: *const Self, ef: u32) usize {
+            const n: f64 = @floatFromInt(self.len());
+            const visits: f64 = 32.0 * @as(f64, @floatFromInt(@max(ef, 16)));
+            return @max(2048, @as(usize, @intFromFloat(@sqrt(n * visits))));
         }
 
         pub const GRAPH_MAGIC: u32 = 0x57534E48; // 'HNSW' le
@@ -1214,6 +1415,25 @@ pub fn Hnsw(comptime D: type) type {
             }
             if (i != bytes.len) return error.TrailingBytes;
             @atomicStore(usize, &self.published, n, .release);
+            try self.fillSqnorms();
+        }
+
+        /// Squared norms are not in any snapshot format; recompute them for
+        /// loaded rows (from f32 when stored, else from the int8 row).
+        fn fillSqnorms(self: *Self) !void {
+            const n = self.len();
+            try self.sqnorms.ensureTotalCapacity(self.allocator, n);
+            var id: u32 = @intCast(self.sqnorms.items.len);
+            while (id < n) : (id += 1) {
+                const v: f32 = if (self.opts.store_f32 and self.vectorConst(id).len != 0)
+                    @floatCast(vecmath.dot(self.vectorConst(id), self.vectorConst(id)))
+                else blk: {
+                    const q = self.qvecConst(id);
+                    const sc = self.qscaleOf(id);
+                    break :blk @as(f32, @floatFromInt(vecmath.dotI8(q, q))) * sc * sc;
+                };
+                self.sqnorms.appendAssumeCapacity(v);
+            }
         }
 
         pub fn pageAlign(n: usize) usize {
@@ -1663,6 +1883,7 @@ pub fn Hnsw(comptime D: type) type {
                 self.nbr_gen.appendAssumeCapacity(0);
                 self.vec_gen.appendAssumeCapacity(0);
             }
+            try self.fillSqnorms();
         }
 
         fn copySlabInto(comptime T: type, list: *std.ArrayList(T), alloc: std.mem.Allocator, src: []const T) !void {
@@ -1720,6 +1941,7 @@ pub fn Hnsw(comptime D: type) type {
                 self.nbr_gen.appendAssumeCapacity(0);
                 self.vec_gen.appendAssumeCapacity(0);
             }
+            try self.fillSqnorms();
         }
 
         /// Read an HMLS (or persist v2) file into heap ArrayLists. No mmap.
@@ -1774,6 +1996,7 @@ pub fn Hnsw(comptime D: type) type {
                 self.nbr_gen.appendAssumeCapacity(0);
                 self.vec_gen.appendAssumeCapacity(0);
             }
+            try self.fillSqnorms();
         }
     };
 }
@@ -2236,4 +2459,152 @@ test "publishInsert then spliceBackEdges matches commitInsert" {
         try std.testing.expectEqual(x.id, y.id);
         try std.testing.expectApproxEqAbs(x.distance, y.distance, 1e-6);
     }
+}
+
+/// Exact top-k ids under `metric` for test oracles.
+fn bruteTopK(alloc: std.mem.Allocator, metric: Metric, rows: []const []const f32, q: []const f32, k: usize, keep: ?*const std.DynamicBitSetUnmanaged) ![]u32 {
+    const Pair = struct { id: u32, d: f32 };
+    var all: std.ArrayList(Pair) = .empty;
+    defer all.deinit(alloc);
+    for (rows, 0..) |r, i| {
+        if (keep) |b| if (!b.isSet(i)) continue;
+        const d: f32 = switch (metric) {
+            .cosine => 1 - @as(f32, @floatCast(vecmath.dot(q, r))) / (vecmath.l2Norm(q) * vecmath.l2Norm(r)),
+            .euclidean_squared => vecmath.l2Squared(q, r),
+            .dot_product => -@as(f32, @floatCast(vecmath.dot(q, r))),
+        };
+        try all.append(alloc, .{ .id = @intCast(i), .d = d });
+    }
+    std.mem.sort(Pair, all.items, {}, struct {
+        fn lt(_: void, a: Pair, b: Pair) bool {
+            return a.d < b.d;
+        }
+    }.lt);
+    const out = try alloc.alloc(u32, @min(k, all.items.len));
+    for (out, 0..) |*o, i| o.* = all.items[i].id;
+    return out;
+}
+
+fn overlap(a: []const u32, b: []const SearchResult) usize {
+    var hits: usize = 0;
+    for (b) |r| {
+        for (a) |x| hits += @intFromBool(x == r.id);
+    }
+    return hits;
+}
+
+test "euclidean and dot-product metrics keep vectors as given and match brute force" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const dim = 32;
+    for ([_]Metric{ .euclidean_squared, .dot_product }) |metric| {
+        var rng = std.Random.DefaultPrng.init(7);
+        var index = Hnsw(void).init(alloc, dim, .{ .metric = metric });
+        defer index.deinit();
+        var rows: std.ArrayList([]f32) = .empty;
+        for (0..1500) |_| {
+            const v = try alloc.alloc(f32, dim);
+            // norms vary from ~0.5x to ~4x, so normalizing would change the answer
+            const scale = 0.5 + 3.5 * rng.random().float(f32);
+            for (v) |*x| x.* = scale * rng.random().floatNorm(f32);
+            _ = try index.insert(v);
+            try rows.append(alloc, v);
+        }
+        // an all-zero row is fine outside cosine
+        const zero = try alloc.alloc(f32, dim);
+        @memset(zero, 0);
+        _ = try index.insert(zero);
+        try rows.append(alloc, zero);
+
+        var hits: usize = 0;
+        for (0..40) |_| {
+            var q: [dim]f32 = undefined;
+            for (&q) |*x| x.* = 2 * rng.random().floatNorm(f32);
+            const want = try bruteTopK(alloc, metric, rows.items, &q, 10, null);
+            const got = try index.search(&q, 10, 128, alloc);
+            hits += overlap(want, got);
+            // reported distances are exact under the metric
+            const r0 = rows.items[got[0].id];
+            const exact: f32 = if (metric == .euclidean_squared) vecmath.l2Squared(&q, r0) else -@as(f32, @floatCast(vecmath.dot(&q, r0)));
+            try std.testing.expectApproxEqRel(exact, got[0].distance, 1e-4);
+        }
+        try std.testing.expect(hits >= 40 * 10 * 95 / 100);
+
+        // serialize/load recomputes the squared norms euclidean needs
+        const blob = try index.serialize(alloc);
+        var loaded = Hnsw(void).init(alloc, 0, .{ .metric = metric });
+        defer loaded.deinit();
+        try loaded.load(blob);
+        var q: [dim]f32 = undefined;
+        for (&q) |*x| x.* = rng.random().floatNorm(f32);
+        const a = try index.search(&q, 10, 64, alloc);
+        const b = try loaded.search(&q, 10, 64, alloc);
+        for (a, b) |x, y| try std.testing.expectEqual(x.id, y.id);
+    }
+}
+
+test "filtered search returns only accepted rows; scan is exact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const dim = 24;
+    var rng = std.Random.DefaultPrng.init(3);
+    var index = Hnsw(void).init(alloc, dim, .{});
+    defer index.deinit();
+    var rows: std.ArrayList([]f32) = .empty;
+    const n = 4000;
+    for (0..n) |_| {
+        const v = try alloc.alloc(f32, dim);
+        for (v) |*x| x.* = rng.random().floatNorm(f32);
+        _ = try index.insert(v);
+        try rows.append(alloc, v);
+    }
+    // 2% of rows, scattered
+    var keep = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
+    for (0..n) |i| {
+        if (i % 50 == 7) keep.set(i);
+    }
+
+    var walk_hits: usize = 0;
+    for (0..30) |_| {
+        var q: [dim]f32 = undefined;
+        for (&q) |*x| x.* = rng.random().floatNorm(f32);
+        const want = try bruteTopK(alloc, .cosine, rows.items, &q, 10, &keep);
+
+        const walked = try index.searchAccept(&q, 10, 64, 4, Hnsw(void).AcceptBits{ .bits = &keep }, alloc);
+        try std.testing.expectEqual(@as(usize, 10), walked.len);
+        for (walked) |r| try std.testing.expect(keep.isSet(r.id));
+        walk_hits += overlap(want, walked);
+
+        const scanned = try index.searchScan(&q, 10, 4, &keep, alloc);
+        try std.testing.expectEqual(@as(usize, 10), scanned.len);
+        for (want, scanned) |w, r| try std.testing.expectEqual(w, r.id);
+    }
+    // filtering during the walk keeps recall; post-filtering an ef=64 result
+    // would return ~1 of 10 rows here
+    try std.testing.expect(walk_hits >= 30 * 10 * 90 / 100);
+
+    // past exact_scan_rows the scan reads int8 rows and reranks
+    var most = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
+    for (0..n) |i| {
+        if (i % 5 != 0) most.set(i);
+    }
+    try std.testing.expect(most.count() > Hnsw(void).exact_scan_rows);
+    var scan_hits: usize = 0;
+    for (0..30) |_| {
+        var q: [dim]f32 = undefined;
+        for (&q) |*x| x.* = rng.random().floatNorm(f32);
+        const want = try bruteTopK(alloc, .cosine, rows.items, &q, 10, &most);
+        const got = try index.searchScan(&q, 10, 4, &most, alloc);
+        for (got) |r| try std.testing.expect(most.isSet(r.id));
+        scan_hits += overlap(want, got);
+    }
+    try std.testing.expect(scan_hits >= 30 * 10 * 98 / 100);
+
+    // an empty filter returns nothing from either path
+    var none = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
+    try std.testing.expectEqual(@as(usize, 0), (try index.searchScan(rows.items[0], 5, 4, &none, alloc)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try index.searchAccept(rows.items[0], 5, 32, 4, Hnsw(void).AcceptBits{ .bits = &none }, alloc)).len);
+    try std.testing.expect(index.scanLimit(64) >= 2048);
 }
