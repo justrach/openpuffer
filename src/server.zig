@@ -437,17 +437,6 @@ const FdQueue = struct {
         self.mu.unlock(self.io);
     }
 
-    fn tryPush(self: *FdQueue, fd: std.posix.fd_t) bool {
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        if (self.count == self.slots.len) return false;
-        self.slots[self.tail] = fd;
-        self.tail = (self.tail + 1) % self.slots.len;
-        self.count += 1;
-        self.cv.signal(self.io);
-        return true;
-    }
-
     fn pop(self: *FdQueue) std.posix.fd_t {
         self.mu.lockUncancelable(self.io);
         while (self.count == 0) {
@@ -478,13 +467,54 @@ fn listenPending(listen_fd: std.posix.fd_t) bool {
     return n > 0 and pfd[0].revents & std.os.linux.POLL.IN != 0;
 }
 
-fn drainListenBacklog(listen_fd: std.posix.fd_t, queue: *FdQueue) void {
+/// Idle keep-alive connections wait here instead of in a worker. Workers used
+/// to requeue every keep-alive fd, and the next worker to pop it blocked in
+/// `recv` until that client spoke again: with as many idle clients as
+/// workers, every other connection stalled. The watcher holds idle fds in an
+/// epoll set (one-shot, removed as they fire) and queues an fd for the
+/// workers only once it has bytes to read or has been closed.
+const IdleWatcher = struct {
+    epfd: std.posix.fd_t,
+    queue: *FdQueue,
+
+    fn init(queue: *FdQueue) !IdleWatcher {
+        const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.EpollUnavailable;
+        return .{ .epfd = @intCast(rc), .queue = queue };
+    }
+
+    /// Wait for the client's next request off the worker threads.
+    fn park(self: *IdleWatcher, fd: std.posix.fd_t) void {
+        var ev = std.os.linux.epoll_event{
+            .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.RDHUP | std.os.linux.EPOLL.ONESHOT,
+            .data = .{ .fd = fd },
+        };
+        const rc = std.os.linux.epoll_ctl(self.epfd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
+        // Never drop a connection: if it can't be watched, a worker takes it.
+        if (std.os.linux.errno(rc) != .SUCCESS) self.queue.push(fd);
+    }
+
+    fn run(self: *IdleWatcher) void {
+        var events: [64]std.os.linux.epoll_event = undefined;
+        while (true) {
+            const rc = std.os.linux.epoll_wait(self.epfd, &events, events.len, -1);
+            if (std.os.linux.errno(rc) != .SUCCESS) continue; // EINTR
+            for (events[0..rc]) |ev| {
+                const fd = ev.data.fd;
+                _ = std.os.linux.epoll_ctl(self.epfd, std.os.linux.EPOLL.CTL_DEL, fd, null);
+                self.queue.push(fd);
+            }
+        }
+    }
+};
+
+fn drainListenBacklog(listen_fd: std.posix.fd_t, watcher: *IdleWatcher) void {
     while (listenPending(listen_fd)) {
         const res = std.os.linux.accept4(listen_fd, null, null, std.os.linux.SOCK.CLOEXEC);
         if (std.os.linux.errno(res) != .SUCCESS) return;
         const fd: std.posix.fd_t = @intCast(res);
         iouring.enableTcpNoDelay(fd);
-        queue.push(fd);
+        watcher.park(fd);
     }
 }
 
@@ -494,20 +524,25 @@ const PoolCtx = struct {
     registry: *Registry,
     o: Options,
     queue: *FdQueue,
+    watcher: *IdleWatcher,
     listen_fd: std.posix.fd_t,
 };
 
-fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options, listen_fd: std.posix.fd_t) !*FdQueue {
+fn startWorkerPool(alloc: std.mem.Allocator, io: std.Io, registry: *Registry, o: Options, listen_fd: std.posix.fd_t) !*IdleWatcher {
     const queue = try alloc.create(FdQueue);
     queue.* = .{ .io = io };
+    const watcher = try alloc.create(IdleWatcher);
+    watcher.* = try IdleWatcher.init(queue);
+    const wt = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, IdleWatcher.run, .{watcher});
+    wt.detach();
     const ctx = try alloc.create(PoolCtx);
-    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue, .listen_fd = listen_fd };
+    ctx.* = .{ .alloc = alloc, .io = io, .registry = registry, .o = o, .queue = queue, .watcher = watcher, .listen_fd = listen_fd };
     const n = workerCount(ctx.o);
     for (0..n) |_| {
         const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, poolWorker, .{ctx});
         t.detach();
     }
-    return queue;
+    return watcher;
 }
 
 fn poolWorker(ctx: *PoolCtx) void {
@@ -519,7 +554,7 @@ fn poolWorker(ctx: *PoolCtx) void {
     var xfer = ConnXfer{};
     while (true) {
         const fd = ctx.queue.pop();
-        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.queue, ctx.listen_fd) catch .close;
+        const end = handleIoUringConn(&xfer, fd, ctx.alloc, ctx.io, ctx.registry, ctx.o, &store, &arena_state, ctx.watcher, ctx.listen_fd) catch .close;
         if (end == .close) _ = std.os.linux.close(fd);
     }
 }
@@ -558,8 +593,8 @@ fn serveIoUring(
     out: *std.Io.Writer,
 ) !void {
     _ = std.os.linux.listen(listen_fd, 1024);
-    const queue = try startWorkerPool(alloc, io, registry, o, listen_fd);
-    try out.print("linux serve: io_uring accept + {d} keep-alive workers (fair rotate), ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
+    const watcher = try startWorkerPool(alloc, io, registry, o, listen_fd);
+    try out.print("linux serve: io_uring accept + {d} keep-alive workers (idle connections parked in epoll), ef={d} rerank_mult={d}, TCP_NODELAY\n", .{ workerCount(o), o.ef, o.rerank_mult });
     try out.flush();
     var ring = try iouring.Ring.init();
     defer ring.deinit();
@@ -572,9 +607,10 @@ fn serveIoUring(
         iouring.enableTcpNoDelay(fd);
         // Never handle on the accept thread: a keep-alive query would pin
         // accept and leave upserts sitting in the listen backlog until they
-        // time out (~3s). Always queue; workers rotate after each request.
-        drainListenBacklog(listen_fd, queue);
-        queue.push(fd);
+        // time out (~3s). New connections wait in the watcher like idle ones,
+        // so a client that connects and stays quiet never holds a worker.
+        drainListenBacklog(listen_fd, watcher);
+        watcher.park(fd);
     }
 }
 
@@ -603,7 +639,7 @@ fn handleIoUringConn(
     o: Options,
     store: *std.ArrayList(u8),
     arena_state: *std.heap.ArenaAllocator,
-    queue: ?*FdQueue,
+    watcher: ?*IdleWatcher,
     listen_fd: ?std.posix.fd_t,
 ) !ConnEnd {
     var n: usize = 0;
@@ -635,17 +671,20 @@ fn handleIoUringConn(
         try xfer.sendAll(fd, wire);
 
         if (!keepalive) return .close;
-        // One request per pop. Requeue the keep-alive fd so a waiting
-        // insert/update is not stuck behind this client's next recv.
-        if (queue) |q| {
-            if (listen_fd) |lfd| drainListenBacklog(lfd, q);
-            if (q.tryPush(fd)) return .requeued;
-        }
+        // A pipelined request is already buffered here: serve it now.
+        // (Requeueing first dropped those bytes and left the client waiting.)
         if (used < n) {
             const rest = n - used;
             std.mem.copyForwards(u8, store.items[0..rest], store.items[used..n]);
             n = rest;
             continue;
+        }
+        // One request per pop. Park the idle fd so this worker is free for
+        // whoever is ready, instead of blocking on this client's next recv.
+        if (watcher) |w| {
+            if (listen_fd) |lfd| drainListenBacklog(lfd, w);
+            w.park(fd);
+            return .requeued;
         }
         n = 0;
     }

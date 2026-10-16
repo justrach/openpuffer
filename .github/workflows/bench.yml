@@ -45,6 +45,10 @@ jobs:
       - name: x86_64 Windows persistence consumer compiles
         if: matrix.os == 'ubuntu-latest'
         run: zig build check-windows
+      - name: idle keep-alive connections do not stall the server
+        run: |
+          zig build -Doptimize=ReleaseFast
+          python3 tools/keepalive_check.py --bin zig-out/bin/openpuffer
 
   numbers:
     name: numbers (${{ matrix.os }})
