@@ -91,6 +91,14 @@ pub fn build(b: *std.Build) void {
     const ns_tests = b.addTest(.{ .root_module = ns_mod });
     const run_ns_tests = b.addRunArtifact(ns_tests);
 
+    const attrs_mod = b.createModule(.{
+        .root_source_file = b.path("src/attrs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const attrs_tests = b.addTest(.{ .root_module = attrs_mod });
+    const run_attrs_tests = b.addRunArtifact(attrs_tests);
+
     const persist_mod = b.createModule(.{
         .root_source_file = b.path("src/persist.zig"),
         .target = target,
@@ -154,6 +162,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_consumer_tests.step);
     test_step.dependOn(&run_rss_tests.step);
     test_step.dependOn(&run_ns_tests.step);
+    test_step.dependOn(&run_attrs_tests.step);
     test_step.dependOn(&run_persist_tests.step);
     test_step.dependOn(&run_server_tests.step);
 }

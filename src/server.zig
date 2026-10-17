@@ -1,14 +1,23 @@
 //! turbopuffer-compatible HTTP API served on top of the local HNSW engine.
 //!
 //! Endpoints (mirror https://turbopuffer.com/docs):
-//!   POST /v2/namespaces/{ns}        write   (upsert_columns or upsert_rows,
-//!                                            distance_metric: cosine_distance)
+//!   POST /v2/namespaces/{ns}        write: upsert_columns or upsert_rows
+//!                                   (columns other than id/vector are
+//!                                   attributes), deletes [ids],
+//!                                   delete_by_filter, distance_metric
+//!                                   (cosine_distance, euclidean_squared,
+//!                                   dot_product; fixed by the first write)
 //!   POST /v2/namespaces/{ns}/query  ANN query (rank_by ["vector","ANN",[...]],
-//!                                            top_k/limit, consistency ignored)
+//!                                   top_k/limit, filters, include_attributes;
+//!                                   consistency ignored)
 //!   GET  /v2/namespaces/{ns}        stats
 //!   DELETE /v2/namespaces/{ns}      drop namespace
 //!
-//! Responses use the same shapes: {"rows":[{"id":N,"$distance":D}],...}
+//! Responses use the same shapes: {"rows":[{"id":N,"$distance":D,...attrs}],...}
+//!
+//! A deleted document leaves its row in the graph as a tombstone
+//! (doc_ids[row] == deleted_doc) so the graph stays connected; searches walk
+//! through it but never return it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,8 +26,13 @@ const s3_mod = @import("s3.zig");
 const persist_mod = @import("persist.zig");
 const iouring = @import("iouring_sock.zig");
 const ns_mod = @import("namespace.zig");
+const attrs_mod = @import("attrs.zig");
 
 const Hnsw = hnsw_mod.Hnsw(void);
+
+/// doc_ids value of a deleted row. Ids come from JSON integers checked to be
+/// non-negative, so no document can have it.
+const deleted_doc: u64 = std.math.maxInt(u64);
 
 const Namespace = struct {
     name: []const u8,
@@ -41,9 +55,19 @@ const Namespace = struct {
     unspliced: u32 = 0,
     /// external document id -> local hnsw id (upserts)
     id_map: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Attribute columns by local id. Changed only under the exclusive lock.
+    attrs: attrs_mod.Store,
+    /// Tombstoned rows (doc_ids[row] == deleted_doc).
+    dead: usize = 0,
+    /// The first write fixes the distance metric; later writes must match.
+    metric_fixed: bool = false,
 
     fn init(alloc: std.mem.Allocator, name: []const u8, io: std.Io) Namespace {
-        return .{ .name = name, .index = Hnsw.init(alloc, 0, .{}), .io = io };
+        return .{ .name = name, .index = Hnsw.init(alloc, 0, .{}), .io = io, .attrs = attrs_mod.Store.init(alloc) };
+    }
+
+    fn metric(ns: *const Namespace) hnsw_mod.Metric {
+        return ns.index.opts.metric;
     }
 };
 
@@ -146,7 +170,7 @@ const PersistWorker = struct {
         var merged: std.Io.Writer.Allocating = .init(self.alloc);
         defer merged.deinit();
         const w = &merged.writer;
-        try w.writeAll("{\"docs\":[");
+        try writeWalOpen(w, ns.metric());
         var first = true;
         for (group) |job| {
             const inner = walDocsInner(job.body);
@@ -191,6 +215,13 @@ const PersistWorker = struct {
         }
     }
 };
+
+/// `{"docs":[` or, outside cosine, `{"metric":"...","docs":[` so replay
+/// rebuilds the namespace with the metric it was written with.
+fn writeWalOpen(w: *std.Io.Writer, metric: hnsw_mod.Metric) !void {
+    if (metric == .cosine) return w.writeAll("{\"docs\":[");
+    try w.print("{{\"metric\":\"{s}\",\"docs\":[", .{metric.name()});
+}
 
 fn walDocsInner(body: []const u8) []const u8 {
     const prefix = "{\"docs\":[";
@@ -598,7 +629,7 @@ fn handleIoUringConn(
             res.raw_status = .internal_server_error;
             res.raw_body = "{\"error\":\"internal\"}";
         };
-        const status_n: u16 = @intFromEnum(res.raw_status);
+        const status_n: u16 = @backingInt(res.raw_status);
         const phrase = res.raw_status.phrase() orelse "OK";
         const wire = try iouring.formatResponse(arena, status_n, phrase, res.raw_body, keepalive);
         try xfer.sendAll(fd, wire);
@@ -670,6 +701,7 @@ fn freeNamespace(alloc: std.mem.Allocator, ns: *Namespace) void {
     ns.index.deinit();
     ns.id_map.deinit(alloc);
     ns.doc_ids.deinit(alloc);
+    ns.attrs.deinit();
     alloc.free(ns.name);
     alloc.destroy(ns);
 }
@@ -932,15 +964,7 @@ fn recoverInto(job: *RecoverJob, store: *persist_mod.Store, ns: *Namespace) !voi
                 const hdr = try persist_mod.parseBinaryHeader(snap.bytes);
                 t_parse_done = t_parse.readNs(io);
                 var t_build = Sw.start(io);
-                try ns.doc_ids.ensureTotalCapacity(job.registry.alloc, hdr.n);
-                try ns.id_map.ensureTotalCapacity(job.registry.alloc, @intCast(hdr.n));
-                var di: usize = 0;
-                while (di < hdr.n) : (di += 1) {
-                    const id = std.mem.readInt(u64, snap.bytes[hdr.doc_ids_off + di * 8 ..][0..8], .little);
-                    ns.doc_ids.appendAssumeCapacity(id);
-                    ns.id_map.putAssumeCapacity(id, @intCast(di));
-                }
-                try ns.index.load(snap.bytes[hdr.graph_off..]);
+                try loadBinarySnapshot(ns, job.registry.alloc, alloc, snap.bytes, hdr);
                 t_build_done = t_build.readNs(io);
             },
             .json => {
@@ -1018,11 +1042,17 @@ fn snapshotNamespace(store: *persist_mod.Store, ns: *Namespace) !void {
         if (@atomicLoad(u32, &ns.unspliced, .acquire) == 0) break;
         ns.lock.unlock(ns.io);
     }
-    const body = persist_mod.Store.buildBinarySnapshot(
+    const ext = snapshotExt(store.alloc, ns) catch |e| {
+        ns.lock.unlock(ns.io);
+        return e;
+    };
+    defer store.alloc.free(ext);
+    const body = persist_mod.Store.buildBinarySnapshotExt(
         store.alloc,
         ns.wal_seq,
         ns.dim,
         ns.doc_ids.items,
+        ext,
         &ns.index,
     ) catch |e| {
         ns.lock.unlock(ns.io);
@@ -1032,6 +1062,69 @@ fn snapshotNamespace(store: *persist_mod.Store, ns: *Namespace) !void {
     ns.lock.unlock(ns.io);
     defer store.alloc.free(body);
     try store.putSnapshotBin(ns.name, body);
+}
+
+/// Snapshot extension: metric and attribute columns, as JSON. Empty for a
+/// cosine namespace without attributes, which keeps the original format.
+/// `{"metric":"...","attrs":{"name":[v_row0, v_row1, ...], ...}}`
+fn snapshotExt(alloc: std.mem.Allocator, ns: *const Namespace) ![]u8 {
+    if (ns.metric() == .cosine and ns.attrs.isEmpty()) return alloc.alloc(u8, 0);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("{{\"metric\":\"{s}\",\"attrs\":{{", .{ns.metric().name()});
+    for (ns.attrs.names.items, 0..) |name, col| {
+        if (col > 0) try w.writeAll(",");
+        try attrs_mod.writeJsonString(w, name);
+        try w.writeAll(":[");
+        for (0..ns.doc_ids.items.len) |row| {
+            if (row > 0) try w.writeAll(",");
+            try ns.attrs.writeJson(w, ns.attrs.get(col, @intCast(row)));
+        }
+        try w.writeAll("]");
+    }
+    try w.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
+/// Fill an empty `ns` from a binary snapshot (doc ids, tombstones,
+/// extension, graph).
+fn loadBinarySnapshot(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8, hdr: persist_mod.BinaryHeader) !void {
+    try ns.doc_ids.ensureTotalCapacity(persist, hdr.n);
+    try ns.id_map.ensureTotalCapacity(persist, @intCast(hdr.n));
+    var di: usize = 0;
+    while (di < hdr.n) : (di += 1) {
+        const id = std.mem.readInt(u64, bytes[hdr.doc_ids_off + di * 8 ..][0..8], .little);
+        ns.doc_ids.appendAssumeCapacity(id);
+        if (id == deleted_doc) {
+            ns.dead += 1;
+        } else {
+            ns.id_map.putAssumeCapacity(id, @intCast(di));
+        }
+    }
+    if (hdr.ext_len != 0) try loadSnapshotExt(ns, scratch, bytes[hdr.ext_off..][0..hdr.ext_len]);
+    try ns.index.load(bytes[hdr.graph_off..]);
+    ns.metric_fixed = true;
+}
+
+fn loadSnapshotExt(ns: *Namespace, alloc: std.mem.Allocator, ext: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, ext, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadSnapshot;
+    if (parsed.value.object.get("metric")) |m| {
+        if (m != .string) return error.BadSnapshot;
+        ns.index.opts.metric = hnsw_mod.Metric.parse(m.string) orelse return error.BadSnapshot;
+    }
+    const cols = parsed.value.object.get("attrs") orelse return;
+    if (cols != .object) return error.BadSnapshot;
+    var it = cols.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .array) return error.BadSnapshot;
+        const col = try ns.attrs.ensureColumn(kv.key_ptr.*);
+        for (kv.value_ptr.array.items, 0..) |v, row| {
+            try ns.attrs.set(col, @intCast(row), try ns.attrs.fromJson(v));
+        }
+    }
 }
 
 const Responder = struct {
@@ -1239,7 +1332,7 @@ fn dispatch(
         var buf: [256]u8 = undefined;
         var esc_buf: [160]u8 = undefined;
         const esc = ns_mod.jsonEscape(ns.name, &esc_buf);
-        const s = try std.fmt.bufPrint(&buf, "{{\"namespace\":\"{s}\",\"dim\":{d},\"count\":{d}}}", .{ esc, ns.dim, ns.index.len() });
+        const s = try std.fmt.bufPrint(&buf, "{{\"namespace\":\"{s}\",\"dim\":{d},\"count\":{d},\"metric\":\"{s}\"}}", .{ esc, ns.dim, ns.index.len() - ns.dead, ns.metric().name() });
         return respondJson(res, .ok, s);
     }
 
@@ -1252,10 +1345,8 @@ fn dispatch(
         registry.mutex.unlock(registry.io);
         if (removed) |kv| {
             kv.value.lock.lockUncancelable(kv.value.io);
-            kv.value.index.deinit();
-            kv.value.id_map.deinit(registry.alloc);
             kv.value.lock.unlock(kv.value.io);
-            registry.alloc.destroy(kv.value);
+            freeNamespace(registry.alloc, kv.value);
         }
         return respondJson(res, .ok, "{\"ok\":true}");
     }
@@ -1273,32 +1364,74 @@ fn upsertDoc(ns: *Namespace, persist: std.mem.Allocator, id: u64, vec: []const f
     try ns.id_map.put(persist, id, local);
 }
 
-fn reserveWriteRoom(ns: *Namespace, persist: std.mem.Allocator) !void {
-    if (ns.index.hasInsertRoom(1) and ns.doc_ids.capacity > ns.doc_ids.items.len) {
-        return;
+/// Room for one more published row without reallocating anything a
+/// concurrent reader or writer may hold a pointer into.
+fn hasWriteRoom(ns: *const Namespace) bool {
+    return ns.index.hasInsertRoom(1) and ns.doc_ids.capacity > ns.doc_ids.items.len and
+        ns.id_map.available > 0 and ns.attrs.rows > ns.doc_ids.items.len;
+}
+
+/// Grow the packed slabs, doc_ids and id_map. The exclusive lock keeps out
+/// queries, in-place updates and publishers (they all hold it shared);
+/// map_mu keeps out id_map lookups.
+fn growWriteRoom(ns: *Namespace, persist: std.mem.Allocator) !void {
+    ns.lock.lockUncancelable(ns.io);
+    defer ns.lock.unlock(ns.io);
+    ns.map_mu.lockUncancelable(ns.io);
+    defer ns.map_mu.unlock(ns.io);
+    if (hasWriteRoom(ns)) return;
+    try ns.index.ensureInsertRoom(1024);
+    try ns.doc_ids.ensureTotalCapacity(persist, ns.doc_ids.items.len + 1024);
+    try ns.id_map.ensureUnusedCapacity(persist, 1024);
+    try ns.attrs.reserveRows(ns.doc_ids.capacity);
+}
+
+/// Replace an existing document's vector and attributes. With attributes
+/// in play this takes the exclusive lock, so no query sees the new vector
+/// with the old attributes (or a half-written value).
+fn updateDoc(ns: *Namespace, local: u32, vec: []const f32, attrs: []const AttrSet) !void {
+    if (attrs.len == 0 and ns.attrs.isEmpty()) {
+        ns.lock.lockSharedUncancelable(ns.io);
+        defer ns.lock.unlockShared(ns.io);
+        return ns.index.update(local, vec);
     }
     ns.lock.lockUncancelable(ns.io);
     defer ns.lock.unlock(ns.io);
-    try ns.index.ensureInsertRoom(1024);
-    try ns.doc_ids.ensureTotalCapacity(persist, ns.doc_ids.items.len + 1024);
-    try ns.id_map.ensureTotalCapacity(persist, ns.id_map.count() + 1024);
+    if (local < ns.doc_ids.items.len and ns.doc_ids.items[local] == deleted_doc) return; // deleted meanwhile
+    try ns.index.update(local, vec);
+    ns.attrs.clearRow(local);
+    for (attrs) |a| try ns.attrs.set(a.col, local, a.val);
 }
 
-fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32) !void {
+/// Concurrent upsert. Every step that touches the packed slabs holds the
+/// namespace lock at least shared, so `growWriteRoom` (exclusive) can never
+/// reallocate them under an in-place update or a publish. (Publishing used
+/// to run under splice_mu alone and could append into a slab that another
+/// writer was reallocating; concurrent bulk writes crashed.)
+fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32, attrs: []const AttrSet) !void {
     ns.map_mu.lockUncancelable(ns.io);
     const existing = ns.id_map.get(id);
     ns.map_mu.unlock(ns.io);
-    if (existing) |local| {
-        try ns.index.update(local, vec);
-        return;
-    }
+    if (existing) |local| return updateDoc(ns, local, vec, attrs);
     if (ns.index.entryPoint() == null) {
         ns.lock.lockUncancelable(ns.io);
         defer ns.lock.unlock(ns.io);
-        try upsertDoc(ns, persist, id, vec);
-        return;
+        if (ns.index.entryPoint() == null) {
+            ns.map_mu.lockUncancelable(ns.io);
+            defer ns.map_mu.unlock(ns.io);
+            try upsertDoc(ns, persist, id, vec);
+            const local = ns.id_map.get(id).?;
+            ns.attrs.clearRow(local);
+            for (attrs) |a| try ns.attrs.set(a.col, local, a.val);
+            return;
+        }
     }
+    if (try insertDocFair(ns, persist, scratch, id, vec, attrs)) |local| return updateDoc(ns, local, vec, attrs);
+}
 
+/// Insert path of `upsertDocFair`. Returns the row instead when another
+/// writer inserted `id` first (the caller then updates it).
+fn insertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Allocator, id: u64, vec: []const f32, attrs: []const AttrSet) !?u32 {
     ns.splice_mu.lockUncancelable(ns.io);
     const level = ns.index.nextLevel();
     ns.splice_mu.unlock(ns.io);
@@ -1310,19 +1443,26 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
     };
     ns.lock.unlockShared(ns.io);
 
-    reserveWriteRoom(ns, persist) catch |e| {
-        plan.discard(ns.index.allocator);
-        return e;
-    };
-
     ns.splice_mu.lockUncancelable(ns.io);
     defer ns.splice_mu.unlock(ns.io);
+    // Publishers are serialized by splice_mu, so room seen here stays ours.
+    while (true) {
+        ns.lock.lockSharedUncancelable(ns.io);
+        if (hasWriteRoom(ns)) break;
+        ns.lock.unlockShared(ns.io);
+        growWriteRoom(ns, persist) catch |e| {
+            plan.discard(ns.index.allocator);
+            return e;
+        };
+    }
+    // Held through the splice: queries also hold it shared and keep walking.
+    defer ns.lock.unlockShared(ns.io);
+
     ns.map_mu.lockUncancelable(ns.io);
     if (ns.id_map.get(id)) |local| {
         ns.map_mu.unlock(ns.io);
         plan.discard(ns.index.allocator);
-        try ns.index.update(local, vec);
-        return;
+        return local;
     }
     ns.map_mu.unlock(ns.io);
 
@@ -1330,6 +1470,9 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
         plan.discard(ns.index.allocator);
         return e;
     };
+    // Queries see a row only once doc_ids covers it, so its attributes are
+    // in place first. A fresh row's values are all null already.
+    for (attrs) |a| ns.attrs.setReserved(a.col, local, a.val);
     ns.doc_ids.appendAssumeCapacity(id);
     ns.map_mu.lockUncancelable(ns.io);
     ns.id_map.putAssumeCapacity(id, local);
@@ -1337,36 +1480,59 @@ fn upsertDocFair(ns: *Namespace, persist: std.mem.Allocator, scratch: std.mem.Al
     ns.index.publishEntry(local, plan.level);
     _ = @atomicRmw(u32, &ns.unspliced, .Add, 1, .acq_rel);
     defer _ = @atomicRmw(u32, &ns.unspliced, .Sub, 1, .acq_rel);
-
-    // Splice under shared so a concurrent capacity grow (exclusive) waits.
-    // Queries also hold shared and keep walking.
-    ns.lock.lockSharedUncancelable(ns.io);
-    defer ns.lock.unlockShared(ns.io);
     try ns.index.spliceBackEdges(&plan, local);
+    return null;
 }
 
+/// Replay one WAL segment. Entries are `[id,[vec]]` and `[id,[vec],{attrs}]`
+/// (upserts) and `[id,null]` (deletes), in write order.
 fn replayWalBody(ns: *Namespace, persist: std.mem.Allocator, alloc: std.mem.Allocator, body: []const u8) !usize {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.BadWal;
+    if (parsed.value.object.get("metric")) |m| {
+        if (m != .string) return error.BadWal;
+        const metric = hnsw_mod.Metric.parse(m.string) orelse return error.BadWal;
+        if (ns.index.len() == 0) ns.index.opts.metric = metric else if (metric != ns.metric()) return error.BadWal;
+    }
     const docs = parsed.value.object.get("docs") orelse return error.BadWal;
     if (docs != .array) return error.BadWal;
     for (docs.array.items) |doc| {
-        const pair = doc.array.items;
+        if (doc != .array or doc.array.items.len < 2 or doc.array.items[0] != .integer) return error.BadWal;
+        const entry = doc.array.items;
+        const id: u64 = std.math.cast(u64, entry[0].integer) orelse return error.BadWal;
+        if (entry[1] == .null) {
+            deleteDocLocked(ns, id);
+            continue;
+        }
+        if (entry[1] != .array) return error.BadWal;
         if (ns.dim == 0) {
-            ns.dim = pair[1].array.items.len;
+            ns.dim = entry[1].array.items.len;
             ns.index.dim = ns.dim;
         }
-        const id: u64 = @intCast(pair[0].integer);
-        const arr = pair[1].array;
-        const v = try alloc.alloc(f32, arr.items.len);
-        for (arr.items, 0..) |x, i| v[i] = switch (x) {
-            .float => |f| @floatCast(f),
-            .integer => |n| @floatFromInt(n),
-            else => 0,
-        };
+        const v = try vecFromJson(entry[1].array, alloc);
         try upsertDoc(ns, persist, id, v);
+        const local = ns.id_map.get(id).?;
+        ns.attrs.clearRow(local);
+        if (entry.len > 2) {
+            if (entry[2] != .object) return error.BadWal;
+            var it = entry[2].object.iterator();
+            while (it.next()) |kv| {
+                const col = try ns.attrs.ensureColumn(kv.key_ptr.*);
+                try ns.attrs.set(col, local, try ns.attrs.fromJson(kv.value_ptr.*));
+            }
+        }
     }
+    ns.metric_fixed = true;
     return docs.array.items.len;
+}
+
+/// Tombstone `id`. Caller holds the exclusive lock (or owns `ns` outright).
+fn deleteDocLocked(ns: *Namespace, id: u64) void {
+    const kv = ns.id_map.fetchRemove(id) orelse return;
+    ns.doc_ids.items[kv.value] = deleted_doc;
+    ns.attrs.clearRow(kv.value);
+    ns.dead += 1;
 }
 
 fn vecFromJson(arr: std.json.Array, alloc: std.mem.Allocator) ![]f32 {
@@ -1381,6 +1547,116 @@ fn vecFromJson(arr: std.json.Array, alloc: std.mem.Allocator) ![]f32 {
     return v;
 }
 
+const AttrIn = struct { name: []const u8, val: std.json.Value };
+/// An attribute resolved against the namespace's store (column created,
+/// string interned) under the exclusive lock, so applying it never allocates.
+const AttrSet = struct { col: usize, val: attrs_mod.Value };
+const UpsertIn = struct { id: u64, vec: []f32, attrs: []const AttrIn, resolved: []AttrSet = &.{} };
+
+/// Why a write body was rejected (400).
+const BadWrite = struct { msg: []const u8 };
+
+fn docId(v: std.json.Value) ?u64 {
+    return switch (v) {
+        .integer => |n| std.math.cast(u64, n),
+        else => null,
+    };
+}
+
+fn isAttrValue(v: std.json.Value) bool {
+    return switch (v) {
+        .null, .bool, .integer, .float, .number_string, .string => true,
+        .array, .object => false,
+    };
+}
+
+fn isReservedColumn(name: []const u8) bool {
+    return std.mem.eql(u8, name, "id") or std.mem.eql(u8, name, "vector") or
+        std.mem.eql(u8, name, "attributes") or (name.len > 0 and name[0] == '$');
+}
+
+/// Parse upsert_columns / upsert_rows into `out`. Returns a message on bad input.
+fn parseUpserts(alloc: std.mem.Allocator, root: std.json.ObjectMap, out: *std.ArrayList(UpsertIn)) !?BadWrite {
+    if (root.get("upsert_columns")) |cols_v| {
+        if (cols_v != .object) return .{ .msg = "upsert_columns must be an object" };
+        const cols = cols_v.object;
+        const ids_v = cols.get("id") orelse return .{ .msg = "id column required" };
+        const vecs_v = cols.get("vector") orelse return .{ .msg = "vector column required" };
+        if (ids_v != .array or vecs_v != .array) return .{ .msg = "columns must be arrays" };
+        const n = ids_v.array.items.len;
+        if (vecs_v.array.items.len != n) return .{ .msg = "every column must have one value per id" };
+        var names: std.ArrayList([]const u8) = .empty;
+        var values: std.ArrayList([]std.json.Value) = .empty;
+        var it = cols.iterator();
+        while (it.next()) |kv| {
+            const name = kv.key_ptr.*;
+            if (std.mem.eql(u8, name, "id") or std.mem.eql(u8, name, "vector")) continue;
+            if (isReservedColumn(name)) return .{ .msg = "attribute names must not be reserved (id, vector, attributes, $...)" };
+            if (kv.value_ptr.* != .array or kv.value_ptr.array.items.len != n) return .{ .msg = "every column must have one value per id" };
+            try names.append(alloc, name);
+            try values.append(alloc, kv.value_ptr.array.items);
+        }
+        for (0..n) |i| {
+            const id = docId(ids_v.array.items[i]) orelse return .{ .msg = "ids must be non-negative integers" };
+            const vec_v = vecs_v.array.items[i];
+            if (vec_v != .array) return .{ .msg = "vector rows must be arrays" };
+            const row_attrs = try alloc.alloc(AttrIn, names.items.len);
+            for (names.items, values.items, row_attrs) |name, vals, *slot| {
+                if (!isAttrValue(vals[i])) return .{ .msg = "attribute values must be strings, numbers, booleans or null" };
+                slot.* = .{ .name = name, .val = vals[i] };
+            }
+            const vec = vecFromJson(vec_v.array, alloc) catch return .{ .msg = "vector values must be numbers" };
+            try out.append(alloc, .{ .id = id, .vec = vec, .attrs = row_attrs });
+        }
+    }
+    if (root.get("upsert_rows")) |rows_v| {
+        if (rows_v != .array) return .{ .msg = "upsert_rows must be an array" };
+        for (rows_v.array.items) |row| {
+            if (row != .object) return .{ .msg = "rows must be objects" };
+            const robj = row.object;
+            const id = docId(robj.get("id") orelse return .{ .msg = "row missing id" }) orelse
+                return .{ .msg = "ids must be non-negative integers" };
+            const vec_v = robj.get("vector") orelse return .{ .msg = "row missing vector" };
+            if (vec_v != .array) return .{ .msg = "vector must be an array" };
+            var row_attrs: std.ArrayList(AttrIn) = .empty;
+            var it = robj.iterator();
+            while (it.next()) |kv| {
+                const name = kv.key_ptr.*;
+                if (std.mem.eql(u8, name, "id") or std.mem.eql(u8, name, "vector")) continue;
+                if (isReservedColumn(name)) return .{ .msg = "attribute names must not be reserved (id, vector, attributes, $...)" };
+                if (!isAttrValue(kv.value_ptr.*)) return .{ .msg = "attribute values must be strings, numbers, booleans or null" };
+                try row_attrs.append(alloc, .{ .name = name, .val = kv.value_ptr.* });
+            }
+            const vec = vecFromJson(vec_v.array, alloc) catch return .{ .msg = "vector values must be numbers" };
+            try out.append(alloc, .{ .id = id, .vec = vec, .attrs = row_attrs.items });
+        }
+    }
+    return null;
+}
+
+fn writeJsonValue(w: *std.Io.Writer, v: std.json.Value) !void {
+    switch (v) {
+        .null => try w.writeAll("null"),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .integer => |n| try w.print("{d}", .{n}),
+        .float => |f| try w.print("{d}", .{f}),
+        .number_string => |str| try w.writeAll(str),
+        .string => |str| try attrs_mod.writeJsonString(w, str),
+        .array, .object => unreachable, // rejected by isAttrValue
+    }
+}
+
+fn respondBadWrite(res: *Responder, alloc: std.mem.Allocator, msg: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    try out.writer.writeAll("{\"error\":");
+    try attrs_mod.writeJsonString(&out.writer, msg);
+    try out.writer.writeAll("}");
+    return respondJson(res, .bad_request, out.written());
+}
+
+/// Write order within one request: delete_by_filter, then upserts, then
+/// deletes. The WAL records the same order, with filter matches expanded to
+/// ids, so replay is deterministic.
 fn handleWrite(
     arena: std.mem.Allocator,
     persist: std.mem.Allocator,
@@ -1397,81 +1673,129 @@ fn handleWrite(
     if (parsed.value != .object) return respondJson(res, .bad_request, "{\"error\":\"expected object\"}");
     const root = parsed.value.object;
 
+    var metric: ?hnsw_mod.Metric = null;
     if (root.get("distance_metric")) |dm| {
-        if (dm != .string or !std.mem.eql(u8, dm.string, "cosine_distance")) {
-            return respondJson(res, .bad_request, "{\"error\":\"only cosine_distance supported\"}");
-        }
+        if (dm != .string) return respondBadWrite(res, alloc, "distance_metric must be a string");
+        metric = hnsw_mod.Metric.parse(dm.string) orelse
+            return respondBadWrite(res, alloc, "distance_metric must be cosine_distance, euclidean_squared or dot_product");
     }
 
-    const IdVec = struct { id: u64, vec: []f32 };
-    var batch: std.ArrayList(IdVec) = .empty;
+    var ups: std.ArrayList(UpsertIn) = .empty;
+    if (try parseUpserts(alloc, root, &ups)) |bad| return respondBadWrite(res, alloc, bad.msg);
 
-    if (root.get("upsert_columns")) |cols_v| {
-        if (cols_v != .object) return respondJson(res, .bad_request, "{\"error\":\"upsert_columns must be object\"}");
-        const cols = cols_v.object;
-        const ids_v = cols.get("id") orelse return respondJson(res, .bad_request, "{\"error\":\"id column required\"}");
-        const vecs_v = cols.get("vector") orelse return respondJson(res, .bad_request, "{\"error\":\"vector column required\"}");
-        if (ids_v != .array or vecs_v != .array) return respondJson(res, .bad_request, "{\"error\":\"columns must be arrays\"}");
-        for (ids_v.array.items, vecs_v.array.items) |id_v, vec_v| {
-            if (vec_v != .array) return respondJson(res, .bad_request, "{\"error\":\"vector rows must be arrays\"}");
-            const id: u64 = switch (id_v) {
-                .integer => |n| @intCast(n),
-                else => return respondJson(res, .bad_request, "{\"error\":\"ids must be integers\"}"),
-            };
-            try batch.append(alloc, .{ .id = id, .vec = try vecFromJson(vec_v.array, alloc) });
-        }
-    } else if (root.get("upsert_rows")) |rows_v| {
-        if (rows_v != .array) return respondJson(res, .bad_request, "{\"error\":\"upsert_rows must be array\"}");
-        for (rows_v.array.items) |row| {
-            if (row != .object) return respondJson(res, .bad_request, "{\"error\":\"rows must be objects\"}");
-            const robj = row.object;
-            const id_v = robj.get("id") orelse return respondJson(res, .bad_request, "{\"error\":\"row missing id\"}");
-            const vec_v = robj.get("vector") orelse return respondJson(res, .bad_request, "{\"error\":\"row missing vector\"}");
-            if (vec_v != .array) return respondJson(res, .bad_request, "{\"error\":\"vector must be array\"}");
-            const id: u64 = switch (id_v) {
-                .integer => |n| @intCast(n),
-                else => return respondJson(res, .bad_request, "{\"error\":\"ids must be integers\"}"),
-            };
-            try batch.append(alloc, .{ .id = id, .vec = try vecFromJson(vec_v.array, alloc) });
-        }
-    } else {
-        return respondJson(res, .bad_request, "{\"error\":\"missing upsert_columns/upsert_rows\"}");
+    var deletes: std.ArrayList(u64) = .empty;
+    if (root.get("deletes")) |dv| {
+        if (dv != .array) return respondBadWrite(res, alloc, "deletes must be an array of ids");
+        for (dv.array.items) |v| try deletes.append(alloc, docId(v) orelse return respondBadWrite(res, alloc, "ids must be non-negative integers"));
     }
-
-    if (batch.items.len == 0) return respondJson(res, .ok, "{\"ok\":true}");
+    const del_filter = root.get("delete_by_filter");
+    if (ups.items.len == 0 and deletes.items.len == 0 and del_filter == null) {
+        if (root.get("upsert_columns") != null or root.get("upsert_rows") != null) return respondJson(res, .ok, "{\"ok\":true}");
+        return respondBadWrite(res, alloc, "missing upsert_columns, upsert_rows, deletes or delete_by_filter");
+    }
 
     {
         ns.lock.lockUncancelable(ns.io);
         defer ns.lock.unlock(ns.io);
-        if (ns.dim == 0) {
-            ns.dim = batch.items[0].vec.len;
-            ns.index.dim = ns.dim;
+        if (ups.items.len != 0) {
+            if (ns.dim == 0) {
+                ns.dim = ups.items[0].vec.len;
+                ns.index.dim = ns.dim;
+            }
+            for (ups.items) |u| {
+                if (u.vec.len != ns.dim) return respondJson(res, .bad_request, "{\"error\":\"dimension mismatch\"}");
+            }
         }
-        for (batch.items) |iv| {
-            if (iv.vec.len != ns.dim) return respondJson(res, .bad_request, "{\"error\":\"dimension mismatch\"}");
+        if (metric) |m| {
+            if (!ns.metric_fixed and ns.index.len() == 0) {
+                ns.index.opts.metric = m;
+            } else if (m != ns.metric()) {
+                var buf: [160]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&buf, "distance_metric is {s} for this namespace", .{ns.metric().name()});
+                return respondBadWrite(res, alloc, msg);
+            }
+        }
+        if (ups.items.len != 0) ns.metric_fixed = true;
+        for (ups.items) |*u| {
+            u.resolved = try alloc.alloc(AttrSet, u.attrs.len);
+            for (u.attrs, u.resolved) |a, *r| r.* = .{
+                .col = try ns.attrs.ensureColumn(a.name),
+                .val = ns.attrs.fromJson(a.val) catch |e| switch (e) {
+                    error.BadAttribute, error.BadFilter => unreachable, // rejected by isAttrValue
+                    error.OutOfMemory => return e,
+                },
+            };
         }
     }
+    // Reject bad vectors before applying anything: a failure halfway through
+    // would leave applied rows that the WAL never records.
+    for (ups.items) |u| {
+        hnsw_mod.checkVector(ns.metric(), u.vec) catch |e| return respondBadWrite(res, alloc, switch (e) {
+            error.ZeroNormVector => "a zero vector has no cosine direction",
+            else => "vector values must be finite numbers",
+        });
+    }
+
+    var filter_deletes: std.ArrayList(u64) = .empty;
+    if (del_filter) |f| {
+        ns.lock.lockSharedUncancelable(ns.io);
+        defer ns.lock.unlockShared(ns.io);
+        const n = @min(ns.index.len(), ns.doc_ids.items.len);
+        var bits = ns.attrs.eval(f, ns.doc_ids.items[0..n], n, alloc) catch |e| switch (e) {
+            error.BadFilter, error.BadAttribute => return respondBadWrite(res, alloc, "delete_by_filter is not a valid filter"),
+            error.OutOfMemory => return e,
+        };
+        var it = bits.iterator(.{});
+        while (it.next()) |row| {
+            if (ns.doc_ids.items[row] != deleted_doc) try filter_deletes.append(alloc, ns.doc_ids.items[row]);
+        }
+    }
+
+    try applyDeletes(ns, filter_deletes.items);
 
     // Updates: vec_gen seqlock, no namespace lock. Inserts: shared
     // neighbor search, exclusive only if slabs need to grow, then
     // splice_mu publish + shared back-edge splice.
-    for (batch.items) |iv| {
-        try upsertDocFair(ns, persist, alloc, iv.id, iv.vec);
-    }
+    for (ups.items) |u| try upsertDocFair(ns, persist, alloc, u.id, u.vec, u.resolved);
+
+    try applyDeletes(ns, deletes.items);
 
     // durable WAL: group-commit via persist worker when configured
     if (registry.lanes.len != 0 or registry.store != null) {
         var wb: std.Io.Writer.Allocating = .init(persist);
         const ww = &wb.writer;
         try ww.writeAll("{\"docs\":[");
-        for (batch.items, 0..) |iv, i| {
-            if (i > 0) try ww.writeAll(",");
-            try ww.print("[{d},[", .{iv.id});
-            for (iv.vec, 0..) |x, j| {
+        var first = true;
+        for (filter_deletes.items) |id| {
+            if (!first) try ww.writeAll(",");
+            first = false;
+            try ww.print("[{d},null]", .{id});
+        }
+        for (ups.items) |u| {
+            if (!first) try ww.writeAll(",");
+            first = false;
+            try ww.print("[{d},[", .{u.id});
+            for (u.vec, 0..) |x, j| {
                 if (j > 0) try ww.writeAll(",");
                 try ww.print("{d}", .{x});
             }
-            try ww.writeAll("]]");
+            try ww.writeAll("]");
+            if (u.attrs.len != 0) {
+                try ww.writeAll(",{");
+                for (u.attrs, 0..) |a, j| {
+                    if (j > 0) try ww.writeAll(",");
+                    try attrs_mod.writeJsonString(ww, a.name);
+                    try ww.writeAll(":");
+                    try writeJsonValue(ww, a.val);
+                }
+                try ww.writeAll("}");
+            }
+            try ww.writeAll("]");
+        }
+        for (deletes.items) |id| {
+            if (!first) try ww.writeAll(",");
+            first = false;
+            try ww.print("[{d},null]", .{id});
         }
         try ww.writeAll("]}");
         const wal_body = try wb.toOwnedSlice();
@@ -1483,15 +1807,70 @@ fn handleWrite(
             };
         } else if (registry.store) |store| {
             defer persist.free(wal_body);
+            var full: std.Io.Writer.Allocating = .init(persist);
+            defer full.deinit();
+            try writeWalOpen(&full.writer, ns.metric());
+            try full.writer.writeAll(walDocsInner(wal_body));
+            try full.writer.writeAll("]}");
             ns.lock.lockUncancelable(ns.io);
             ns.wal_seq += 1;
             const seq = ns.wal_seq;
             ns.lock.unlock(ns.io);
-            try store.appendWal(ns.name, seq, wal_body);
+            try store.appendWal(ns.name, seq, full.written());
         }
     }
 
     return respondJson(res, .ok, "{\"ok\":true}");
+}
+
+/// Same lock order as `upsertDocFair`: splice_mu, then the namespace lock,
+/// then map_mu.
+fn lockForRowChanges(ns: *Namespace) void {
+    ns.splice_mu.lockUncancelable(ns.io);
+    ns.lock.lockUncancelable(ns.io);
+    ns.map_mu.lockUncancelable(ns.io);
+}
+
+fn unlockRowChanges(ns: *Namespace) void {
+    ns.map_mu.unlock(ns.io);
+    ns.lock.unlock(ns.io);
+    ns.splice_mu.unlock(ns.io);
+}
+
+fn applyDeletes(ns: *Namespace, ids: []const u64) !void {
+    if (ids.len == 0) return;
+    lockForRowChanges(ns);
+    defer unlockRowChanges(ns);
+    for (ids) |id| deleteDocLocked(ns, id);
+}
+
+/// Accepts rows whose document is live.
+const LiveRows = struct {
+    doc_ids: []const u64,
+    pub inline fn ok(l: LiveRows, id: u32) bool {
+        return id < l.doc_ids.len and l.doc_ids[id] != deleted_doc;
+    }
+};
+
+/// What a query asked to get back besides id and distance.
+const Include = union(enum) { none, all, names: []const []const u8 };
+
+fn parseInclude(alloc: std.mem.Allocator, body: []const u8) !?Include {
+    const span = attrs_mod.valueSpan(body, "\"include_attributes\"") orelse return .none;
+    const v = (std.json.parseFromSlice(std.json.Value, alloc, span, .{}) catch return null).value;
+    switch (v) {
+        .bool => |b| return if (b) .all else .none,
+        .null => return .none,
+        .array => |arr| {
+            const names = try alloc.alloc([]const u8, arr.items.len);
+            for (arr.items, names) |item, *n| {
+                if (item != .string) return null;
+                n.* = item.string;
+            }
+            return .{ .names = names };
+        },
+        else => return null,
+    }
 }
 
 fn handleQuery(
@@ -1505,6 +1884,14 @@ fn handleQuery(
         return respondJson(res, .bad_request, "{\"error\":\"rank_by must be [field,'ANN',vector]\"}");
     const query_vec = spec.vec;
     const top_k = spec.top_k;
+    var filter: ?std.json.Value = null;
+    if (attrs_mod.valueSpan(body, "\"filters\"")) |span| {
+        const f = (std.json.parseFromSlice(std.json.Value, alloc, span, .{}) catch
+            return respondJson(res, .bad_request, "{\"error\":\"filters must be JSON\"}")).value;
+        if (f != .null) filter = f;
+    }
+    const include = try parseInclude(alloc, body) orelse
+        return respondJson(res, .bad_request, "{\"error\":\"include_attributes must be true, false or a list of names\"}");
 
     ns.lock.lockSharedUncancelable(ns.io);
     defer ns.lock.unlockShared(ns.io);
@@ -1517,15 +1904,43 @@ fn handleQuery(
 
     const ef = spec.ef orelse o.ef;
     const rerank_mult = spec.rerank_mult orelse o.rerank_mult;
-    const results = try ns.index.searchAdvanced(query_vec, top_k, ef, rerank_mult, alloc);
+    // Rows past doc_ids are mid-publish; leave them out.
+    const n = @min(ns.index.len(), ns.doc_ids.items.len);
+    const live = LiveRows{ .doc_ids = ns.doc_ids.items[0..n] };
+    const results: []const hnsw_mod.SearchResult = blk: {
+        if (filter) |f| {
+            var bits = ns.attrs.eval(f, live.doc_ids, n, alloc) catch |e| switch (e) {
+                error.BadFilter, error.BadAttribute => return respondJson(res, .bad_request, "{\"error\":\"filters must be [attr, op, value], [\\\"And\\\"|\\\"Or\\\", [filters]] or [\\\"Not\\\", filter]\"}"),
+                error.OutOfMemory => return e,
+            };
+            if (ns.dead != 0) {
+                for (live.doc_ids, 0..) |d, row| {
+                    if (d == deleted_doc) bits.unset(row);
+                }
+            }
+            // Few matches: exact scan of just those rows. Many: graph walk
+            // that only accepts matches.
+            const matches = bits.count();
+            if (matches == 0) break :blk &.{};
+            if (matches <= ns.index.scanLimit(ef)) break :blk try ns.index.searchScan(query_vec, top_k, rerank_mult, &bits, alloc);
+            break :blk try ns.index.searchAccept(query_vec, top_k, ef, rerank_mult, Hnsw.AcceptBits{ .bits = &bits }, alloc);
+        }
+        if (ns.dead != 0 or n < ns.index.len()) break :blk try ns.index.searchAccept(query_vec, top_k, ef, rerank_mult, live, alloc);
+        break :blk try ns.index.searchAdvanced(query_vec, top_k, ef, rerank_mult, alloc);
+    };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     const w = &out.writer;
     try w.writeAll("{\"rows\":[");
     for (results, 0..) |r, i| {
         if (i > 0) try w.writeAll(",");
-        const doc_id: u64 = if (r.id < ns.doc_ids.items.len) ns.doc_ids.items[r.id] else r.id;
-        try w.print("{{\"id\":{d},\"$distance\":{d}}}", .{ doc_id, r.distance });
+        try w.print("{{\"id\":{d},\"$distance\":{d}", .{ ns.doc_ids.items[r.id], r.distance });
+        switch (include) {
+            .none => {},
+            .all => try ns.attrs.writeRowFields(w, r.id, null),
+            .names => |names| try ns.attrs.writeRowFields(w, r.id, names),
+        }
+        try w.writeAll("}");
     }
     try w.writeAll("],\"usage\":{}}");
     return respondJson(res, .ok, out.written());
@@ -1594,4 +2009,150 @@ test "parseAnnQuery reads optional rerank_mult" {
     defer std.testing.allocator.free(spec.vec);
     try std.testing.expectEqual(@as(?u32, 64), spec.ef);
     try std.testing.expectEqual(@as(?usize, 8), spec.rerank_mult);
+}
+
+fn testCall(reg: *Registry, alloc: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) !struct { status: std.http.Status, body: []const u8 } {
+    var res = Responder{ .raw_alloc = alloc };
+    try dispatch(alloc, std.testing.io, method, path, body, reg, .{}, &res);
+    return .{ .status = res.raw_status, .body = res.raw_body };
+}
+
+fn expectContains(hay: []const u8, needle: []const u8, want: bool) !void {
+    if ((std.mem.indexOf(u8, hay, needle) != null) != want) {
+        std.debug.print("expected {s}'{s}' in {s}\n", .{ if (want) "" else "no ", needle, hay });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "attributes, filters, deletes and delete_by_filter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var reg = Registry{ .alloc = a, .io = std.testing.io };
+    const ns = "/v2/namespaces/mem";
+
+    var r = try testCall(&reg, a, "POST", ns,
+        \\{"upsert_columns":{"id":[1,2,3,4],"vector":[[1,0],[0.9,0.1],[0.8,0.2],[0,1]],
+        \\ "kind":["fact","todo","fact",null],"pri":[1,2,3.5,4]},"distance_metric":"cosine_distance"}
+    );
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+
+    r = try testCall(&reg, a, "POST", ns ++ "/query",
+        \\{"rank_by":["vector","ANN",[1,0]],"top_k":10,"filters":["kind","Eq","fact"],"include_attributes":true}
+    );
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    try expectContains(r.body, "{\"id\":1,", true);
+    try expectContains(r.body, "{\"id\":3,", true);
+    try expectContains(r.body, "{\"id\":2,", false);
+    try expectContains(r.body, "\"kind\":\"fact\",\"pri\":1}", true);
+
+    r = try testCall(&reg, a, "POST", ns ++ "/query",
+        \\{"rank_by":["vector","ANN",[1,0]],"top_k":10,"filters":["And",[["pri","Gte",2],["Not",["kind","Eq",null]]]],"include_attributes":["pri"]}
+    );
+    try expectContains(r.body, "{\"id\":2,", true);
+    try expectContains(r.body, "{\"id\":3,", true);
+    try expectContains(r.body, "{\"id\":4,", false);
+    try expectContains(r.body, "\"kind\"", false);
+
+    // delete one id, then everything matching a filter
+    r = try testCall(&reg, a, "POST", ns, "{\"deletes\":[1]}");
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    r = try testCall(&reg, a, "POST", ns ++ "/query", "{\"rank_by\":[\"vector\",\"ANN\",[1,0]],\"top_k\":10}");
+    try expectContains(r.body, "{\"id\":1,", false);
+    try expectContains(r.body, "{\"id\":2,", true);
+    r = try testCall(&reg, a, "POST", ns, "{\"delete_by_filter\":[\"kind\",\"Eq\",\"todo\"]}");
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    r = try testCall(&reg, a, "GET", ns, "");
+    try expectContains(r.body, "\"count\":2", true);
+
+    // an upsert replaces the document: attributes not given are cleared
+    r = try testCall(&reg, a, "POST", ns, "{\"upsert_rows\":[{\"id\":3,\"vector\":[0.7,0.3]}]}");
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    r = try testCall(&reg, a, "POST", ns ++ "/query",
+        \\{"rank_by":["vector","ANN",[1,0]],"top_k":10,"filters":["kind","Eq","fact"]}
+    );
+    try std.testing.expectEqualStrings("{\"rows\":[],\"usage\":{}}", r.body);
+    // a deleted id can come back
+    r = try testCall(&reg, a, "POST", ns, "{\"upsert_rows\":[{\"id\":1,\"vector\":[1,0],\"kind\":\"fact\"}]}");
+    r = try testCall(&reg, a, "POST", ns ++ "/query",
+        \\{"rank_by":["vector","ANN",[1,0]],"top_k":10,"filters":["kind","In",["fact"]]}
+    );
+    try expectContains(r.body, "{\"id\":1,", true);
+
+    // rejected writes and queries
+    const bad = [_][]const u8{
+        "{\"upsert_rows\":[{\"id\":9,\"vector\":[1,0]}],\"distance_metric\":\"euclidean_squared\"}",
+        "{\"upsert_rows\":[{\"id\":-1,\"vector\":[1,0]}]}",
+        "{\"upsert_rows\":[{\"id\":9,\"vector\":[0,0]}]}",
+        "{\"upsert_columns\":{\"id\":[9,10],\"vector\":[[1,0]]}}",
+        "{\"upsert_rows\":[{\"id\":9,\"vector\":[1,0],\"tags\":[\"x\"]}]}",
+        "{\"upsert_rows\":[{\"id\":9,\"vector\":[1,0],\"$distance\":1}]}",
+        "{\"delete_by_filter\":[\"kind\",\"Like\",\"x\"]}",
+        "{\"distance_metric\":\"manhattan\",\"deletes\":[1]}",
+    };
+    for (bad) |b| {
+        r = try testCall(&reg, a, "POST", ns, b);
+        std.testing.expectEqual(std.http.Status.bad_request, r.status) catch |e| {
+            std.debug.print("accepted: {s}\n", .{b});
+            return e;
+        };
+    }
+    r = try testCall(&reg, a, "POST", ns ++ "/query", "{\"rank_by\":[\"vector\",\"ANN\",[1,0]],\"filters\":[\"kind\"]}");
+    try std.testing.expectEqual(std.http.Status.bad_request, r.status);
+    r = try testCall(&reg, a, "GET", ns, "");
+    try expectContains(r.body, "\"count\":3", true);
+}
+
+test "euclidean namespaces use the metric for ranking and distances" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var reg = Registry{ .alloc = a, .io = std.testing.io };
+    var r = try testCall(&reg, a, "POST", "/v2/namespaces/l2",
+        \\{"upsert_columns":{"id":[1,2],"vector":[[10,0],[1,0]]},"distance_metric":"euclidean_squared"}
+    );
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    // by cosine both are equally close to [2,0]; by squared L2, id 2 is (1 vs 64)
+    r = try testCall(&reg, a, "POST", "/v2/namespaces/l2/query", "{\"rank_by\":[\"vector\",\"ANN\",[2,0]],\"top_k\":2}");
+    try std.testing.expectEqualStrings("{\"rows\":[{\"id\":2,\"$distance\":1},{\"id\":1,\"$distance\":64}],\"usage\":{}}", r.body);
+    r = try testCall(&reg, a, "GET", "/v2/namespaces/l2", "");
+    try expectContains(r.body, "\"metric\":\"euclidean_squared\"", true);
+}
+
+test "WAL replay and snapshots keep attributes, tombstones and the metric" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ns = Namespace.init(a, "m", std.testing.io);
+    const wal =
+        \\{"metric":"euclidean_squared","docs":[[5,[1,0],{"kind":"a","n":2}],[6,[3,4]],[5,null],[7,[0,2],{"kind":"b \"q\""}]]}
+    ;
+    _ = try replayWalBody(&ns, a, a, wal);
+    try std.testing.expectEqual(hnsw_mod.Metric.euclidean_squared, ns.metric());
+    try std.testing.expectEqual(@as(usize, 1), ns.dead);
+    try std.testing.expect(ns.id_map.get(5) == null);
+    const col = ns.attrs.column("kind").?;
+    try std.testing.expectEqualStrings("b \"q\"", ns.attrs.strings.items[ns.attrs.get(col, ns.id_map.get(7).?).str]);
+    try std.testing.expect(ns.attrs.get(col, 0) == .null); // deleted row's attributes are gone
+
+    const ext = try snapshotExt(a, &ns);
+    const body = try persist_mod.Store.buildBinarySnapshotExt(a, 9, ns.dim, ns.doc_ids.items, ext, &ns.index);
+    const hdr = try persist_mod.parseBinaryHeader(body);
+    try std.testing.expectEqual(persist_mod.SNAP_VERSION_EXT, hdr.version);
+    var back = Namespace.init(a, "m", std.testing.io);
+    back.dim = hdr.dim;
+    back.index.dim = hdr.dim;
+    try loadBinarySnapshot(&back, a, a, body, hdr);
+    try std.testing.expectEqual(hnsw_mod.Metric.euclidean_squared, back.metric());
+    try std.testing.expectEqual(@as(usize, 1), back.dead);
+    try std.testing.expectEqual(@as(?u32, 2), back.id_map.get(7));
+    const bcol = back.attrs.column("kind").?;
+    try std.testing.expectEqualStrings("b \"q\"", back.attrs.strings.items[back.attrs.get(bcol, 2).str]);
+    // the column survives; its only value belonged to the deleted row
+    try std.testing.expect(back.attrs.get(back.attrs.column("n").?, 0) == .null);
+
+    // a cosine namespace without attributes still writes the original format
+    var plain = Namespace.init(a, "p", std.testing.io);
+    _ = try replayWalBody(&plain, a, a, "{\"docs\":[[1,[1,0]]]}");
+    try std.testing.expectEqual(@as(usize, 0), (try snapshotExt(a, &plain)).len);
 }
