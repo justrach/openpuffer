@@ -126,13 +126,18 @@ class Rig:
         self.binary, self.workdir = binary, workdir
         self.bucket = os.path.join(workdir, "bucket")
         self.s3_port, self.port = free_port(), free_port()
+        s3_log = os.path.join(workdir, "s3_fake.log")
         self.s3 = subprocess.Popen([sys.executable, os.path.join(TOOLS, "s3_fake.py"), "--port", str(self.s3_port),
                                     "--dir", self.bucket, "--latency-ms", str(latency_ms)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                   stdout=subprocess.DEVNULL, stderr=open(s3_log, "w"))
         self.server = None
         self.log_path = None
         self.client = Client(self.port)
-        self.wait(lambda: self.s3_stats() is not None, 10, "fake S3 did not start")
+        # Cold Python starts on a loaded CI runner can take well over 10 s.
+        self.wait(lambda: self.s3.poll() is not None or self.s3_stats() is not None, 60, "fake S3 did not start")
+        if self.s3.poll() is not None:
+            with open(s3_log) as f:
+                raise AssertionError(f"fake S3 exited during startup:\n{f.read()[-2000:]}")
 
     # fake S3 control
     def s3_call(self, method, path, body=None):
