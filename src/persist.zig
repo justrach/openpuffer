@@ -73,7 +73,10 @@ pub const Store = struct {
 
     fn getObjectOrNull(self: *Store, key: []const u8) !?[]u8 {
         return self.client.getObject(key) catch |e| switch (e) {
-            error.S3RequestFailed => return null,
+            // Only a 404 is absence. A 503 or a dropped connection returning
+            // null here made recovery skip the snapshot, rebuild from the WAL
+            // tail alone, and then compact that partial index over it.
+            error.S3NotFound => return null,
             else => return e,
         };
     }

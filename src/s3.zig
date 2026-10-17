@@ -176,7 +176,46 @@ pub const Client = struct {
         return buf.toOwnedSlice();
     }
 
+    /// Attempts per request. Object stores drop or reset connections and answer
+    /// 503 SlowDown under load; every call here (GET, PUT of a whole object,
+    /// DELETE, LIST) is idempotent, so a transient failure is retried.
+    pub const max_attempts: u32 = 5;
+    const base_backoff_ms: u64 = 50;
+
     fn request(
+        self: *Client,
+        method: std.http.Method,
+        key: []const u8,
+        query: []const u8,
+        payload: ?[]const u8,
+    ) ![]u8 {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            if (self.requestOnce(method, key, query, payload)) |body| {
+                return body;
+            } else |err| {
+                if (!retryable(err) or attempt + 1 >= max_attempts) {
+                    if (attempt > 0 and retryable(err)) {
+                        std.debug.print("s3 {s} {s}: giving up after {d} attempts: {any}\n", .{ @tagName(method), key, attempt + 1, err });
+                    }
+                    return err;
+                }
+                const backoff_ms = base_backoff_ms << @intCast(attempt); // 50, 100, 200, 400 ms
+                self.io.sleep(.{ .nanoseconds = backoff_ms * std.time.ns_per_ms }, .awake) catch {};
+            }
+        }
+    }
+
+    /// Transport failures and 429/5xx answers can succeed on a fresh attempt.
+    /// A definite answer (404, 403, other 4xx) or a local error cannot.
+    pub fn retryable(err: anyerror) bool {
+        return switch (err) {
+            error.S3NotFound, error.S3RequestFailed, error.OutOfMemory, error.NoSpaceLeft => false,
+            else => true,
+        };
+    }
+
+    fn requestOnce(
         self: *Client,
         method: std.http.Method,
         key: []const u8,
@@ -238,12 +277,18 @@ pub const Client = struct {
                 .{ .name = "authorization", .value = auth_value },
             },
             .response_writer = &resp.writer,
-            .keep_alive = false,
+            // Reuse pooled connections: one TCP connection per request would
+            // burn an ephemeral port each time and pay a handshake per PUT.
+            .keep_alive = true,
         });
         if (result.status.class() != .success) {
-            if (result.status != .not_found) {
-                std.debug.print("s3 {s} {s} -> {d}: {s}\n", .{ @tagName(method), key, @intFromEnum(result.status), resp.written()[0..@min(resp.written().len, 300)] });
-            }
+            // Only a 404 means "no such object". Any other failure must not be
+            // mistaken for absence: recovery would skip a snapshot and later
+            // compact a partial index over it.
+            if (result.status == .not_found) return error.S3NotFound;
+            const code = @intFromEnum(result.status);
+            std.debug.print("s3 {s} {s} -> {d}: {s}\n", .{ @tagName(method), key, code, resp.written()[0..@min(resp.written().len, 300)] });
+            if (code == 429 or code >= 500) return error.S3Unavailable;
             return error.S3RequestFailed;
         }
         return alloc.dupe(u8, resp.written());
@@ -267,35 +312,59 @@ pub const Client = struct {
 
     pub const ListedKey = struct { key: []u8 };
 
-    /// List keys under a prefix (handles up to 1 page of 1000 — plenty here).
+    /// List every key under a prefix. S3 returns at most 1000 keys per page;
+    /// follow NextContinuationToken until IsTruncated is false. (Reading one
+    /// page silently dropped every namespace past the first 1000 keys.)
     pub fn listKeys(self: *Client, prefix: []const u8) ![][]u8 {
         const alloc = self.alloc;
         const enc_prefix = try self.urlEncodeQueryValue(prefix);
         defer alloc.free(enc_prefix);
-        var qbuf: [600]u8 = undefined;
-        const query = try std.fmt.bufPrint(&qbuf, "?list-type=2&prefix={s}", .{enc_prefix});
 
-        // List uses different canonical query handling; simplest correct path:
-        // sign with the same query string (without '?').
-        const body = try self.request(.GET, "/", query[1..], null);
-        defer alloc.free(body);
-
-        // parse <Key>...</Key> entries
         var keys: std.ArrayList([]u8) = .empty;
-        var rest: []const u8 = body;
-        while (std.mem.indexOf(u8, rest, "<Key>")) |start| {
-            const after = rest[start + 5 ..];
-            const end = std.mem.indexOf(u8, after, "</Key>") orelse break;
-            const raw = after[0..end];
-            // XML-unescape the minimal set we may emit
-            const decoded = if (std.mem.indexOfScalar(u8, raw, '&') != null)
-                try xmlUnescape(alloc, raw)
-            else
-                try alloc.dupe(u8, raw);
-            try keys.append(alloc, decoded);
-            rest = after[end + 6 ..];
+        errdefer {
+            for (keys.items) |k| alloc.free(k);
+            keys.deinit(alloc);
+        }
+        var token: ?[]u8 = null;
+        defer if (token) |t| alloc.free(t);
+
+        while (true) {
+            // SigV4 canonical query: parameters sorted by name
+            // (continuation-token < list-type < prefix), values URI-encoded.
+            const query = if (token) |t| blk: {
+                const enc_token = try self.urlEncodeQueryValue(t);
+                defer alloc.free(enc_token);
+                break :blk try std.fmt.allocPrint(alloc, "continuation-token={s}&list-type=2&prefix={s}", .{ enc_token, enc_prefix });
+            } else try std.fmt.allocPrint(alloc, "list-type=2&prefix={s}", .{enc_prefix});
+            defer alloc.free(query);
+
+            const body = try self.request(.GET, "/", query, null);
+            defer alloc.free(body);
+
+            var rest: []const u8 = body;
+            while (std.mem.indexOf(u8, rest, "<Key>")) |start| {
+                const after = rest[start + 5 ..];
+                const end = std.mem.indexOf(u8, after, "</Key>") orelse break;
+                try keys.append(alloc, try xmlUnescape(alloc, after[0..end]));
+                rest = after[end + 6 ..];
+            }
+
+            if (std.mem.indexOf(u8, body, "<IsTruncated>true</IsTruncated>") == null) break;
+            const next = tagText(body, "NextContinuationToken") orelse return error.S3ListMissingToken;
+            const decoded = try xmlUnescape(alloc, next);
+            if (token) |t| alloc.free(t);
+            token = decoded;
         }
         return keys.toOwnedSlice(alloc);
+    }
+
+    fn tagText(body: []const u8, comptime tag: []const u8) ?[]const u8 {
+        const open = "<" ++ tag ++ ">";
+        const close = "</" ++ tag ++ ">";
+        const s = std.mem.indexOf(u8, body, open) orelse return null;
+        const from = s + open.len;
+        const e = std.mem.indexOfPos(u8, body, from, close) orelse return null;
+        return body[from..e];
     }
 
     fn xmlUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -381,4 +450,25 @@ fn resolveCredentialsInner(alloc: std.mem.Allocator, io: std.Io, env_map: *std.p
         .secret = secret.?,
         .region = region orelse try alloc.dupe(u8, "us-east-1"),
     };
+}
+
+test "only transient failures are retried" {
+    try std.testing.expect(Client.retryable(error.S3Unavailable));
+    try std.testing.expect(Client.retryable(error.ConnectionResetByPeer));
+    try std.testing.expect(Client.retryable(error.ReadFailed));
+    try std.testing.expect(!Client.retryable(error.S3NotFound));
+    try std.testing.expect(!Client.retryable(error.S3RequestFailed));
+    try std.testing.expect(!Client.retryable(error.OutOfMemory));
+}
+
+test "list pages expose the continuation token" {
+    const page =
+        "<ListBucketResult><KeyCount>1000</KeyCount><IsTruncated>true</IsTruncated>" ++
+        "<NextContinuationToken>openpuffer/u4/wal/00000000000000000003.json</NextContinuationToken>" ++
+        "<Contents><Key>openpuffer/u1/snapshot.bin</Key></Contents></ListBucketResult>";
+    try std.testing.expectEqualStrings(
+        "openpuffer/u4/wal/00000000000000000003.json",
+        Client.tagText(page, "NextContinuationToken").?,
+    );
+    try std.testing.expect(Client.tagText(page, "Missing") == null);
 }
