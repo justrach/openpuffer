@@ -64,6 +64,8 @@ pub const Options = struct {
     /// Default true so the scored 20k bench stays comparable. Set false
     /// (`--no-f32`) to drop ~4×dim bytes per row; search then uses int8 only.
     store_f32: bool = true,
+    /// Experimental execution-only toggle; not persisted.
+    batch_neighbor_scoring: bool = false,
 };
 
 pub const SearchResult = struct { id: u32, distance: f32 };
@@ -558,6 +560,40 @@ pub fn Hnsw(comptime D: type) type {
             }
         }
 
+        fn distQBatch4(self: *const Self, qq: []const i8, qs: f32, qn2: f32, ids: [4]u32) [4]f32 {
+            if (self.opts.metric != .cosine) {
+                var scalar: [4]f32 = undefined;
+                inline for (0..4) |j| scalar[j] = self.distQ(qq, qs, qn2, ids[j]);
+                return scalar;
+            }
+            var generations: [4]u32 = undefined;
+            var vectors: [4][]const i8 = undefined;
+            var scales: [4]f32 = undefined;
+            inline for (0..4) |j| {
+                generations[j] = @atomicLoad(u32, &self.vec_gen.items[ids[j]], .acquire);
+                if (generations[j] & 1 != 0) {
+                    // A writer is active: retain the original retry protocol.
+                    var fallback: [4]f32 = undefined;
+                    inline for (0..4) |k| fallback[k] = self.distQ(qq, qs, qn2, ids[k]);
+                    return fallback;
+                }
+                vectors[j] = self.qvecConst(ids[j])[0..qq.len];
+                scales[j] = self.qscaleOf(ids[j]);
+            }
+            const dots = vecmath.dotI8Batch4(qq, vectors);
+            var distances: [4]f32 = undefined;
+            inline for (0..4) |j| {
+                const after = @atomicLoad(u32, &self.vec_gen.items[ids[j]], .acquire);
+                if (after != generations[j]) {
+                    distances[j] = self.distQ(qq, qs, qn2, ids[j]);
+                } else {
+                    const approx = @as(f64, @floatFromInt(dots[j])) * qs * scales[j];
+                    distances[j] = @max(0.0, 1.0 - @as(f32, @floatCast(approx)));
+                }
+            }
+            return distances;
+        }
+
         /// Distance contexts let searchLayer run on either exact or quantized math.
         pub const F32Dist = struct {
             s: *const Self,
@@ -572,6 +608,10 @@ pub fn Hnsw(comptime D: type) type {
             qs: f32,
             qn2: f32 = 1,
             n: usize,
+            batch: bool = false,
+            pub inline fn distBatch(d: @This(), ids: [4]u32) [4]f32 {
+                return d.s.distQBatch4(d.qq[0..@min(d.n, d.qq.len)], d.qs, d.qn2, ids);
+            }
             pub inline fn dist(d: @This(), id: u32) f32 {
                 const n = @min(d.n, d.qq.len);
                 return d.s.distQ(d.qq[0..n], d.qs, d.qn2, id);
@@ -693,6 +733,41 @@ pub fn Hnsw(comptime D: type) type {
                 }
                 var nbr_buf: [64]u32 = undefined;
                 const nbrs = self.snapshotNeighbors(c.id, layer, &nbr_buf);
+                if (comptime @hasDecl(@TypeOf(dist_ctx), "distBatch")) {
+                    if (dist_ctx.batch) {
+                        var next: usize = 0;
+                        while (next < nbrs.len) {
+                            var ids: [4]u32 = undefined;
+                            var count: usize = 0;
+                            while (next < nbrs.len and count < ids.len) : (next += 1) {
+                                const nid = nbrs[next];
+                                if (try alreadyVisited(visited, alloc, nid)) continue;
+                                ids[count] = nid;
+                                count += 1;
+                                @prefetch(self.qvecConst(nid).ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+                            }
+                            var distances: [4]f32 = undefined;
+                            if (count == ids.len) {
+                                distances = dist_ctx.distBatch(ids);
+                            } else {
+                                for (ids[0..count], 0..) |nid, j| distances[j] = dist_ctx.dist(nid);
+                            }
+                            // Consume in original adjacency order with identical
+                            // heap operations, thresholds, and equal-score ties.
+                            for (ids[0..count], distances[0..count]) |nid, d| {
+                                const w = if (results.count() > 0) results.peek().?.d else std.math.floatMax(f32);
+                                if (results.count() < ef or d < w) {
+                                    try candidates.push(alloc, .{ .id = nid, .d = d });
+                                    if (accept.ok(nid)) {
+                                        try results.push(alloc, .{ .id = nid, .d = d });
+                                        if (results.count() > ef) _ = results.pop();
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
                 for (nbrs, 0..) |nid, ni| {
                     // one-ahead software prefetch: the next neighbor's int8
                     // vector starts its memory fetch while we dot this one.
@@ -1100,7 +1175,7 @@ pub fn Hnsw(comptime D: type) type {
             var qbuf: [512]i8 = undefined;
             const pq = try self.prepareQuery(query, &norm_buf, &qbuf, alloc);
             defer pq.deinit(alloc);
-            const ctx = QDist{ .s = self, .qq = pq.qq, .qs = pq.qs, .qn2 = pq.qn2, .n = self.searchPrefix() };
+            const ctx = QDist{ .s = self, .qq = pq.qq, .qs = pq.qs, .qn2 = pq.qn2, .n = self.searchPrefix(), .batch = self.opts.batch_neighbor_scoring and self.opts.metric == .cosine };
 
             var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, self.len() + 2048);
             defer visited.deinit(alloc);

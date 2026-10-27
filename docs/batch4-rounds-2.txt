@@ -1,0 +1,99 @@
+fixture=clustered-512 count=4096 dim=512 build_ms=1029.48
+fixture=clustered-512 storage=heap queries=128 k=24 ef=48 rerank=2 parity=all recall=1.000000
+fixture=clustered-512 storage=heap round=0 implementation=scalar p50_ns=15666 p95_ns=19667 rss_kib=18000
+fixture=clustered-512 storage=heap round=0 implementation=batch4 p50_ns=14791 p95_ns=18125 rss_kib=18000
+fixture=clustered-512 storage=heap round=1 implementation=batch4 p50_ns=14958 p95_ns=17583 rss_kib=18000
+fixture=clustered-512 storage=heap round=1 implementation=scalar p50_ns=15666 p95_ns=18166 rss_kib=18000
+fixture=clustered-512 storage=heap round=2 implementation=scalar p50_ns=14584 p95_ns=16250 rss_kib=18000
+fixture=clustered-512 storage=heap round=2 implementation=batch4 p50_ns=15000 p95_ns=17833 rss_kib=18000
+fixture=clustered-512 storage=heap round=3 implementation=batch4 p50_ns=13084 p95_ns=15042 rss_kib=18000
+fixture=clustered-512 storage=heap round=3 implementation=scalar p50_ns=15375 p95_ns=22458 rss_kib=18000
+fixture=clustered-512 storage=heap round=4 implementation=scalar p50_ns=14459 p95_ns=20917 rss_kib=18000
+fixture=clustered-512 storage=heap round=4 implementation=batch4 p50_ns=14375 p95_ns=18500 rss_kib=18000
+fixture=clustered-512 storage=heap round=5 implementation=batch4 p50_ns=13584 p95_ns=22542 rss_kib=18016
+fixture=clustered-512 storage=heap round=5 implementation=scalar p50_ns=14666 p95_ns=20750 rss_kib=18016
+fixture=clustered-512 storage=heap round=6 implementation=scalar p50_ns=16291 p95_ns=24958 rss_kib=18016
+fixture=clustered-512 storage=heap round=6 implementation=batch4 p50_ns=16000 p95_ns=22166 rss_kib=18016
+fixture=clustered-512 storage=heap checksum=134882605846296
+fixture=clustered-512 storage=mmap queries=128 k=24 ef=48 rerank=2 parity=all recall=1.000000
+fixture=clustered-512 storage=mmap round=0 implementation=scalar p50_ns=16375 p95_ns=22250 rss_kib=28960
+fixture=clustered-512 storage=mmap round=0 implementation=batch4 p50_ns=14958 p95_ns=20750 rss_kib=28960
+fixture=clustered-512 storage=mmap round=1 implementation=batch4 p50_ns=13459 p95_ns=17375 rss_kib=28960
+fixture=clustered-512 storage=mmap round=1 implementation=scalar p50_ns=16958 p95_ns=25167 rss_kib=28960
+fixture=clustered-512 storage=mmap round=2 implementation=scalar p50_ns=14375 p95_ns=22084 rss_kib=28960
+fixture=clustered-512 storage=mmap round=2 implementation=batch4 p50_ns=14917 p95_ns=18084 rss_kib=28960
+fixture=clustered-512 storage=mmap round=3 implementation=batch4 p50_ns=13916 p95_ns=15792 rss_kib=28960
+fixture=clustered-512 storage=mmap round=3 implementation=scalar p50_ns=16458 p95_ns=20250 rss_kib=28960
+fixture=clustered-512 storage=mmap round=4 implementation=scalar p50_ns=15500 p95_ns=17875 rss_kib=28960
+fixture=clustered-512 storage=mmap round=4 implementation=batch4 p50_ns=15209 p95_ns=19917 rss_kib=28960
+fixture=clustered-512 storage=mmap round=5 implementation=batch4 p50_ns=12583 p95_ns=14083 rss_kib=28960
+fixture=clustered-512 storage=mmap round=5 implementation=scalar p50_ns=16208 p95_ns=21125 rss_kib=28960
+fixture=clustered-512 storage=mmap round=6 implementation=scalar p50_ns=16458 p95_ns=19500 rss_kib=28960
+fixture=clustered-512 storage=mmap round=6 implementation=batch4 p50_ns=16041 p95_ns=18541 rss_kib=28960
+fixture=clustered-512 storage=mmap checksum=134882605846296
+fixture=uniform-512 count=4096 dim=512 build_ms=2497.16
+fixture=uniform-512 storage=heap queries=128 k=24 ef=48 rerank=2 parity=all recall=0.568359
+fixture=uniform-512 storage=heap round=0 implementation=scalar p50_ns=47000 p95_ns=61167 rss_kib=18448
+fixture=uniform-512 storage=heap round=0 implementation=batch4 p50_ns=43166 p95_ns=55208 rss_kib=18448
+fixture=uniform-512 storage=heap round=1 implementation=batch4 p50_ns=44167 p95_ns=55334 rss_kib=18448
+fixture=uniform-512 storage=heap round=1 implementation=scalar p50_ns=44125 p95_ns=54583 rss_kib=18448
+fixture=uniform-512 storage=heap round=2 implementation=scalar p50_ns=43208 p95_ns=62584 rss_kib=18448
+fixture=uniform-512 storage=heap round=2 implementation=batch4 p50_ns=40417 p95_ns=49958 rss_kib=18448
+fixture=uniform-512 storage=heap round=3 implementation=batch4 p50_ns=42459 p95_ns=52833 rss_kib=18448
+fixture=uniform-512 storage=heap round=3 implementation=scalar p50_ns=47500 p95_ns=61167 rss_kib=18448
+fixture=uniform-512 storage=heap round=4 implementation=scalar p50_ns=44458 p95_ns=53375 rss_kib=18448
+fixture=uniform-512 storage=heap round=4 implementation=batch4 p50_ns=43958 p95_ns=51209 rss_kib=18448
+fixture=uniform-512 storage=heap round=5 implementation=batch4 p50_ns=41500 p95_ns=52000 rss_kib=18448
+fixture=uniform-512 storage=heap round=5 implementation=scalar p50_ns=47000 p95_ns=54333 rss_kib=18448
+fixture=uniform-512 storage=heap round=6 implementation=scalar p50_ns=43000 p95_ns=50250 rss_kib=18448
+fixture=uniform-512 storage=heap round=6 implementation=batch4 p50_ns=43500 p95_ns=54250 rss_kib=18448
+fixture=uniform-512 storage=heap checksum=137203838316090
+fixture=uniform-512 storage=mmap queries=128 k=24 ef=48 rerank=2 parity=all recall=0.568359
+fixture=uniform-512 storage=mmap round=0 implementation=scalar p50_ns=44375 p95_ns=59084 rss_kib=29344
+fixture=uniform-512 storage=mmap round=0 implementation=batch4 p50_ns=45875 p95_ns=61542 rss_kib=29344
+fixture=uniform-512 storage=mmap round=1 implementation=batch4 p50_ns=42292 p95_ns=56084 rss_kib=29344
+fixture=uniform-512 storage=mmap round=1 implementation=scalar p50_ns=46875 p95_ns=67125 rss_kib=29344
+fixture=uniform-512 storage=mmap round=2 implementation=scalar p50_ns=46708 p95_ns=65083 rss_kib=29344
+fixture=uniform-512 storage=mmap round=2 implementation=batch4 p50_ns=43125 p95_ns=62416 rss_kib=29344
+fixture=uniform-512 storage=mmap round=3 implementation=batch4 p50_ns=39459 p95_ns=50834 rss_kib=29344
+fixture=uniform-512 storage=mmap round=3 implementation=scalar p50_ns=47791 p95_ns=59583 rss_kib=29344
+fixture=uniform-512 storage=mmap round=4 implementation=scalar p50_ns=47708 p95_ns=57000 rss_kib=29344
+fixture=uniform-512 storage=mmap round=4 implementation=batch4 p50_ns=45750 p95_ns=56000 rss_kib=29344
+fixture=uniform-512 storage=mmap round=5 implementation=batch4 p50_ns=40750 p95_ns=52709 rss_kib=29344
+fixture=uniform-512 storage=mmap round=5 implementation=scalar p50_ns=47333 p95_ns=58125 rss_kib=29344
+fixture=uniform-512 storage=mmap round=6 implementation=scalar p50_ns=45292 p95_ns=63333 rss_kib=29344
+fixture=uniform-512 storage=mmap round=6 implementation=batch4 p50_ns=44250 p95_ns=53875 rss_kib=29344
+fixture=uniform-512 storage=mmap checksum=137203838316090
+fixture=clustered-1536 count=4096 dim=1536 build_ms=3640.97
+fixture=clustered-1536 storage=heap queries=128 k=10 ef=128 rerank=4 parity=all recall=0.999219
+fixture=clustered-1536 storage=heap round=0 implementation=scalar p50_ns=105750 p95_ns=186709 rss_kib=41376
+fixture=clustered-1536 storage=heap round=0 implementation=batch4 p50_ns=99000 p95_ns=123292 rss_kib=41376
+fixture=clustered-1536 storage=heap round=1 implementation=batch4 p50_ns=98000 p95_ns=134167 rss_kib=41376
+fixture=clustered-1536 storage=heap round=1 implementation=scalar p50_ns=107708 p95_ns=162625 rss_kib=41376
+fixture=clustered-1536 storage=heap round=2 implementation=scalar p50_ns=109708 p95_ns=158875 rss_kib=41376
+fixture=clustered-1536 storage=heap round=2 implementation=batch4 p50_ns=102583 p95_ns=148875 rss_kib=41376
+fixture=clustered-1536 storage=heap round=3 implementation=batch4 p50_ns=99375 p95_ns=132500 rss_kib=41376
+fixture=clustered-1536 storage=heap round=3 implementation=scalar p50_ns=108625 p95_ns=159458 rss_kib=41376
+fixture=clustered-1536 storage=heap round=4 implementation=scalar p50_ns=108042 p95_ns=185416 rss_kib=41376
+fixture=clustered-1536 storage=heap round=4 implementation=batch4 p50_ns=99125 p95_ns=137125 rss_kib=41376
+fixture=clustered-1536 storage=heap round=5 implementation=batch4 p50_ns=99500 p95_ns=114875 rss_kib=41376
+fixture=clustered-1536 storage=heap round=5 implementation=scalar p50_ns=100958 p95_ns=139041 rss_kib=41376
+fixture=clustered-1536 storage=heap round=6 implementation=scalar p50_ns=107917 p95_ns=170292 rss_kib=41376
+fixture=clustered-1536 storage=heap round=6 implementation=batch4 p50_ns=103125 p95_ns=155250 rss_kib=41376
+fixture=clustered-1536 storage=heap checksum=56698702456368
+fixture=clustered-1536 storage=mmap queries=128 k=10 ef=128 rerank=4 parity=all recall=0.999219
+fixture=clustered-1536 storage=mmap round=0 implementation=scalar p50_ns=104667 p95_ns=152750 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=0 implementation=batch4 p50_ns=100250 p95_ns=146542 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=1 implementation=batch4 p50_ns=101500 p95_ns=144542 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=1 implementation=scalar p50_ns=104833 p95_ns=168625 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=2 implementation=scalar p50_ns=105291 p95_ns=141125 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=2 implementation=batch4 p50_ns=101500 p95_ns=137750 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=3 implementation=batch4 p50_ns=97458 p95_ns=154041 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=3 implementation=scalar p50_ns=103542 p95_ns=133042 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=4 implementation=scalar p50_ns=101292 p95_ns=125459 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=4 implementation=batch4 p50_ns=99041 p95_ns=146042 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=5 implementation=batch4 p50_ns=103541 p95_ns=148292 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=5 implementation=scalar p50_ns=102625 p95_ns=126542 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=6 implementation=scalar p50_ns=105125 p95_ns=143500 rss_kib=72752
+fixture=clustered-1536 storage=mmap round=6 implementation=batch4 p50_ns=98333 p95_ns=124375 rss_kib=72752
+fixture=clustered-1536 storage=mmap checksum=56698702456368
