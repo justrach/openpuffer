@@ -100,6 +100,29 @@ pub fn dotI8(a: []const i8, b: []const i8) i32 {
     return sum;
 }
 
+/// Four independent full-dimensional dot products sharing each query load.
+/// Integer accumulation preserves dotI8's result; no dimensions are skipped.
+/// A smaller lane count keeps four accumulators within the NEON register file.
+pub fn dotI8Batch4(a: []const i8, b: [4][]const i8) [4]i32 {
+    const lane = 16;
+    var acc: [4]@Vector(lane, i32) = @splat(@splat(0));
+    var i: usize = 0;
+    while (i + lane <= a.len) : (i += lane) {
+        const query: @Vector(lane, i8) = a[i..][0..lane].*;
+        const wide_query: @Vector(lane, i32) = @intCast(query);
+        inline for (0..4) |j| {
+            const stored: @Vector(lane, i8) = b[j][i..][0..lane].*;
+            acc[j] += wide_query * @as(@Vector(lane, i32), @intCast(stored));
+        }
+    }
+    var sums: [4]i32 = undefined;
+    inline for (0..4) |j| sums[j] = @reduce(.Add, acc[j]);
+    while (i < a.len) : (i += 1) {
+        inline for (0..4) |j| sums[j] += @as(i32, a[i]) * @as(i32, b[j][i]);
+    }
+    return sums;
+}
+
 test "cosine basics" {
     const a = [_]f32{ 1, 0, 0 };
     const b = [_]f32{ 1, 0, 0 };

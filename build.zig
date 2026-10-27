@@ -153,7 +153,29 @@ pub fn build(b: *std.Build) void {
     const windows_check = b.step("check-windows", "Cross-compile the Windows persistence API guard");
     windows_check.dependOn(&windows_guard.step);
 
+    const batch_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_ann_batch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "openpuffer", .module = lib_mod }},
+    });
+    const batch_bench = b.addExecutable(.{ .name = "bench-ann-batch", .root_module = batch_bench_mod });
+    const run_batch_bench = b.addRunArtifact(batch_bench);
+    b.step("bench-ann-batch", "Compare opt-in batched scoring on synthetic fixtures").dependOn(&run_batch_bench.step);
+
+    const batch_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_ann_batch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "openpuffer", .module = lib_mod }},
+    });
+    const batch_tests = b.addTest(.{ .root_module = batch_mod });
+    const run_batch_tests = b.addRunArtifact(batch_tests);
+    b.step("test-ann-batch", "Check experimental scoring parity").dependOn(&run_batch_tests.step);
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_batch_tests.step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_shard_tests.step);
